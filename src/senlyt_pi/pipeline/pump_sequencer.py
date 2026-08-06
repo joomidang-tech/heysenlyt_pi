@@ -155,6 +155,11 @@ class PumpSequencer:
         #   (2026-07-19 QA "흡입/배출" — traceId=null 로그라 흐름 추적이 안 되던 사각 봉합).
         #   단일 in-flight(동시 1잡)라 인스턴스 필드 1개로 충분하다.
         self._job_ctx: "tuple[str, str] | None" = None
+        # 현재 실행 중 잡의 진행 스냅샷 (command_id, steps_done, step_n) — heartbeat 동봉용
+        #   (2026-08-06 QA "[admin] 튜브필링 UI" 원안: 현재 포트 표시). 추가 통신 0 — 기존 10s
+        #   하트비트에 편승한다. 쓰기=잡 실행 스레드 / 읽기=하트비트 스레드지만 불변 튜플 재바인딩이라
+        #   CPython 에서 원자적(찢긴 읽기 없음). 단일 in-flight 라 필드 1개로 충분.
+        self._live_progress: "tuple[str, int, int] | None" = None
         self._executor = EngineExecutor(engine, max_retries=max_retries)
         self.request_id_gen = request_id_gen
         self.publisher = publisher
@@ -191,6 +196,11 @@ class PumpSequencer:
     def queue_depth(self) -> int:
         """대기 큐 깊이(heartbeat queueDepth 파생)."""
         return len(self._pending) + (1 if self._busy else 0)
+
+    @property
+    def live_progress(self) -> "tuple[str, int, int] | None":
+        """현재 실행 중 잡의 (command_id, steps_done, step_n) — 유휴면 None(heartbeat 동봉용)."""
+        return self._live_progress
 
     def request_drain(self) -> None:
         """graceful 종료 요청(SIGTERM). 현재 step 은 완주, 이후 미시작. 대기 job 은 실행하지 않음."""
@@ -305,6 +315,8 @@ class PumpSequencer:
         # ACCEPTED 보고(제조 시작).
         self._publish_via(reporter, DispensePhase.ACCEPTED, 0, step_n, None)
 
+        # 진행 스냅샷 시작 — 하트비트가 (command_id, 0/N)부터 실어 나른다(2026-08-06).
+        self._live_progress = (job.command_id, 0, step_n)
         steps_done = 0
         try:
             return self._run_stages(job, reporter, resolved, step_n)
@@ -325,6 +337,9 @@ class PumpSequencer:
                 step_n=step_n,
                 error_code=StatusErrorCode.PARTIAL_DISPENSE,
             )
+        finally:
+            # 잡 종결(성공/실패/예외 불문) — 스냅샷 해제(유휴 하트비트에 잔상 금지).
+            self._live_progress = None
 
     def _run_stages(
         self,
@@ -374,6 +389,8 @@ class PumpSequencer:
             results = self._run_stage(stage_steps)
             stage_ok = sum(1 for ok, _ in results if ok)
             steps_done += stage_ok
+            # 진행 스냅샷 갱신 — 다음 하트비트(10s)가 실어 나른다(2026-08-06 현재 포트 표시).
+            self._live_progress = (job.command_id, steps_done, step_n)
 
             failures = [ec for ok, ec in results if not ok]
             if failures:

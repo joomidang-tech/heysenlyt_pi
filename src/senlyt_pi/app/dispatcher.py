@@ -409,6 +409,8 @@ class Dispatcher:
             valves=valves,
             pump_health=pump_health,
             hw_checked_at=hw_checked_at,
+            # 실행 중 잡 진행 스냅샷(2026-08-06) — admin "현재 포트" 표시 근거(유휴면 None·키 미방출).
+            job_progress=self.sequencer.live_progress,
         )
 
     def _re_report_settled_terminal(self, cs: CommandSet) -> None:
