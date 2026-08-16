@@ -412,6 +412,10 @@ class Heartbeat:
     #   hwCheckedAt = 마지막 프로브 시각(ISO) — "N초 전 확인" 표시용.
     pump_health: "dict[int, str] | None" = None
     hw_checked_at: str | None = None
+    # (선택·2026-08-06 QA "[admin] 튜브필링 UI" 원안) 실행 중 잡 진행 스냅샷
+    #   (commandSetId, stepsDone, stepN) — admin 이 "현재 몇 번째 포트인지"를 표시하는 근거.
+    #   추가 통신 0(기존 하트비트 편승·유휴면 키 미방출). Sequencer.live_progress 파생.
+    job_progress: "tuple[str, int, int] | None" = None
 
     def to_json(self) -> dict[str, Any]:
         """includeIfNull:false — 선택 필드는 부재 시 키 방출 안 함(부록A P-4)."""
@@ -430,4 +434,15 @@ class Heartbeat:
             {str(a): s for a, s in self.pump_health.items()} if self.pump_health else None,
         )
         put_if_present(m, "hwCheckedAt", self.hw_checked_at)
+        put_if_present(
+            m,
+            "jobProgress",
+            {
+                "commandSetId": self.job_progress[0],
+                "stepsDone": self.job_progress[1],
+                "stepN": self.job_progress[2],
+            }
+            if self.job_progress
+            else None,
+        )
         return m
