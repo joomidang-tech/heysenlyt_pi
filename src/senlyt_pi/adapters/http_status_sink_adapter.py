@@ -69,7 +69,7 @@ def _order_id_of(command_id: str) -> str:
 
 
 def _utc_now_iso() -> str:
-    """스풀 합성 WARN 용 UTC ISO8601(ms) — 데몬 now_iso 와 같은 포맷."""
+    """UTC ISO8601(ms) — 데몬 now_iso 와 같은 포맷. 스풀 합성 WARN + 배치 sentAt 공용."""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
@@ -320,18 +320,39 @@ class HttpStatusSinkAdapter:
 
         ⛔ 여기서 StructuredLogger 로 로그를 찍지 말 것 — drain 의 send 콜백으로 불리며,
         로거 sink 는 daemon `_trace_lock` 을 잡는다(락 역전 데드락 재료·TraceSpill docstring).
+
+        `sentAt` (2026-08-17) — **전송 순간** 이 기기의 시계. span 의 `ts` 와 목적이 다르다:
+          · `ts`     = 그 사건이 일어난 시각 (배치·스풀 때문에 과거일 수 있다 = 정상)
+          · `sentAt` = 지금 이 순간의 내 시계 (서버 수신 시각과 비교하면 **순수 시계 오차**)
+        서버는 `offset = sentAt - 수신시각` 으로 "로그가 오래된 것"과 "시계가 틀어진 것"을
+        가른다. 이 값이 없으면 둘이 서버에서 완전히 동일하게 보여 원리적으로 구분 불가다
+        (RTC 없는 파이는 timesyncd 가 **종료 시각**을 복원해 며칠 과거를 가리킬 수 있다).
+        ⚠️ 반드시 여기(전송 직전)에서 읽는다 — 스풀 drain 도 이 함수를 타므로, 며칠 전
+        스풀분을 지금 올려도 `sentAt` 은 지금 시각이라 오차 계산이 오염되지 않는다.
+
+        ⚠️ **429·5xx 는 실패로 돌려준다**(2026-08-17). `_request` 는 4xx/5xx 를 예외가 아니라
+        `(status, body)` 로 돌려주므로, 그냥 True 를 반환하면 서버가 거절한 배치를 "보냈다"로
+        치고 **버린다**. 둘 다 재시도하면 성공할 수 있는 상태라 버리면 안 된다:
+          · 429 = 서버가 "지금 말고 나중에". 보통 로그가 쏟아질 때 걸리므로, 하필 제일 필요할
+            때 조용히 사라진다.
+          · 5xx = 이 라우트에서 500 이 나는 유일한 이유가 **Firestore 적재 실패**다. 즉 정본이
+            못 받은 바로 그 배치를 버리는 꼴이라, 이 파일이 내건 "단절 유실 0"과 정면으로 어긋난다.
+        False 를 주면 호출자가 스풀에 남겨 다음 주기에 재전송한다(drain 은 첫 실패에서 멈추므로
+        폭주가 아니라 스로틀로 작동한다).
+        ⛔ 그 외 4xx(400 형식 오류·401 인증)는 재전송해도 같은 결과라 종전대로 성공 처리한다 —
+          고칠 수 없는 배치를 영원히 재시도하면 스풀이 그 배치로 막힌다.
         """
         try:
-            self._request(
+            status, _ = self._request(
                 "POST",
                 self._config().trace_url,
-                body={"logs": batch},
+                body={"logs": batch, "sentAt": _utc_now_iso()},
                 headers=bearer_headers(self.bearer_token),
                 timeout=self.timeout,
             )
-            return True
         except HttpTransportError:
             return False
+        return not (status == 429 or status >= 500)
 
     def spill_traces(self, spans: Sequence[TraceSpan]) -> None:
         """전송 시도 없이 곧장 스풀에 적재 — 데몬 메모리 버퍼 overflow 의 배출구(드롭 대체)."""
