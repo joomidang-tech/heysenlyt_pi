@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import threading
 from typing import Mapping
 
@@ -218,9 +220,97 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
     return 0
 
 
+# ── 호스트 열/전압/스로틀 프로브(2026-07-25) — 실기기 과열→통신끊김 진단의 관측 씨앗 ───────────
+#   전부 **read-only OS 조회**(하드웨어 명령 0·펌프 미접촉 → 발열·거동에 영향 없음). vcgencmd 미가용
+#   (비-Pi 개발기)이면 sysfs 폴백, 그것도 없으면 skip — 관측이 부팅을 막지 않는다(예외 전부 흡수).
+_THROTTLE_BITS: dict[int, str] = {
+    0: "undervolt_now",
+    1: "arm_capped_now",
+    2: "throttled_now",
+    3: "soft_temp_now",
+    16: "undervolt_since_boot",
+    17: "arm_capped_since_boot",
+    18: "throttled_since_boot",
+    19: "soft_temp_since_boot",
+}
+
+
+def _vcgencmd(arg: str) -> str | None:
+    """vcgencmd 서브명령 1회(read-only). 미설치·비-Pi·실패·타임아웃 → None."""
+    exe = shutil.which("vcgencmd")
+    if not exe:
+        return None
+    try:
+        res = subprocess.run(  # noqa: S603 — 고정 실행파일·리터럴 인자(사용자 입력 아님).
+            [exe, *arg.split()],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001 — 관측이 부팅을 막지 않는다.
+        return None
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def _soc_temp_c() -> float | None:
+    """SoC 온도(°C) — 리눅스 표준 sysfs 폴백(vcgencmd 없어도 됨)."""
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", encoding="ascii") as f:
+            return int(f.read().strip()) / 1000.0
+    except (OSError, ValueError):
+        return None
+
+
+def _probe_host_thermal(logger: StructuredLogger) -> None:
+    """부팅 시 호스트 열/전압/스로틀 1회 실측 로그(read-only·무해).
+
+    라즈베리파이 과열→통신끊김 진단(2026-07-25). get_throttled 상위비트(16~19)는 **sticky**(부팅 후
+    발생을 기억) — `undervolt_since_boot`=전력강하(H2) vs `throttled/soft_temp_since_boot`=열(H1) 을
+    가른다. 재부팅 안 했으면 박람회 당시 발생 여부가 그대로 남아, 텔레메트리 구축 전에도 H1/H2 판별 가능.
+    """
+    temp = _vcgencmd("measure_temp")
+    if temp is None:
+        soc = _soc_temp_c()
+        temp = f"{soc:.1f}'C(sysfs)" if soc is not None else None
+
+    throttled_raw = _vcgencmd("get_throttled")
+    throttled_hex: str | None = None
+    flags: list[str] = []
+    if throttled_raw and "=" in throttled_raw:
+        throttled_hex = throttled_raw.split("=", 1)[1].strip()
+        try:
+            v = int(throttled_hex, 0)
+            flags = [name for bit, name in _THROTTLE_BITS.items() if (v >> bit) & 1]
+        except ValueError:
+            pass
+
+    # vcgencmd·sysfs 모두 없음(비-Pi 개발기) → 조용히 skip 로그 1줄.
+    if temp is None and throttled_raw is None:
+        logger.info(
+            "호스트 열 프로브 — vcgencmd/thermal 미가용(비-Pi 개발기 추정) · skip",
+            stage=STAGE_PI_RECEIVED,
+        )
+        return
+
+    logger.info(
+        "호스트 열 프로브(부팅 실측)",
+        stage=STAGE_PI_RECEIVED,
+        temp=temp,
+        armClock=_vcgencmd("measure_clock arm"),
+        coreVolts=_vcgencmd("measure_volts core"),
+        throttled=throttled_hex,
+        throttleFlags=flags or ["none"],
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     environ = os.environ
     logger = StructuredLogger()
+
+    # 부팅 시 호스트 열/전압/스로틀 1회 실측(read-only) — 실기기 과열→통신끊김 진단 관측 씨앗(2026-07-25).
+    #   RUN/SELFTEST/기본 어느 경로든 찍혀, `senlytd` 한 번만 돌려도 Pi 실측이 로그로 나온다.
+    _probe_host_thermal(logger)
 
     if _is_truthy(environ.get(SENLYT_RUN_ENV)):
         return _run(environ, logger)
