@@ -2,14 +2,13 @@
 # hey senlyt pi daemon — 라즈베리파이 1줄 설치·구동 (다운로드부터 자동).
 #
 # 사용 (Pi에서 한 줄) — 명령어는 하나, 바꾸는 건 **서버 URL 하나**뿐:
-#   curl -fsSL https://raw.githubusercontent.com/joomidang-tech/product_heysenlyt_pi/main/install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/v1.3.0/install.sh \
 #     | sudo bash -s -- https://senlyt.com                 # prod
 #     | sudo bash -s -- https://dev-env.senlyt.com         # dev
 #     | sudo bash -s -- https://v1-2-0.env.senlyt.com      # 버전 프리뷰
 #
-# pi 코드는 항상 main(승격된 안정본)에서 받는다 — 데몬은 서버-불가지(어느 서버를 보든 인자로 받음)라,
-# 환경 구분은 "어느 서버 URL을 보게 하나" 하나로만 한다. (아직 main 미승격 코드를 먼저 시험할 때만
-# SENLYT_INSTALL_BRANCH=dev 처럼 브랜치를 덮어쓴다 — raw URL 경로도 그 브랜치로 함께 바꿔 실행.)
+# pi 코드는 이 파일이 놓인 브랜치(v1.3.0 — 위 URL 의 버전)에서 받는다. 환경 구분은 맨 끝 서버 URL 하나로만.
+# (일부러 다른 브랜치 코드를 시험할 때만 SENLYT_INSTALL_BRANCH= 로 덮어쓴다.)
 #
 # 사람이 넣는 건 **서버 URL 하나**뿐. 나머지는 켜진 뒤 자동:
 #   - deviceId  = HW 시리얼 자동수집(RPi4=cpuinfo·RPi5=device-tree)
@@ -19,9 +18,9 @@
 set -euo pipefail
 
 SERVER_URL="${1:-}"
-REPO="https://github.com/joomidang-tech/product_heysenlyt_pi.git"
-# 기본 main(승격 안정본) — 환경 구분은 서버 URL 하나로만. main 미승격 코드 시험 시에만 override.
-BRANCH="${SENLYT_INSTALL_BRANCH:-main}"
+REPO="https://github.com/joomidang-tech/heysenlyt_pi.git"
+# 기본 = 이 파일이 놓인 브랜치. CI 가 "BRANCH 기본값 == 이 브랜치" 를 검사한다.
+BRANCH="${SENLYT_INSTALL_BRANCH:-v1.3.0}"
 APP_DIR="/opt/senlyt/heysenlyt-pi"
 ENV_DIR="/etc/senlyt"
 ENV_FILE="$ENV_DIR/device.env"
