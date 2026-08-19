@@ -10,7 +10,7 @@ name: CI
 
 on:
   push:
-    branches: [main, dev, "v*.*.*"]
+    branches: ["v*.*.*"]   # pi 는 환경 브랜치를 두지 않는다 — 제품 버전 브랜치만
   # 수동 재실행용 (Actions 탭에서 브랜치 선택 후 Run workflow)
   workflow_dispatch:
 
@@ -64,3 +64,11 @@ jobs:
               echo "ℹ️ 비배포 브랜치 '$BRANCH' — 환경 검증 스킵(테스트만)."
               ;;
           esac
+
+      - name: install.sh BRANCH 기본값 == 이 브랜치 (버전 브랜치 자를 때 갱신 누락 방지)
+        run: |
+          want="${{ github.ref_name }}"
+          got=$(sed -n 's/^BRANCH="\${SENLYT_INSTALL_BRANCH:-\(.*\)}"$/\1/p' install.sh)
+          [ -n "$got" ] || { echo "::error::install.sh 에서 BRANCH 기본값을 못 읽었다"; exit 1; }
+          [ "$got" = "$want" ] || { echo "::error::install.sh BRANCH 기본값='$got' 인데 이 브랜치는 '$want' — 새 버전 브랜치를 자르며 갱신을 빠뜨렸다"; exit 1; }
+          echo "✅ install.sh 가 자기 브랜치($want)를 설치한다"
