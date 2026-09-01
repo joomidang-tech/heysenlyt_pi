@@ -318,10 +318,16 @@ class Command:
     recipe: tuple[RecipeStep, ...] | None  # recipe steps | None
     trace_id: str
     created_at: str  # ISO8601 (resync 기준·재포맷 금지·부록A P-3)
+    # (선택·2026-09-02 용량 축 fail-closed) recipe 볼륨(µL)의 조립 전제 시린지 용량(mL) —
+    #   dispatcher 가 부팅 스냅샷 pump_map 용량과 대조해 다르면 거부. 부재=구서버 하위호환.
+    syringe_capacity_ml: float | None = None
 
     @staticmethod
     def from_json(j: Mapping[str, Any]) -> "Command":
+        from .command_set import _optional_float  # tolerant reader 공유(R4 P3 — 순환 없음).
+
         raw_recipe = j.get("recipe")
+        raw_cap = j.get("syringeCapacityMl")
         return Command(
             id=j["id"],
             order_id=j["orderId"],
@@ -332,6 +338,7 @@ class Command:
             else tuple(RecipeStep.from_json(s) for s in raw_recipe),
             trace_id=j["traceId"],
             created_at=j["createdAt"],
+            syringe_capacity_ml=_optional_float(raw_cap),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -342,6 +349,12 @@ class Command:
             "deviceId": self.device_id,
             # recipe 는 null 도 의미가 있으므로(§9-1 폴백 신호) 명시적으로 방출.
             "recipe": None if self.recipe is None else [s.to_json() for s in self.recipe],
+            # 용량 선언 왕복 대칭(R4.5 P3) — 있을 때만 방출(없으면 키 자체 생략 = 구계약 그대로).
+            **(
+                {"syringeCapacityMl": self.syringe_capacity_ml}
+                if self.syringe_capacity_ml is not None
+                else {}
+            ),
             "traceId": self.trace_id,
             "createdAt": self.created_at,
         }

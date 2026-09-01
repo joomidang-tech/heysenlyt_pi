@@ -173,6 +173,16 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         logger.error("실 어댑터 조립 실패 — 부팅 중단", stage=STAGE_ERROR, error=str(e))
         return 1
 
+    # 엔진을 넘겨 pump_map **자동인식**을 가능하게 한다(PUMP_ADDRESSES 미설정 = "URL만" 설치).
+    #   env 가 있으면 그게 이기고, 없으면 어댑터의 probe 로 버스를 스캔한다.
+    #   server_settings(부팅 스냅샷)로 시린지 용량/스트로크를 서버 SoT 값으로 얹는다(O-18).
+    resolver = build_resolver(
+        environ,
+        engine=components.engine,
+        server_settings=getattr(components, "server_settings", None),
+        # 서버배정 mode 우선(env 폴백) — 'URL만' 설치 식향 기기가 예상주소[1,2]만 프로브(부팅지연 0).
+        mode=getattr(components, "mode", None),
+    )
     deps = DaemonDeps(
         device_id=components.device_id,
         command_source=components.command_source,
@@ -180,16 +190,10 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         engine=components.engine,
         valve=components.valve,
         ledger=ledger,
-        # 엔진을 넘겨 pump_map **자동인식**을 가능하게 한다(PUMP_ADDRESSES 미설정 = "URL만" 설치).
-        #   env 가 있으면 그게 이기고, 없으면 어댑터의 probe 로 버스를 스캔한다.
-        #   server_settings(부팅 스냅샷)로 시린지 용량/스트로크를 서버 SoT 값으로 얹는다(O-18).
-        resolver=build_resolver(
-            environ,
-            engine=components.engine,
-            server_settings=getattr(components, "server_settings", None),
-            # 서버배정 mode 우선(env 폴백) — 'URL만' 설치 식향 기기가 예상주소[1,2]만 프로브(부팅지연 0).
-            mode=getattr(components, "mode", None),
-        ),
+        resolver=resolver,
+        # 용량 축 가드 활성(R4 P0-1·R4.5 P2-A) — 출처 판정은 용량을 파생한 build_resolver 가
+        #   각인한 값을 그대로 쓴다(재계산 금지 — 두 곳 계산이 어긋나면 P0-1 이 부활한다).
+        capacity_from_settings=resolver.capacity_from_settings,
         commandset_source=components.command_source,  # 동일 SSE 어댑터가 두 축 제공.
         # 주기 HW 감시 기대 주소(실시간 판단·2026-07-19) — 부팅 인식이 비어도 이 주소들을 계속
         #   프로브해 pumpHealth 로 보고(어댑터 미장착 = silent 빨강, USB 꽂히면 ok 초록 자동 전환).

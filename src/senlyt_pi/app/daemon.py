@@ -178,6 +178,12 @@ class DaemonDeps:
     #   빈 채 부팅하면(어댑터 미장착 등) 감시 대상 0 → admin 이 부팅 스냅샷 폴백에 갇혔다.
     #   mode 파생(flavor=[1,2]·fragrance=[1,2,3]) — senlytd 가 주입. None = pump_map 만(하위호환).
     hw_watch_addrs: "tuple[int, ...] | None" = None
+    # 용량 축 가드 활성 조건(R4 P0-1) — pump_map 의 syringe_capacity_ml 이 **서버 스냅샷 유래**일
+    #   때만 True. 폴백(스냅샷 부재 → 모드 기본 0.5)일 땐 False — 그 0.5 는 관측값이 아니라
+    #   추측값이라, 이를 근거로 서버 선언 용량을 거부하면 부팅 순단 1회로 제조·세척 전량 거부
+    #   (위생 하드락 탈출구 봉쇄 = 현장 방문 전 벽돌)가 된다. 가드는 "서버가 말한 값 vs 서버가
+    #   말한 값" 대조일 때만 의미가 있다. False = 무검사(델타 이전과 동일 거동 + 부팅 WARN).
+    capacity_from_settings: bool = False
 
 
 class SenlytDaemon:
@@ -257,6 +263,10 @@ class SenlytDaemon:
             commandset_source=deps.commandset_source,
             commandset_sink=commandset_sink if callable(commandset_sink) else None,
             logger=deps.logger,  # 정비 신선도 게이트 관측(2026-07-19)
+            # 용량 축 fail-closed(2026-09-02) — RR 과 같은 pump_map(부팅 스냅샷 파생). 봉투/명령의
+            #   선언 용량과 대조해 다르면 실행 전 거부(스냅샷 스테일 무성 과소토출 차단).
+            #   ⚠️ 스냅샷 유래일 때만(R4 P0-1) — 폴백 용량(추측값)으로는 대조하지 않는다.
+            pump_map=resolver.pump_map if deps.capacity_from_settings else None,
         )
         self._recovery = BootRecovery(deps.ledger)
 

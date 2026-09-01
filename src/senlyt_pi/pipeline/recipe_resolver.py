@@ -213,6 +213,9 @@ class RecipeResolver:
     def __init__(self, pump_map: Mapping[int, SyringeSpec]) -> None:
         # pumpAddr → SyringeSpec. PUMP_MAP(§9-1) 검증에 사용.
         self.pump_map = dict(pump_map)
+        # 용량 출처(R4.5 P2-A) — pump_map 의 syringe_capacity_ml 이 서버 스냅샷 유래면 True.
+        #   build_resolver 가 용량을 파생하며 각인한다(기본 False = 안전측·가드 비활성).
+        self.capacity_from_settings: bool = False
 
     def resolve(self, steps: Sequence[RecipeStep]) -> ResolvedRecipe:
         """steps 를 정렬·검증·파생한다. 위반 시 [RecipeValidationError] raise(→ drop).

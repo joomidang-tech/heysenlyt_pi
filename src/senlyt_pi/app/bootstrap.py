@@ -422,13 +422,23 @@ def build_resolver(
     capacity_override = syringe_capacity_from_settings(server_settings)
     stroke_override = full_stroke_from_settings(server_settings)
 
+    def _mark(r: RecipeResolver) -> RecipeResolver:
+        # 용량 출처 각인(R4.5 P2-A) — "pump_map 용량이 스냅샷 유래인가"를 여기(용량을 실제로
+        #   파생하는 유일한 곳)서 함께 돌려준다. senlytd 가 이 값을 그대로 Dispatcher 가드에
+        #   넘기므로 술어를 두 번 계산할 일이 없다 — 두 파일이 손으로 같은 불변식을 유지하다
+        #   한쪽만 고쳐져 조용히 어긋나는(=P0-1 부활) 구조를 없앤다.
+        r.capacity_from_settings = capacity_override is not None
+        return r
+
     raw = environ.get(SENLYT_PUMP_ADDRESSES_ENV)
     if raw and raw.strip():
-        return RecipeResolver(
-            pump_map_from_addresses_env(
-                raw,
-                capacity_override=capacity_override,
-                full_stroke_override=stroke_override,
+        return _mark(
+            RecipeResolver(
+                pump_map_from_addresses_env(
+                    raw,
+                    capacity_override=capacity_override,
+                    full_stroke_override=stroke_override,
+                )
             )
         )
 
@@ -448,10 +458,12 @@ def build_resolver(
                 if capacity_override is not None
                 else resolve_syringe_capacity_ml(None, is_flavor=is_flavor)
             )
-            return RecipeResolver(
-                auto_pump_map(found, capacity_ml=capacity, full_stroke=stroke_override)
+            return _mark(
+                RecipeResolver(
+                    auto_pump_map(found, capacity_ml=capacity, full_stroke=stroke_override)
+                )
             )
-    return RecipeResolver({})
+    return _mark(RecipeResolver({}))
 
 
 def build_components(
@@ -537,7 +549,10 @@ def build_components(
         #   없음"(함대 정지)이다. 네트워크 순단·서버 배포 창을 넘기도록 tecan 기기만 3회 재시도
         #   (sy01b 기기는 1회 유지 — 폴백 축이 곧 정답이라 부팅 지연을 만들 이유가 없다).
         _engine_env = (environ.get(SENLYT_ENGINE_ENV) or "").strip().lower()
-        attempts = 3 if _engine_env in ("tecan", "tecan_xcalibur", "xcalibur") else 1
+        # 재시도는 **엔진 무관 3회**(R4 P0-1) — 종전 "sy01b 는 폴백 축이 곧 정답이라 1회" 는
+        #   스트로크 축(12000)에만 참이었다. 용량 축이 fail-closed 가 된 지금, 스냅샷 부재는
+        #   "용량 가드 비활성 + 서버·pi 용량 불일치 가능" 창이라 어느 엔진이든 순단을 흡수한다.
+        attempts = 3
         for _attempt in range(attempts):
             try:
                 server_settings = fetcher(server_config, identity.dispenser_token, mode)
@@ -597,6 +612,15 @@ def build_components(
         settingsStrokeRaw=settings_stroke,
         adapterStroke=adapter_stroke,
     )
+    if syringe_capacity_from_settings(server_settings) is None:
+        # R4 P0-1 — 스냅샷이 용량을 안 줬다 = 이 부팅의 용량(모드 기본 0.5)은 **추측값**이다.
+        #   용량 축 가드는 비활성(추측으로 서버 선언을 거부하면 벽돌)이고, 서버 설정이 0.5 가
+        #   아니면 소량 주문이 무성 과소/과다로 흐를 수 있다 — 재시작(재fetch)이 정석 복구.
+        log.warn(
+            "settings 스냅샷 부재 — 시린지 용량 미확정(모드 기본 0.5 가정·용량 축 가드 비활성). "
+            "서버 설정 용량이 0.5mL 가 아니면 부피가 어긋난다 — 네트워크 확인 후 senlytd 재시작 권장",
+            stage=STAGE_PI_RECEIVED,
+        )
     if adapter_stroke is not None and adapter_stroke != effective_stroke:
         # ⚠️ 숫자를 message 에 인라인(재검증 P2-3 잔여) — 서버 trace allowlist 는 message 만
         #   통과시키고 kwargs(detail) 의 settingsStroke/adapterStroke 는 admin 도달 전에 폐기된다.

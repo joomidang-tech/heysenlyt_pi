@@ -24,7 +24,7 @@ import time
 from typing import Any, Callable, Iterator, Mapping
 
 from ..config.server_target import ServerConfig
-from ..core.command_set import CommandSet, command_sets_from_snapshot
+from ..core.command_set import CommandSet, _warn_broken_once, command_sets_from_snapshot
 from ..core.wire_messages import Command
 from ..obs.log import STAGE_PI_RECEIVED, StructuredLogger
 from .http_client import DEFAULT_TIMEOUT_SECONDS, SseStream, bearer_headers, open_sse
@@ -80,8 +80,10 @@ def commands_from_snapshot(
             continue
         try:
             cmd = Command.from_json(item)
-        except (KeyError, TypeError, ValueError):
-            continue  # 깨진 command 는 skip(전체 snapshot 을 죽이지 않음).
+        except (KeyError, TypeError, ValueError) as e:
+            # 무성 skip 금지(2026-09-02 감사 P2) — 흔적을 남긴다(core 헬퍼 재사용·id 당 1회).
+            _warn_broken_once("command", item, e)
+            continue
         if cmd.device_id != device_id:
             continue
         out.append(cmd)
