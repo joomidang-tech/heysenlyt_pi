@@ -369,6 +369,14 @@ def s6_broadcast_control(bus: Bus, addrs: list[str], force: int, air: int, out: 
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
+    # ⛔ SY-01B 전용 프로브(검증 P0-3·2026-09-01) — 이 스크립트는 `U{...}R`(스톨전류)·`?` 폴을
+    #   하드코딩한다. XCalibur(Tecan)에서 U 는 NVM 설정 기록(비가역 위험)이라 실행을 거부한다.
+    #   Tecan 초기화 폴 특성 실측은 실물 도착 후 이 스크립트의 tecan 판(N0R·Q)을 별도로 만들 것.
+    import os
+    if os.environ.get("SENLYT_ENGINE", "").strip().lower() in ("tecan", "tecan_xcalibur", "xcalibur"):
+        print("⛔ 이 프로브는 SY-01B 전용입니다 — SENLYT_ENGINE=tecan 기기에서 실행 금지"
+              " (U 명령 = XCalibur NVM 설정 기록 위험).", file=sys.stderr)
+        return 2
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", default=None, help="시리얼 포트 (기본: /dev/ttyUSB*/ttyACM* 자동)")
     ap.add_argument("--addrs", default="1,2", help="펌프 주소 콤마 (기본 1,2 — 식향)")

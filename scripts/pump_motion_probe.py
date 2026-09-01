@@ -69,6 +69,22 @@ READY_BIT = 0x20     # bit5 = Ready(1=새 명령 수락 / 0=Busy)
 BAUD = 9600          # 8N1
 RESP_PREFIX = b"/0"
 
+# ── 기기 모델 가드(검증 P0-3 봉합·2026-09-01) — `--model` 로 명시 선택 ─────────
+#   ⛔ XCalibur(Tecan)에 sy01b 문법을 쏘면 안 되는 지점 2개:
+#     · `U200,5R` — XCalibur 의 U<n> 은 **NVM 설정 기록**(밸브타입·보드레이트, 다음 전원인가 시
+#       발효·매뉴얼 Table 3-5). 오송신 1발이 비가역 설정 변경이 될 수 있다 → tecan 은 `N0R`
+#       (표준 3000 증분 모드 고정 — 스톨전류 명령은 XCalibur 에 없음·과부하 감지 내장).
+#     · Ready 폴 — XCalibur 는 busy 비트가 **[Q]에서만 유효**(§3.6 "the only valid method").
+#       `?` 는 위치 리포트라 Bit5 를 믿고 다음 명령을 보내면 err15 를 스스로 유발한다(v1 의 죄).
+#       단 [Q] 는 latched 오버로드(err9/10)를 **소진**한다(§3.6.3 "[Q] clears the error") —
+#       프로브가 첫 폴에서 잡아 보고하지만, 현장 증거를 지울 수 있음을 배너로 경고한다.
+#   MODEL[모델] = (pre_init 명령, pre_init 라벨, ready 폴 명령, 기본 흡입 스텝(0.4mL 상당))
+MODEL_DIALECTS = {
+    "sy01b": {"pre_init": "U200,5R", "pre_init_label": "U200,5R(스톨전류)", "poll": "?", "default_steps": 9600},
+    "tecan": {"pre_init": "N0R", "pre_init_label": "N0R(표준 3000축 고정)", "poll": "Q", "default_steps": 2400},
+}
+STATUS_POLL = "?"  # main() 에서 --model 에 따라 확정.
+
 ERR_MEANING = {
     0: "정상",
     1: "초기화 에러(재초기화 필요)",
@@ -171,7 +187,12 @@ def wait_idle(pump: Pump, label: str, timeout: float, target: int | None = None)
     last_pos, stable, last = None, 0, {}
     n = 0
     while time.monotonic() - t0 < timeout:
-        d = decode(pump.txn("?", read_timeout_s=0.5))
+        d = decode(pump.txn(STATUS_POLL, read_timeout_s=0.5))
+        if STATUS_POLL == "Q" and d.get("pos") is None:
+            # XCalibur Q 는 데이터 블록 0(위치 없음) — 진행/stuck 추적용 위치는 `?` 로 별도 조회
+            #   (?=위치 리포트 · 상태 판정에는 안 쓴다 — Bit5 는 Q 것만 신뢰).
+            p = decode(pump.txn("?", read_timeout_s=0.5))
+            d["pos"] = p.get("pos")
         last = d
         n += 1
         el = time.monotonic() - t0
@@ -222,10 +243,13 @@ def phase_aspirate(pump: Pump, label: str, speed_cmd: str, steps: int, in_port: 
 
 
 def main():
-    ap = argparse.ArgumentParser(description="SY-01B 모션/스톨 프로브 (플런저 실이동 · 데몬 정지 필요)")
+    ap = argparse.ArgumentParser(description="시린지펌프 모션/스톨 프로브 (플런저 실이동 · 데몬 정지 필요)")
+    ap.add_argument("--model", choices=sorted(MODEL_DIALECTS), default="sy01b",
+                    help="펌프 기기 모델 — tecan(XCalibur)은 U 미송신(N0R)·Q 폴·3000축 스텝 기본")
     ap.add_argument("--port", default=None)
     ap.add_argument("--addr", default="1")
-    ap.add_argument("--steps", type=int, default=9600, help="흡입 스텝(0.4mL@0.5mL/12000=9600)")
+    ap.add_argument("--steps", type=int, default=None,
+                    help="흡입 스텝(기본: 0.4mL 상당 — sy01b 9600 / tecan 2400)")
     ap.add_argument("--speed", type=int, default=5000, help="흡입 top speed Hz(실패 재현=5000)")
     ap.add_argument("--slow", type=int, default=2000, help="저속 비교 Hz")
     ap.add_argument("--in", dest="in_port", type=int, default=3)
@@ -237,6 +261,12 @@ def main():
     if args.safe_air:
         args.in_port = 12
 
+    global STATUS_POLL
+    dialect = MODEL_DIALECTS[args.model]
+    STATUS_POLL = dialect["poll"]
+    if args.steps is None:
+        args.steps = dialect["default_steps"]
+
     port = args.port or find_port()
     if not port:
         print("ERROR: 시리얼 포트 못 찾음. --port /dev/ttyUSB1 로 지정.", file=sys.stderr)
@@ -245,8 +275,11 @@ def main():
     FAST = f"v1000V{args.speed}c{args.speed}L14"
     SLOW = f"v1000V{args.slow}c{args.slow}L14"
     print("=" * 72)
-    print(f" SY-01B 프로브 v2 (Ready 직렬화)  port={port} addr={args.addr}")
+    print(f" 시린지펌프 프로브 v2 (Ready 직렬화)  model={args.model}  port={port} addr={args.addr}")
     print(f" 흡입 {args.steps}스텝  fast={args.speed}Hz slow={args.slow}Hz  in={args.in_port} out={args.out_port}")
+    if args.model == "tecan":
+        print(" ⚠️ XCalibur: U 미송신(N0R 대체) · Ready 폴=[Q] — Q 는 latched 오버로드(err9/10)를")
+        print("    소진한다(§3.6.3). 프로브가 첫 폴에서 잡아 보고하지만 현장 증거가 지워질 수 있음.")
     print("=" * 72)
 
     pump = Pump(port, args.addr)
@@ -257,12 +290,12 @@ def main():
             show(f"baseline{i}", decode(pump.txn("?")))
             time.sleep(0.15)
 
-        # Phase 1 — 초기화 (매 명령 Ready 대기로 직렬화)
-        print("\n### Phase 1 — 초기화 TR → U200,5R → Z1R (0.5mL=Half), 각 단계 Ready 대기")
+        # Phase 1 — 초기화 (매 명령 Ready 대기로 직렬화) — pre-init 은 모델 방언(U↔N0).
+        print(f"\n### Phase 1 — 초기화 TR → {dialect['pre_init_label']} → Z1R (0.5mL=Half), 각 단계 Ready 대기")
         send(pump, "TR", "TR", timeout=1.0)
         wait_idle(pump, "TR 후", 5.0)
-        send(pump, "U200,5R", "U200,5R", timeout=1.0)
-        wait_idle(pump, "스톨전류 설정 후", 5.0)
+        send(pump, dialect["pre_init"], dialect["pre_init_label"], timeout=1.0)
+        wait_idle(pump, "홈 전 셋업 후", 5.0)
         send(pump, "Z1R", "Z1R(초기화)", timeout=1.0)
         init = wait_idle(pump, "초기화 홈 완료", 30.0)
         if init.get("err") not in (0, None):

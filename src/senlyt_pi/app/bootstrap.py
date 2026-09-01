@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -53,7 +54,8 @@ from ..ports.engine_port import EnginePort
 from ..ports.valve_port import ValvePort
 
 # 엔진 선택 env(override) — 미지정이면 **자동감지**(실 Pi+시리얼 어댑터→sy01b·아니면 fake). 02_infra §10.
-#   설치 시 안 넣어도 됨("URL만"). 명시하면 그 값 우선(fake|sy01b) — E2E/개발 고정용.
+#   설치 시 안 넣어도 됨("URL만"). 명시하면 그 값 우선(fake|sy01b|tecan) — E2E/개발 고정용.
+#   tecan(=tecan_xcalibur|xcalibur) 은 Cavro XCalibur 실물 전용 — 자동감지로는 절대 선택되지 않는다.
 SENLYT_ENGINE_ENV = "SENLYT_ENGINE"
 # pi 실행 모드(주문 큐 mode·flavor|fragrance) — 어느 컬렉션/큐를 구독·역보고할지.
 #   ⚠️ TOFU 후 **서버 배정(identity.mode)이 우선** — 이 env 는 서버 미배정 시 폴백일 뿐(더 이상 필수 아님).
@@ -169,10 +171,17 @@ def build_engine(
         choice = "sy01b" if is_pi else "fake"
     else:
         choice = raw.strip().lower()
-    if choice == "sy01b":
+    if choice in ("sy01b", "tecan", "tecan_xcalibur", "xcalibur"):
         # 실 RS485 어댑터의 probe/dispense 는 hw-dev 워크오더(실 시리얼). 스텁이면 self-test 가 미준비를
         # 표면화(fail-closed) — 부팅·등록 자체는 허용(제조 트래픽만 보류).
-        from ..adapters.sy01b_engine_adapter import Sy01bEngineAdapter
+        # ⚠️ Tecan(XCalibur)은 **env 명시로만** 선택된다 — 자동감지 기본은 여전히 sy01b
+        #   (실물 전환 전 오배선 방지). 기종별 차이는 tecan_xcalibur_engine_adapter 참조.
+        if choice == "sy01b":
+            from ..adapters.sy01b_engine_adapter import Sy01bEngineAdapter as _RealAdapter
+        else:
+            from ..adapters.tecan_xcalibur_engine_adapter import (
+                TecanXCaliburEngineAdapter as _RealAdapter,
+            )
 
         port = discover_serial_port(environ, port_lister=port_lister)
         # ⚠️ estop_event 주입 = 데몬·시퀀서와 **같은 공유 래치**(§9-4). 이게 있어야 어댑터의 in-flight
@@ -186,10 +195,10 @@ def build_engine(
             return list_candidate_ports(environ, port_lister=port_lister)
 
         if port:
-            return Sy01bEngineAdapter(
+            return _RealAdapter(
                 port=port, estop_event=estop_event, logger=logger, port_resolver=_resolve_ports
             )
-        return Sy01bEngineAdapter(
+        return _RealAdapter(
             estop_event=estop_event, logger=logger, port_resolver=_resolve_ports
         )
     return FakeEnginePort(estop_event=estop_event)
@@ -523,15 +532,29 @@ def build_components(
     server_settings: "Mapping[str, Any] | None" = None
     if fetch_settings:
         fetcher = settings_fetcher if settings_fetcher is not None else fetch_settings_once
-        try:
-            server_settings = fetcher(server_config, identity.dispenser_token, mode)
-        except Exception as e:  # noqa: BLE001 — settings fetch 실패는 부팅을 막지 않는다(폴백).
+        # 재시도(2026-09-01 검증 P1-2) — 비기본 엔진(SENLYT_ENGINE=tecan)은 settings 폴백이
+        #   sy01b 12000 축이라, 스냅샷 1회 실패가 곧 "전 모션 -1001 거부 + 재시작 전 자가복구
+        #   없음"(함대 정지)이다. 네트워크 순단·서버 배포 창을 넘기도록 tecan 기기만 3회 재시도
+        #   (sy01b 기기는 1회 유지 — 폴백 축이 곧 정답이라 부팅 지연을 만들 이유가 없다).
+        _engine_env = (environ.get(SENLYT_ENGINE_ENV) or "").strip().lower()
+        attempts = 3 if _engine_env in ("tecan", "tecan_xcalibur", "xcalibur") else 1
+        for _attempt in range(attempts):
+            try:
+                server_settings = fetcher(server_config, identity.dispenser_token, mode)
+            except Exception as e:  # noqa: BLE001 — settings fetch 실패는 부팅을 막지 않는다(폴백).
+                log.warn(
+                    "부팅 settings fetch 실패 — 모드 기본 용량으로 폴백(best-effort)",
+                    stage=STAGE_ERROR,
+                    error=str(e),
+                )
+                server_settings = None
+            if server_settings is not None or _attempt == attempts - 1:
+                break
             log.warn(
-                "부팅 settings fetch 실패 — 모드 기본 용량으로 폴백(best-effort)",
+                f"settings 스냅샷 부재(시도 {_attempt + 1}/{attempts}) — 재시도 (tecan 축 확정에 필수)",
                 stage=STAGE_ERROR,
-                error=str(e),
             )
-            server_settings = None
+            time.sleep(2.0)
 
     command_source = SseCommandSourceAdapter(
         server_config=server_config,
@@ -552,6 +575,13 @@ def build_components(
     #    무엇으로 잡았는지 운영자가 로그로 확인한다(silent auto 금지 — auto + visible self-diagnostic).
     engine_adapter = build_engine(environ, engine=engine, estop_event=estop_event, logger=log)
     valve_adapter = build_valve(environ)
+    # 축(stroke) 자가진단(2026-09-01 검증 P1-5) — 설정축(서버 pumpPresetId→stroke)과 어댑터축
+    #   (SENLYT_ENGINE→preset)을 나란히 찍는다. settings 스냅샷 실패(None)면 설정축은 sy01b 12000
+    #   폴백이라, tecan 기기는 이 로그가 불일치 조기 경보의 유일한 흔적이다(모션은 축 가드가 거부).
+    settings_stroke = full_stroke_from_settings(server_settings)
+    adapter_preset = getattr(engine_adapter, "preset", None)
+    adapter_stroke = adapter_preset.pump_full_stroke if adapter_preset is not None else None
+    effective_stroke = settings_stroke if settings_stroke is not None else PUMP_PRESETS["sy01b"].pump_full_stroke
     log.event(
         "하드웨어 자가진단 — 엔진·밸브 자동감지 결과",
         stage=STAGE_PI_RECEIVED,
@@ -561,7 +591,23 @@ def build_components(
         mode=mode,
         # 서버 settings 시린지 용량 반영 여부(None=서버 미제공→모드 기본 0.5mL 폴백·안전 급소 관측).
         syringeCapacityMl=syringe_capacity_from_settings(server_settings),
+        settingsSnapshot="present" if server_settings is not None else "absent",
+        # ⚠️ 키 구분(R3 P3-4): 여기는 스냅샷 원본 축(부재=None), 아래 WARN 의 settingsStroke 는
+        #   폴백 적용 후 유효축 — 같은 키로 두 뜻을 찍으면 로그 대조가 어긋난다.
+        settingsStrokeRaw=settings_stroke,
+        adapterStroke=adapter_stroke,
     )
+    if adapter_stroke is not None and adapter_stroke != effective_stroke:
+        # ⚠️ 숫자를 message 에 인라인(재검증 P2-3 잔여) — 서버 trace allowlist 는 message 만
+        #   통과시키고 kwargs(detail) 의 settingsStroke/adapterStroke 는 admin 도달 전에 폐기된다.
+        log.warn(
+            f"축 불일치 — 설정축 {effective_stroke}(pumpPresetId) ≠ 어댑터축 {adapter_stroke}"
+            f"(SENLYT_ENGINE·snapshot={'present' if server_settings is not None else 'absent'}). "
+            "모션은 축 가드가 거부한다(-1001). admin 설정과 기기 env 를 맞추고 senlytd 재시작 필요",
+            stage=STAGE_PI_RECEIVED,
+            settingsStroke=effective_stroke,
+            adapterStroke=adapter_stroke,
+        )
 
     return DaemonComponents(
         device_id=identity.device_id,

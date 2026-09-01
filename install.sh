@@ -87,6 +87,33 @@ python3 -m venv --system-site-packages "$APP_DIR/.venv"
 # ── 4. 환경파일 — 넣는 값은 서버 URL 하나뿐 ────────────────────────────────
 mkdir -p "$ENV_DIR" "$LOG_DIR" "$STATE_DIR/queue"
 umask 077
+# ⛔ 운영자 보존 값 수확(검증 P0-2 봉합·2026-09-01) — 종전엔 재실행마다 파일을 통째 재생성해
+#   운영자가 손으로 넣은 키(SENLYT_ENGINE=tecan·SENLYT_VALVE_PINS 등)가 증발했다. Tecan 기기에서
+#   이 증발은 자동감지 sy01b 로의 오배선(=XCalibur 에 U 송신·NVM 기록 위험)으로 직결된다.
+#   방식: 설치기가 관리하는 키(아래 템플릿이 찍는 6개)만 갱신하고, 그 외 `KEY=값` 행은 전부
+#   "운영자 보존 값" 섹션으로 이월한다. "존재 시 미갱신"은 기각 — 서버 URL 교체·템플릿 개선이 죽는다.
+#   멱등: 재실행마다 동일 결과(보존 섹션은 정렬·중복 제거).
+_MANAGED_KEYS="SENLYT_SERVER_BASE_URL SENLYT_RUN LOG_DIR SENLYT_LEDGER_PATH SENLYT_STATE_DIR PUMP_ADDRESSES"
+_PRESERVED=""
+if [ -f "$ENV_FILE" ]; then
+  # `|| [ -n "$line" ]` — 끝 개행 없는 파일의 마지막 줄 보존(검증 P2-E: read 가 EOF 에서 false 를
+  #   돌려 마지막 키가 조용히 증발하던 실결함). 선행 공백도 벗긴다(systemd EnvironmentFile 은
+  #   들여쓴 `  KEY=v` 를 허용 — 안 벗기면 그 줄이 손실된다).
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"   # 선행 공백 제거(POSIX 파라미터 확장).
+    case "$line" in
+      [A-Z_]*=*)
+        key="${line%%=*}"
+        managed=0
+        for mk in $_MANAGED_KEYS; do [ "$key" = "$mk" ] && managed=1; done
+        [ "$managed" = 0 ] && _PRESERVED="${_PRESERVED}${line}
+" ;;
+    esac
+  done < "$ENV_FILE"
+  # 키 기준 dedupe(마지막 값 승리·최초 등장 순서 유지) — 행 전체 sort -u 는 같은 키의 옛 값을
+  #   남겨 systemd EnvironmentFile(마지막 값 채택)과 어긋날 수 있다(검증 P2-2).
+  _PRESERVED=$(printf '%s' "$_PRESERVED" | awk -F= 'NF{v[$1]=$0; if(!seen[$1]++){order[++n]=$1}} END{for(i=1;i<=n;i++) print v[order[i]]}')
+fi
 cat > "$ENV_FILE" <<EOF
 # hey senlyt pi — 설치가 각인한 값. 넣는 건 서버 URL 하나(나머지는 런타임 자동).
 #   deviceId=HW시리얼 자동 · mode=admin 승인 시 배정 · engine/valve=부팅 자동감지
@@ -106,6 +133,12 @@ SENLYT_STATE_DIR=$STATE_DIR
 #   서버 settings(GET-SSE) 수신 시 이 부트스트랩 매핑을 대체할 수 있다.
 PUMP_ADDRESSES=flavor:1,2;fragrance:1,2,3;aroma:1,2,3
 EOF
+if [ -n "$_PRESERVED" ]; then
+  {
+    echo "# ── 운영자 보존 값(재설치 유지 — 설치기가 관리하지 않는 키는 여기로 이월) ──"
+    printf '%s\n' "$_PRESERVED"
+  } >> "$ENV_FILE"
+fi
 
 # ── 5. systemd 유닛 — 부팅 자동시작 + 무인 복구(Restart=always) ────────────
 cat > "$SERVICE" <<EOF

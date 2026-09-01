@@ -38,8 +38,12 @@ class PumpPreset:
 
 # 빌트인 프리셋 정식 수치표 — SoT §6-2 (입력 무시·강제 · 바이트 동일 SoT = pumpGuard.ts).
 #
-# 현재 빌트인 = SY-01B 1종. 사용자 지정(custom)·Tecan(Cavro)은 제거됨(2026-07-18 · 서버 pumpGuard.ts
-# 와 동일) — clamp 는 어떤 입력이든 SY-01B 로 정규화한다. 도입 시 이 표에 1항목만 되살리면 된다.
+# 현재 빌트인 = SY-01B(기본) + Tecan XCalibur(2026-09-01 실물 도입 대비 재도입). 사용자 지정
+# (custom)은 제거 유지(2026-07-18). `clamp_pump_preset` 은 **명시 id "tecan_xcalibur" 만 존중**,
+# 그 외 전부(오타·미지·custom 포함) SY-01B 폴백이다 — 서버 pumpGuard.ts `clampPumpPreset` 과
+# byte-parity(2026-09-01 축 계약: 서버가 tecan 을 배웠다. ⛔ "무조건 sy01b" 로 원복 금지 —
+# 원복하면 설정축이 죽어 tecan 기기가 4배 토출한다). 어댑터 조립(`SENLYT_ENGINE=tecan`)은
+# 이와 별개로 자기 프리셋을 명시적으로 집어 쓴다(이중 키의 env 쪽).
 PUMP_PRESETS: dict[str, PumpPreset] = {
     "sy01b": PumpPreset(
         pump_preset_id="sy01b",
@@ -49,6 +53,21 @@ PUMP_PRESETS: dict[str, PumpPreset] = {
         pump_max_cutoff_speed_hz=5400,
         pump_max_slope=20,
         pump_syringe_type_code=200,
+    ),
+    # Tecan Cavro XCalibur — 수치 정본: 00_research "Manual Operating Cavro XCalibur
+    # 20733085-C.txt" (§3.3.2 N0 표준 3000 증분/풀스트로크 · §3.5.3 v 50..1000/V 5..6000/
+    # c 50..2700/L 1..20). 표준 모드(N0) 고정 — 미세모드(N1·24000)는 속도 단위가 바뀌므로
+    # (increments/sec) 실기기 프로브로 확정 전 도입하지 않는다.
+    # pump_syringe_type_code=0: XCalibur 에는 스톨전류 명령(U<code>,<n>)이 없다 — U 는
+    # NVM 설정 기록(§3.3.2 Table 3-5)이라 절대 오용 금지. 어댑터가 이 필드를 쓰지 않는다.
+    "tecan_xcalibur": PumpPreset(
+        pump_preset_id="tecan_xcalibur",
+        pump_full_stroke=3000,
+        pump_max_start_speed_hz=1000,
+        pump_max_top_speed_hz=6000,
+        pump_max_cutoff_speed_hz=2700,
+        pump_max_slope=20,
+        pump_syringe_type_code=0,
     ),
 }
 
@@ -64,13 +83,22 @@ def _round_half_up(x: float) -> int:
 
 
 def clamp_pump_preset(cfg: Mapping[str, Any] | None) -> PumpPreset:
-    """clampPumpPreset(cfg) — SoT §6-3 (서버 ↔ pi 동일 알고리즘).
+    """clampPumpPreset(cfg) — SoT §6-3 (서버 pumpGuard.ts 와 byte-parity·동일 알고리즘).
 
-    **항상 SY-01B 로 정규화**한다(사용자 지정 제거·2026-07-18). 입력 pumpPresetId·수치
-    (custom·unknown·레거시 포함)는 전부 무시하고 SY-01B 정식 수치를 강제 → 손 튜닝값이
-    물리로 가는 경로 차단(과다흡입 안전). syringeCapacityMl 은 호출 측이 별도 주입한다.
+    판정식(2026-09-01 테칸 재도입 — 서버 TS 와 동일하게 개정):
+      - `pumpPresetId == "tecan_xcalibur"` **명시 입력일 때만** 그 빌트인을 존중한다.
+      - 그 외 전부(부재·sy01b·custom·unknown·레거시 cavro_*) = SY-01B — 기존과 동일 바이트.
+      - 수치는 어느 쪽이든 **표 강제**(입력 수치 무시) — 손 튜닝값이 물리로 가는 경로 차단
+        (과다흡입 안전 불변식 유지). syringeCapacityMl 은 호출 측이 별도 주입한다.
+
+    ⚠️ 어댑터 생성자에 이 반환값을 주입하지 말 것 — 어댑터 preset 은 어댑터 클래스가
+    소유한다(검증 P1-6: settings 프리셋을 Sy01b 어댑터에 꽂으면 `U0,…`=XCalibur NVM
+    "밸브 없음" 기록 같은 조합이 문법적으로 가능해진다). 이 함수의 소비처는 스텝 축
+    (SyringeSpec.pump_full_stroke) 파생뿐이다.
     """
-    return PUMP_PRESETS["sy01b"]
+    raw_id = cfg.get("pumpPresetId") if isinstance(cfg, Mapping) else None
+    honored = "tecan_xcalibur" if raw_id == "tecan_xcalibur" else "sy01b"
+    return PUMP_PRESETS[honored]
 
 
 def resolve_syringe_capacity_ml(raw: Any, *, is_flavor: bool) -> float:
@@ -190,6 +218,13 @@ def is_volume_within_gate(volume_ul: float, spec: SyringeSpec) -> bool:
     return 0 < volume_ul <= spec.max_volume_ul
 
 
+# 축(stroke) 불일치 fail-closed 코드(2026-09-01 검증 C) — 어댑터 축 가드가 시리얼 송신 없이
+#   반환한다. 하드웨어 에러코드(0~15)·통신 sentinel(-1000·-2000)과 겹치지 않는 전용 음수.
+#   의미: "명령 spec 의 풀스트로크 ≠ 어댑터 프리셋 풀스트로크" — admin 설정(pumpPresetId)과
+#   기기 SENLYT_ENGINE 이 어긋난 상태. 무성 1/4·4배 토출을 막기 위해 모션 자체를 거부한다.
+AXIS_MISMATCH_RAW_CODE = -1001
+
+
 class EngineErrorClass(enum.Enum):
     """EnginePort 에러코드 분류 — SoT §6-7."""
 
@@ -201,9 +236,12 @@ class EngineErrorClass(enum.Enum):
 def classify_engine_error_code(code: int) -> EngineErrorClass:
     """엔진 raw errorCode(정수) → 분류 — SoT §6-7.
     0 = 정상 / 1·7·11·15·timeout = transient(R=3 재시도) / 2·3·9·10 = permanent(즉시중단 FAILED).
+    축 불일치(-1001)는 설정을 고치기 전엔 재시도가 무의미 — permanent 명시 분기.
     """
     if code == 0:
         return EngineErrorClass.NORMAL
+    if code == AXIS_MISMATCH_RAW_CODE:
+        return EngineErrorClass.PERMANENT
     if code in (1, 7, 11, 15):
         return EngineErrorClass.TRANSIENT
     if code in (2, 3, 9, 10):

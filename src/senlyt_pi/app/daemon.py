@@ -79,6 +79,7 @@ def _now_iso_ms() -> str:
 #   그게 **정상적인 fake 구동**인지 **보고 누락**인지 운영자가 화면에서 구분할 수 없었다.
 _ENGINE_WIRE_NAMES: dict[str, str] = {
     "Sy01bEngineAdapter": "sy01b",
+    "TecanXCaliburEngineAdapter": "tecan_xcalibur",
     "FakeEnginePort": "fake",
 }
 
