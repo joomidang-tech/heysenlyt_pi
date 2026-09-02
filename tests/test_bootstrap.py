@@ -83,20 +83,59 @@ def test_engine_injection_wins() -> None:
 
 
 # ── 자동감지("URL만" — SENLYT_ENGINE/VALVE 없이) ─────────────────────────────
-def test_engine_autodetect_pi_with_serial_is_sy01b() -> None:
-    """실 Pi + 시리얼 어댑터 존재 → sy01b(설치 시 SENLYT_ENGINE 불요)."""
+def test_engine_declared_sy01b_on_pi_is_sy01b() -> None:
+    """실 Pi + 서버 선언 sy01b → Sy01b (2026-09-02 단일 키 — 선택자는 pump_model 인자)."""
+    eng = build_engine(
+        {}, on_pi=lambda: True, port_lister=lambda: list(_CH340), pump_model="sy01b"
+    )
+    assert isinstance(eng, Sy01bEngineAdapter)
+
+
+def test_engine_declared_sy01b_without_serial_is_still_sy01b() -> None:
+    """실 Pi + 어댑터 미발견 + 선언 sy01b → **그래도 sy01b** (fake 조용 후퇴 금지 원칙 유지).
+
+    (2026-07-19 개정 근거 그대로: fake 후퇴는 명령이 모의로 조용히 성공해 운영자가 오판한다.
+    sy01b 로 기동해 정직하게 실패하고 핫플러그 자가 재연결이 붙는다.)"""
+    eng = build_engine({}, on_pi=lambda: True, port_lister=list, pump_model="sy01b")
+    assert isinstance(eng, Sy01bEngineAdapter)
+
+
+def test_engine_undeclared_on_pi_assembles_undeclared_adapter() -> None:
+    """실 Pi + 선언 없음(스냅샷·캐시 무효) → Undeclared **조립**(2026-09-02 fail-closed).
+
+    ⛔ 폴백 sy01b 금지 — tecan 이라 선언됐던 기기가 미확정 부팅에서 sy01b 로 조립되면
+    초기화 프리앰블 U…R 이 XCalibur NVM 에 기록된다.
+
+    R6.5 P2 — 조립 선택(N4: clamp 금지)과 거부 코드(N11: -1002)는 서로 다른 급소라
+    그물을 **두 테스트로 분리**한다. 한 테스트에 얹으면 그 테스트가 약해질 때 둘이 함께
+    무방비가 된다."""
+    from senlyt_pi.adapters.undeclared_engine_adapter import UndeclaredEngineAdapter
+
     eng = build_engine({}, on_pi=lambda: True, port_lister=lambda: list(_CH340))
-    assert isinstance(eng, Sy01bEngineAdapter)
+    assert isinstance(eng, UndeclaredEngineAdapter)
 
 
-def test_engine_autodetect_pi_without_serial_is_still_sy01b() -> None:
-    """실 Pi + 어댑터 미발견 → **그래도 sy01b** (2026-07-19 개정 — fake 조용 후퇴 금지).
+def test_engine_undeclared_refuses_all_motion_with_dedicated_code() -> None:
+    """Undeclared 어댑터의 전 모션 = -1002(UNDECLARED_HW_RAW_CODE) 거부 — 성공 위장 금지.
 
-    종전엔 fake 로 떨어져 명령이 모의로 조용히 성공했다(17:08 실측: USB 사망 후 재시작 →
-    admin '엔진 fake'·done 인데 실물 정지). 이제 sy01b 로 기동해 정직하게 실패(무응답
-    silent=빨강)하고, 핫플러그 자가 재연결이 USB 등장 시 스스로 붙는다."""
-    eng = build_engine({}, on_pi=lambda: True, port_lister=list)
-    assert isinstance(eng, Sy01bEngineAdapter)
+    N11 그물 — initialize 가 0(성공)을 돌려주면 상위가 "펌프 준비됨"으로 오판해
+    미확정 하드웨어에 토출 흐름이 이어진다."""
+    from senlyt_pi.adapters.undeclared_engine_adapter import UndeclaredEngineAdapter
+    from senlyt_pi.core.pump_guard import UNDECLARED_HW_RAW_CODE
+
+    eng = UndeclaredEngineAdapter()
+    assert eng.initialize().raw_error_code == UNDECLARED_HW_RAW_CODE
+    assert eng.probe(1) is False
+
+
+def test_engine_declared_tecan_on_pi_is_tecan() -> None:
+    """실 Pi + 서버 선언 tecan_xcalibur → Tecan 어댑터(3000축)."""
+    from senlyt_pi.adapters.tecan_xcalibur_engine_adapter import TecanXCaliburEngineAdapter
+
+    eng = build_engine(
+        {}, on_pi=lambda: True, port_lister=lambda: list(_CH340), pump_model="tecan_xcalibur"
+    )
+    assert isinstance(eng, TecanXCaliburEngineAdapter)
 
 
 def test_engine_autodetect_non_pi_is_fake_even_with_serial() -> None:
@@ -105,10 +144,18 @@ def test_engine_autodetect_non_pi_is_fake_even_with_serial() -> None:
     assert isinstance(eng, FakeEnginePort)
 
 
-def test_engine_explicit_env_overrides_autodetect() -> None:
-    """명시 SENLYT_ENGINE=fake 는 자동감지보다 우선(E2E 고정)."""
-    eng = build_engine({"SENLYT_ENGINE": "fake"}, on_pi=lambda: True, port_lister=lambda: list(_CH340))
-    assert isinstance(eng, FakeEnginePort)
+def test_engine_env_is_deprecated_and_ignored() -> None:
+    """SENLYT_ENGINE 잔재는 **무시**된다(2026-09-02 단일 키 — 결정권은 서버 선언뿐).
+
+    env=fake 여도 실 Pi + 선언 sy01b 면 sy01b 로 조립된다(env 가 선택에 관여하면 두 키가
+    부활한다). 비-Pi 개발환경 fake 는 on_pi 게이트가 담당(아래 non_pi 테스트)."""
+    eng = build_engine(
+        {"SENLYT_ENGINE": "fake"},
+        on_pi=lambda: True,
+        port_lister=lambda: list(_CH340),
+        pump_model="sy01b",
+    )
+    assert isinstance(eng, Sy01bEngineAdapter)
 
 
 def test_valve_autodetect_non_pi_is_fake() -> None:
@@ -149,16 +196,19 @@ def test_register_path_over_socket(tmp_path) -> None:
         assert store.load().device_id == "hw-e2e"
 
 
-# ── PUMP_ADDRESSES 부트스트랩 pump_map (install.sh 각인값과 계약) ──────────────
+# ── PUMP_ADDRESSES 부트스트랩 pump_map (운영자 override·기설치 잔존값 계약) ────
 #
-# install.sh 가 device.env 에 각인하는 값이 이 파서로 들어온다. 비면 pump_map 이 비어
-# 모든 레시피 스텝이 CMD_VALIDATION_FAILED 로 drop(토출 0) → 주문 실패. 그 계약을 고정한다.
+# env 다이어트(2026-09-02)로 install.sh 는 이 키를 더는 각인하지 않는다(주소 SoT = 부팅
+# 버스 스캔 자동인식). 그러나 ① 재설치 전 기존 기기의 각인값 ② 운영자가 넣는 고정 구성
+# override(⚠️ 관리 키라 **다음 재설치가 걷어낸다** — 재설치 전까지만 유효)는 계속 이
+# 파서로 들어온다 — 그 파싱 계약을 고정한다(비면 pump_map 이 비어
+# 모든 레시피 스텝이 CMD_VALIDATION_FAILED 로 drop(토출 0) → 주문 실패).
 
 _INSTALL_SH_PUMP_ADDRESSES = "flavor:1,2;fragrance:1,2,3;aroma:1,2,3"
 
 
 def test_pump_map_from_install_sh_value() -> None:
-    """install.sh 각인값 그대로 → 유효 addr 전부 매핑(빈 pump_map = 토출 0 회귀 방지).
+    """구 설치 각인값/override 형식 그대로 → 유효 addr 전부 매핑(빈 pump_map = 토출 0 회귀 방지).
 
     식향 2펌프(addr 1,2)·향장향 3펌프(addr 1,2,3) — 2026-07-17 확정.
     """
@@ -171,7 +221,7 @@ def test_pump_map_from_install_sh_value() -> None:
 
 
 def test_pump_map_never_maps_broadcast_addr_0() -> None:
-    """⚠️ addr 0 = RS485 브로드캐스트 — install.sh 각인값이 0 을 기기주소로 쓰지 않는다."""
+    """⚠️ addr 0 = RS485 브로드캐스트 — 표준 구성값이 0 을 기기주소로 쓰지 않는다."""
     assert 0 not in pump_map_from_addresses_env(_INSTALL_SH_PUMP_ADDRESSES)
 
 
@@ -183,7 +233,8 @@ def test_pump_map_flavor_default_capacity_is_05ml() -> None:
 
 
 def test_pump_map_empty_env_is_empty_map() -> None:
-    """미설정 → 빈 매핑(= 전 스텝 drop). install.sh 가 이 값을 반드시 각인해야 하는 이유."""
+    """미설정 → 빈 매핑(= 전 스텝 drop·안전측). 실기기는 버스 스캔(②)이 채우고, 스캔까지
+    실패하면 펌프 응답 감지 → 자동 재기동 재스캔(R8 P1-1)이 복구한다."""
     assert pump_map_from_addresses_env(None) == {}
     assert pump_map_from_addresses_env("") == {}
 

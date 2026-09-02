@@ -62,8 +62,16 @@ class FakeSerial:
         pass
 
 
-TECAN_SETTINGS = {"pumpPreset": {"pumpPresetId": "tecan_xcalibur", "syringeCapacityMl": 0.5}}
-SY01B_SETTINGS = {"pumpPreset": {"pumpPresetId": "sy01b", "syringeCapacityMl": 0.5}}
+# 신 서버 병합 스냅샷 꼴(R6 P0-1) — 선언 채널은 settings.hardware(서버 주입 블록)이고
+#   pumpPreset.pumpPresetId 는 산술 축이다(항상 값이 있어 선언 채널로 못 쓴다).
+TECAN_SETTINGS = {
+    "pumpPreset": {"pumpPresetId": "tecan_xcalibur", "syringeCapacityMl": 0.5},
+    "hardware": {"pumpModel": "tecan_xcalibur", "valvePortCount": 15, "source": "device"},
+}
+SY01B_SETTINGS = {
+    "pumpPreset": {"pumpPresetId": "sy01b", "syringeCapacityMl": 0.5},
+    "hardware": {"pumpModel": "sy01b", "valvePortCount": 12, "source": "mode_default"},
+}
 
 
 def _dispense_cmd(spec: SyringeSpec, volume_ul: float) -> EngineDispenseCommand:
@@ -77,9 +85,15 @@ def _dispense_cmd(spec: SyringeSpec, volume_ul: float) -> EngineDispenseCommand:
 
 
 class TestAssembledAxis:
-    def test_tecan_settings_and_env_produce_3000_axis_frames(self):
-        env = {"SENLYT_ENGINE": "tecan", "PUMP_ADDRESSES": "fragrance:1,2,3"}
-        engine = build_engine(env)
+    def test_tecan_settings_declaration_produces_3000_axis_frames(self):
+        # 단일 키(2026-09-02) — env 없이 **스냅샷 선언(pumpPresetId=tecan)** 하나로 어댑터·축이
+        #   같은 소스에서 조립된다(구 테스트의 SENLYT_ENGINE 이중 키를 대체).
+        from senlyt_pi.adapters.settings_source import pump_model_from_settings
+
+        env = {"PUMP_ADDRESSES": "fragrance:1,2,3"}
+        engine = build_engine(
+            env, on_pi=lambda: True, pump_model=pump_model_from_settings(TECAN_SETTINGS)
+        )
         assert isinstance(engine, TecanXCaliburEngineAdapter)
         resolver = build_resolver(env, engine=engine, server_settings=TECAN_SETTINGS)
         spec = resolver.pump_map[1]
@@ -226,9 +240,10 @@ class TestBootAxisDiagnosis:
         )
         return records
 
-    def test_mismatch_warns_with_both_axes_in_message(self, tmp_path):
-        # tecan 어댑터 + settings 부재(폴백 12000) = 축 불일치 — WARN 에 두 축 숫자가 남아야
-        #   한다(스냅샷 실패 tecan 기기의 유일한 조기 경보 — 검증 P1-B).
+    def test_drift_warns_with_both_axes_in_message(self, tmp_path):
+        # 주입된 tecan 어댑터 + settings 부재·무캐시(유효축 12000 폴백) = 축 드리프트 — WARN 에
+        #   두 축 숫자가 남아야 한다(단일 키 설계에서 이 WARN 은 "캐시/주입 어댑터 vs 유효 설정축"
+        #   드리프트 창의 유일한 조기 경보 — 검증 P1-B 취지 유지·2026-09-02 문구 개정).
         calls = {"n": 0}
 
         def none_fetcher(*_a):
@@ -237,7 +252,7 @@ class TestBootAxisDiagnosis:
 
         engine = TecanXCaliburEngineAdapter(serial_factory=lambda *_a: FakeSerial())
         records = self._boot(tmp_path, engine=engine, fetcher=none_fetcher)
-        warns = [r for r in records if "축 불일치" in str(r.get("message", ""))]
+        warns = [r for r in records if "축 드리프트" in str(r.get("message", ""))]
         assert warns, records
         assert warns[0]["detail"]["settingsStroke"] == 12000
         assert warns[0]["detail"]["adapterStroke"] == 3000
@@ -245,7 +260,7 @@ class TestBootAxisDiagnosis:
         #   admin 도달 전에 폐기하므로, 본문 인라인이 운영자에게 실제 도달하는 유일한 경로다.
         msg = str(warns[0]["message"])
         assert "12000" in msg and "3000" in msg, msg
-        # settings 재시도(P1-2) — tecan 은 3회 시도(순단 흡수).
+        # settings 재시도 — 엔진 무관 3회(R4 P0-1).
         assert calls["n"] == 3
 
     def test_matched_axis_no_warn_and_single_fetch_for_success(self, tmp_path):

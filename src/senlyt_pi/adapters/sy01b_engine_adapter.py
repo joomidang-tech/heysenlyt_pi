@@ -1175,10 +1175,13 @@ class Sy01bEngineAdapter:
     def _axis_guard(self, spec: SyringeSpec) -> "EngineResult | None":
         """스텝 축 불일치 거부 — `spec.pump_full_stroke ≠ preset.pump_full_stroke` 면 모션 0.
 
-        왜: 스텝은 서버 설정(pumpPresetId)이 정한 축으로 파생돼 오고, 어댑터는 기기 env
-        (SENLYT_ENGINE)가 정한 축으로 실행한다 — 두 축이 어긋난 채 실행하면
-        설정 tecan·기기 sy01b 조합에서 **에러 없이 정확히 1/4 토출**(거짓 성공·검증 상태표
-        케이스 4), 반대 조합에선 err3 전량 실패다. 어느 쪽도 실행하면 안 된다.
+        ⚠️ **은퇴 선언(2026-09-02 단일 키 설계·R-P0-1)** — 이 가드의 원래 가치는 좌변(서버 설정
+        pumpPresetId)과 우변(기기 env SENLYT_ENGINE)이 **독립 소스**라는 데 있었다. 이제 어댑터가
+        같은 스냅샷의 pumpModel 로 조립되므로 정상 부팅에선 좌우변이 항상 같다 — 교차검증은
+        소멸했고 대체 방어는 Undeclared fail-closed + 사람 수칙 + probe 관측이다. 코드가 남아
+        있는 이유(방어적 잔존): **캐시 부팅 vs 그 사이 바뀐 서버 선언**의 드리프트 창과 스테일
+        봉투 창에서는 여전히 좌우변이 갈릴 수 있다 — 그때 어긋난 채 실행하면 무성 1/4 토출
+        (또는 err3 전량 실패)이므로 모션 0 이 맞다.
 
         ⛔ **적용 범위 = stroke 를 실제로 소비하는 연산만** — `_cycle`(흡입/배출 A{steps})·
         `dispense_batch`(누적 A)·`run_op(plunger_full)`(A{fullStroke}). estop(TR 무인자)·
@@ -1190,7 +1193,7 @@ class Sy01bEngineAdapter:
             return None
         detail = (
             f"pump axis mismatch: cmd={spec.pump_full_stroke} ≠ adapter={self.preset.pump_full_stroke}"
-            " — 기기설정 pumpPresetId 와 SENLYT_ENGINE 불일치(설정 변경 시 senlytd 재시작 필요)"
+            " — 서버 센소리움 선언과 부팅 스냅샷/캐시가 어긋남(네트워크 확인 후 senlytd 재시작 필요)"
         )
         if self._log is not None:
             # ⚠️ 숫자를 message 에 인라인(검증 P2-3) — 서버 trace allowlist 는 message·engineCode 만

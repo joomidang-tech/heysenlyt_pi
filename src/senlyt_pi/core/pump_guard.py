@@ -222,7 +222,14 @@ def is_volume_within_gate(volume_ul: float, spec: SyringeSpec) -> bool:
 #   반환한다. 하드웨어 에러코드(0~15)·통신 sentinel(-1000·-2000)과 겹치지 않는 전용 음수.
 #   의미: "명령 spec 의 풀스트로크 ≠ 어댑터 프리셋 풀스트로크" — admin 설정(pumpPresetId)과
 #   기기 SENLYT_ENGINE 이 어긋난 상태. 무성 1/4·4배 토출을 막기 위해 모션 자체를 거부한다.
+# 축 불일치(2026-09-02 재해석) — 단일 키 설계에선 "스텝 조립 전제 축 vs 부팅 시 조립된 어댑터
+#   축"의 드리프트(캐시 부팅 중 서버 선언 변경·스테일 봉투 창)를 뜻한다. 구 의미("설정 vs
+#   SENLYT_ENGINE env 불일치")의 env 키는 은퇴됐다 — sy01b_engine_adapter._axis_guard 헤더 참조.
 AXIS_MISMATCH_RAW_CODE = -1001
+# 하드웨어 선언 미확정(2026-09-02 단일 키) — 스냅샷·캐시 모두 없거나 pumpModel 미지값. 어떤
+#   모션도 조립 불가(추측 금지) → permanent(미분류 코드의 보수 분기와 같은 등급). 복구 = 서버
+#   재접속(재fetch 성공 시 재기동) 또는 senlytd 재시작.
+UNDECLARED_HW_RAW_CODE = -1002
 
 
 class EngineErrorClass(enum.Enum):

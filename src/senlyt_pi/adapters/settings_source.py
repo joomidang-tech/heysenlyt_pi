@@ -27,7 +27,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.parse import urlencode
 
 from ..config.server_target import ServerConfig
@@ -39,6 +39,9 @@ from ..core.pump_guard import (
     resolve_syringe_capacity_ml,
 )
 from .http_client import SseStream, bearer_headers, open_sse
+
+if TYPE_CHECKING:
+    from ..persistence.hardware_profile_cache import HardwareProfile
 
 # 부팅 1회 settings SSE 타임아웃 — 서버는 subscribe 즉시 `event:settings` 를 push 하므로 짧게.
 #   connect 는 느린 링크를 빨리 포기(best-effort), read 는 첫 프레임 도착 여유.
@@ -79,10 +82,79 @@ def syringe_capacity_from_settings(settings: Any) -> float | None:
     return resolve_syringe_capacity_ml(cap, is_flavor=True)
 
 
+def pump_model_from_settings(settings: Any) -> "str | None":
+    """settings.**hardware.pumpModel** → 펌프 모델 **엄격 판독**(2026-09-02 단일 키 설계).
+
+    ⛔ 판독 채널은 `hardware`(기기 토큰 바인딩 SSE 에서만 서버가 주입하는 선언 블록) **단일**이다
+    — `pumpPreset.pumpPresetId` 를 읽으면 안 된다(R6 P0-1). 그 필드는 함대 settings 문서의
+    산술 축이라 **병합이 스킵돼도 항상 "sy01b" 가 채워져 있어**, "선언 없음"과 "sy01b 선언"을
+    구분할 수 없다 → 병합 스킵(레지스트리 순단·레거시 토큰·기기문서 부재) 부팅이 Tecan 실물에
+    sy01b 조립(U…R = XCalibur NVM 기록)으로 새고, 캐시까지 sy01b 로 오염된다. hardware 블록은
+    선언이 실제로 병합됐을 때만 존재하므로 부재 = 정직한 "미확정"(→ 캐시 폴백 → Undeclared).
+
+    ⛔ **clamp_pump_preset 미사용** — clamp 는 미지값을 sy01b 로 정규화하는데, 엔진 선택에서 그
+    관대함은 같은 U-NVM 급소로 샌다. 정확 등가만 인정, 그 외/부재 = None. 신모델의 카탈로그
+    등재는 그 모델을 지원하는 pi 릴리스와 동시에만 한다는 릴리스 규칙이 이 엄격성의 짝이다.
+
+    하위호환: 구 서버(hardware 미주입)와의 조합은 None → 캐시 → Undeclared 로 착지한다 —
+    롤아웃 규칙(web 선행 발행)이 이 조합을 봉쇄하고, 어겨도 무동작(복구 가능)이지 오조립이 아니다.
+    """
+    if not isinstance(settings, Mapping):
+        return None
+    hw = settings.get("hardware")
+    if not isinstance(hw, Mapping):
+        return None
+    model = hw.get("pumpModel")
+    if model in ("sy01b", "tecan_xcalibur"):
+        return model
+    return None
+
+
+def valve_port_count_from_settings(settings: Any) -> "int | None":
+    """settings.hardware.valvePortCount(센소리움 파생·서버 주입 필드) → 12|15. 부재/불량 = None(→12).
+
+    hardware 블록은 **settings 객체 내부**의 서버 주입 필드다(clamp allowlist 밖 — 기기 토큰
+    바인딩 SSE 에서만 병합됨). 구 서버 스냅샷엔 없다 = None = 기존 12 거동(하위호환).
+    """
+    if not isinstance(settings, Mapping):
+        return None
+    hw = settings.get("hardware")
+    if not isinstance(hw, Mapping):
+        return None
+    n = hw.get("valvePortCount")
+    if isinstance(n, bool) or not isinstance(n, int):
+        return None
+    return n if n in (12, 15) else None
+
+
 def full_stroke_from_settings(settings: Any) -> int | None:
     """MachineSettings.pumpPreset → clamp된 pumpFullStroke. 부재 → None(sy01b 12000 폴백 유도)."""
     preset = _preset_of(settings)
     return preset.pump_full_stroke if preset is not None else None
+
+
+def hardware_profile_from_snapshot(model: str, settings: Any) -> "HardwareProfile":
+    """선언 스냅샷 → 캐시용 HardwareProfile — **이 함수가 유일한 조립 지점**이다.
+
+    stroke 폴백은 **선언된 모델의** 프리셋 기본(R6.5 P2) — sy01b 고정이면 "tecan 선언 +
+    pumpPreset 부재" 프레임이 {tecan, 12000} 프로파일을 캐시에 남겨, 다음 오프라인 부팅이
+    어댑터 3000 vs spec 12000 = 영구 -1001 로 죽는다. 이 규칙을 bootstrap 과 senlytd
+    (_undeclared_refetch)가 각자 손으로 유지하다 한쪽만 어긋나는 걸 막기 위해 여기로 모았다.
+
+    `model` 은 pump_model_from_settings 가 좁힌 값("sy01b"|"tecan_xcalibur")만 온다 —
+    PUMP_PRESETS 미등재 키가 오면 KeyError 로 시끄럽게 죽는 게 맞다(추측 조립 금지).
+    """
+    from ..persistence.hardware_profile_cache import HardwareProfile
+
+    hw = settings.get("hardware") if isinstance(settings, Mapping) else None
+    sv = hw.get("sensoriumVersion") if isinstance(hw, Mapping) else None
+    return HardwareProfile(
+        pump_model=model,
+        pump_full_stroke=full_stroke_from_settings(settings)
+        or PUMP_PRESETS[model].pump_full_stroke,
+        valve_port_count=valve_port_count_from_settings(settings) or 12,
+        sensorium_version=str(sv) if sv is not None else None,
+    )
 
 
 def pump_addrs_from_settings(settings: Any) -> list[int]:

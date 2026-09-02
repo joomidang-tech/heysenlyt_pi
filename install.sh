@@ -13,9 +13,14 @@
 # 사람이 넣는 건 **서버 URL 하나**뿐. 나머지는 켜진 뒤 자동:
 #   - deviceId  = HW 시리얼 자동수집(RPi4=cpuinfo·RPi5=device-tree)
 #   - mode      = admin에서 승인할 때 배정 → 서버가 기기에 내려줌
-#   - engine/valve = 부팅 자동감지(실 Pi+시리얼 어댑터→sy01b·GPIO→gpio·아니면 fake)
+#   - 펌프 모델 = **admin 센소리움 선언**(부팅 스냅샷 수신 — 미배정이면 전 모션 거부로 안전 대기.
+#     ⇒ Tecan 실물은 admin 에서 +tecan 배정 후 설치/재시작) · valve = GPIO 자동감지
+#   - 펌프 주소 = 부팅 버스 스캔 자동인식(+ 인식 실패 시 펌프 응답 감지 → 자동 재기동 재스캔)
 # 등록은 키 없이 신청(TOFU) → admin에서 "승인"해야 online.  (재실행 안전·멱등)
 set -euo pipefail
+# 로케일 고정(R8) — env 보존 글롭 `[A-Z_]*` 가 UTF-8 collation 에선 소문자까지 매치해
+# 로케일마다 보존 결과가 갈린다. C 고정 = ASCII 대문자 키만 보존(결정론·systemd 관습 정합).
+export LC_ALL=C
 
 SERVER_URL="${1:-}"
 REPO="https://github.com/joomidang-tech/heysenlyt_pi.git"
@@ -88,12 +93,24 @@ python3 -m venv --system-site-packages "$APP_DIR/.venv"
 mkdir -p "$ENV_DIR" "$LOG_DIR" "$STATE_DIR/queue"
 umask 077
 # ⛔ 운영자 보존 값 수확(검증 P0-2 봉합·2026-09-01) — 종전엔 재실행마다 파일을 통째 재생성해
-#   운영자가 손으로 넣은 키(SENLYT_ENGINE=tecan·SENLYT_VALVE_PINS 등)가 증발했다. Tecan 기기에서
-#   이 증발은 자동감지 sy01b 로의 오배선(=XCalibur 에 U 송신·NVM 기록 위험)으로 직결된다.
-#   방식: 설치기가 관리하는 키(아래 템플릿이 찍는 6개)만 갱신하고, 그 외 `KEY=값` 행은 전부
-#   "운영자 보존 값" 섹션으로 이월한다. "존재 시 미갱신"은 기각 — 서버 URL 교체·템플릿 개선이 죽는다.
-#   멱등: 재실행마다 동일 결과(보존 섹션은 정렬·중복 제거).
-_MANAGED_KEYS="SENLYT_SERVER_BASE_URL SENLYT_RUN LOG_DIR SENLYT_LEDGER_PATH SENLYT_STATE_DIR PUMP_ADDRESSES"
+#   운영자가 손으로 넣은 키(SENLYT_VALVE_PINS 등)가 증발했다. 방식: 설치기가 관리하는 키만
+#   갱신하고, 그 외 `KEY=값` 행은 전부 "운영자 보존 값" 섹션으로 이월한다. "존재 시 미갱신"은
+#   기각 — 서버 URL 교체·템플릿 개선이 죽는다. 멱등: 재실행마다 동일 결과.
+# ⚠️ env 다이어트(2026-09-02 — "기기가 알아야 하는 건 어느 서버에 붙는가뿐"): 템플릿이 찍는
+#   설정은 이제 **SENLYT_SERVER_BASE_URL 하나**다. 나머지는 결정권이 딴 데 있거나 파생값이라
+#   env 파일에서 걷어낸다(관리 목록 = strip 대상 — 재설치가 옛 각인을 제거):
+#     - SENLYT_ENGINE            → 폐기. 펌프 모델 = admin 센소리움 선언(부팅 스냅샷) 단일 채널.
+#     - PUMP_ADDRESSES           → 부팅 버스 스캔 자동인식(실펌프 응답 = 존재 SoT, 모드는 서버
+#                                  배정 우선)이 원래 SoT — 각인은 그 자동화를 가리는 과잉이었다.
+#     - SENLYT_RUN·LOG_DIR·SENLYT_STATE_DIR·SENLYT_LEDGER_PATH
+#                                → 설정이 아니라 서비스 배선(설치 표준 경로·소비루프 스위치).
+#                                  systemd 유닛 Environment= 로 이동(아래 5절) — 운영자 device.env
+#                                  의 같은 키가 유닛 값을 덮는다(EnvironmentFile 이 나중 적용).
+#   순서 권고: Tecan 실물 기기는 **admin 에서 +tecan 센소리움 배정 후** 설치/재시작하는 게
+#   매끄럽다(배정 전 부팅은 UndeclaredEngineAdapter = 전 모션 거부라 **안전**하지만, 선언 수신
+#   → 자동 재기동 1사이클을 더 돈다). 종전 "배정 전 부팅 = sy01b 조립 → NVM 기록 위험" 서술은
+#   수정 전 거동이다 — 미선언 폴백 sy01b 는 코드에서 금지됐다(bootstrap 조립 테스트가 강제).
+_MANAGED_KEYS="SENLYT_SERVER_BASE_URL SENLYT_RUN LOG_DIR SENLYT_LEDGER_PATH SENLYT_STATE_DIR PUMP_ADDRESSES SENLYT_ENGINE"
 _PRESERVED=""
 if [ -f "$ENV_FILE" ]; then
   # `|| [ -n "$line" ]` — 끝 개행 없는 파일의 마지막 줄 보존(검증 P2-E: read 가 EOF 에서 false 를
@@ -115,23 +132,14 @@ if [ -f "$ENV_FILE" ]; then
   _PRESERVED=$(printf '%s' "$_PRESERVED" | awk -F= 'NF{v[$1]=$0; if(!seen[$1]++){order[++n]=$1}} END{for(i=1;i<=n;i++) print v[order[i]]}')
 fi
 cat > "$ENV_FILE" <<EOF
-# hey senlyt pi — 설치가 각인한 값. 넣는 건 서버 URL 하나(나머지는 런타임 자동).
-#   deviceId=HW시리얼 자동 · mode=admin 승인 시 배정 · engine/valve=부팅 자동감지
+# hey senlyt pi — 설치가 각인한 값. **서버 URL 하나뿐**이다(2026-09-02 env 다이어트).
+#   deviceId=HW시리얼 자동 · mode=admin 승인 시 배정 · 펌프모델/포트=admin 센소리움 선언 ·
+#   펌프주소=부팅 버스 스캔 자동인식 · 경로/런스위치=systemd 유닛(Environment=).
+#   여기에 KEY=값 을 추가하면 유닛 기본값을 덮는다(운영자 override).
+#   ⚠️ 보존 범위: 설치기 관리 키(_MANAGED_KEYS — SENLYT_RUN·LOG_DIR·SENLYT_STATE_DIR·
+#   SENLYT_LEDGER_PATH·PUMP_ADDRESSES·SENLYT_ENGINE)는 **재설치가 걷어낸다** — 그 키의
+#   override 는 다음 재설치 전까지만 유효하다. 그 외 키(SENLYT_VALVE_* 등)만 재설치에도 보존.
 SENLYT_SERVER_BASE_URL=$SERVER_URL
-SENLYT_RUN=1
-LOG_DIR=$LOG_DIR
-SENLYT_LEDGER_PATH=$STATE_DIR/queue/idempotency-ledger.log
-# 정체성은 **서버(환경)별로 분리** 저장한다($STATE_DIR/identities/{서버host}.json) — 데몬이 이 STATE_DIR 밑에
-#   서버 URL 로 파일명을 파생한다. 그래서 서버를 바꿔 재설치해도 각 서버의 등록·승인이 보존되고,
-#   다시 그 서버로 돌아오면 재승인 없이 즉시 재사용된다(2026-07-23). (SENLYT_IDENTITY_PATH 를 명시하면
-#   그 단일 파일로 고정 — 하위호환 override.)
-SENLYT_STATE_DIR=$STATE_DIR
-# 펌프 RS485 주소 → RecipeResolver pump_map(부트스트랩). 없으면 pump_map 이 비어
-# 모든 레시피 스텝이 CMD_VALIDATION_FAILED 로 drop(토출 0)되어 주문이 실패한다.
-#   flavor(식향)=addr 1,2(시린지 2펌프) · fragrance(향장향)=addr 1,2,3(3펌프).
-#   ⚠️ addr 0 은 RS485 브로드캐스트라 기기주소로 쓰지 않는다. 용량은 양 모드 공통 0.5mL.
-#   서버 settings(GET-SSE) 수신 시 이 부트스트랩 매핑을 대체할 수 있다.
-PUMP_ADDRESSES=flavor:1,2;fragrance:1,2,3;aroma:1,2,3
 EOF
 if [ -n "$_PRESERVED" ]; then
   {
@@ -149,6 +157,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# 서비스 배선 값(설정 아님 — env 다이어트 2026-09-02). 소비루프 스위치 + 설치 표준 경로.
+#   정체성은 서버(환경)별 분리 저장(\$SENLYT_STATE_DIR/identities/{서버host}.json — 데몬이 서버
+#   URL 로 파일명 파생·2026-07-23): 서버를 바꿔 재설치해도 각 서버의 등록·승인이 보존된다.
+# EnvironmentFile 은 **선언 위치와 무관하게** Environment= 를 덮는다(systemd.exec(5):
+#   "Settings from these files override settings made with Environment=" — 순서 규칙은
+#   EnvironmentFile **끼리**에만 적용). 그래서 device.env 의 같은 키가 항상 이긴다 —
+#   아래 배치 순서는 가독성이지 우선순위 장치가 아니다.
+Environment=SENLYT_RUN=1
+Environment=LOG_DIR=$LOG_DIR
+Environment=SENLYT_STATE_DIR=$STATE_DIR
+Environment=SENLYT_LEDGER_PATH=$STATE_DIR/queue/idempotency-ledger.log
 EnvironmentFile=$ENV_FILE
 ExecStart=$APP_DIR/.venv/bin/senlytd
 Restart=always
