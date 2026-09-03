@@ -63,6 +63,7 @@ import time
 from typing import Callable, Iterable, Protocol, Sequence
 
 from ..core.pump_guard import (
+    MODEL_MISMATCH_RAW_CODE,
     AXIS_MISMATCH_RAW_CODE,
     PumpPreset,
     SyringeSpec,
@@ -85,10 +86,28 @@ from ..test_seam.fake_engine_sentinels import FAKE_EMPTY_RAW_CODE, FAKE_TIMEOUT_
 FRAME_START = "/"
 FRAME_END = "\r"
 ETX = 0x03  # 응답 종료 문자
+
+# Tecan 펌웨어 파트넘버 지문(모델 불일치 게이트·2026-09-03) — 벤치 실측 '30064809 C'.
+#   Tecan 3000-계열 파트넘버(8자리, 30 시작) + 공백 + rev 문자. SY-01B 의 & 거동은 미실측 —
+#   이 패턴 "매치"만 차단 근거로 쓴다(미매치/무응답 = fail-open).
+import re as _re
+_TECAN_FP_RE = _re.compile(r"^30\d{6}\s+[A-Z]\b")
+# 공개 별칭(2026-09-03 검증팀 P1-2) — 소비자(hwtool 연결단 409 게이트)가 같은 판정을 쓰려면
+#   여기서 import 해야 한다. 정규식을 복붙하면 지문 패턴 갱신(SY-01B & 실측 후 대칭화 예정) 때
+#   두 게이트의 판정이 갈라진다 — 지문 패턴의 SoT 는 이 파일 하나다.
+#   ⚠️ 알려진 한계: XCalibur 매뉴얼 자신은 "737230 revision A" 형 파트넘버도 예시한다(§3.2.5) —
+#   이 패턴은 30-계열(벤치 실측 "30064809 C")만 잡는다. 미매치=fail-open(차단 안 함)이라 오동작은
+#   없지만, 타 로트 XCalibur 에선 정방향 게이트가 열릴 수 있다(실측 지문 축적 시 확장).
+TECAN_FP_RE = _TECAN_FP_RE
 STATUS_ERROR_MASK = 0x0F  # 상태바이트 하위 4비트 = 에러코드
 STATUS_READY_BIT = 0x20  # bit5 = Ready(모터 정지·명령 수락 가능)
 STATUS_QUERY = "?"  # 상태 조회(모터 회전 중에도 수락되는 몇 안 되는 명령)
-TERMINATE = "TR"  # in-flight 이동 중단 + 포트 클린
+# in-flight 이동 중단. ⚠️ "포트 클린"·"에러 클리어"는 매뉴얼 무근거(V1.2 §4.5.4 는 "이동·루프·지연
+#   종료"뿐 — v1.1.0 실측 관례)라, 복구 경로는 TR 을 믿지 않고 항상 재초기화를 예약한다.
+#   ⚠️ XCalibur 는 이 프레임이 위험하다 — §3.5.5: "[R] … resumption of a halted or terminated
+#   command string" = T 직후의 R 이 방금 종료한 모션을 **재개**할 수 있다(기종별 차이 — tecan 은
+#   TERMINATE_CMD="T" 로 재정의). SY-01B 는 v1.1.0 필드 검증된 관례라 TR 유지.
+TERMINATE = "TR"
 # OSError(핫플러그) 재연결 후 **같은 프레임 재전송이 허용되는 명령** — 멱등(모션 무발생)만
 #   (2026-07-19 P1 · 물리 이중 토출 방어). OSError 는 write 성공 후 read 대기(최대 5s — 이 링크는
 #   무응답이 잦아 창이 넓다) 중에도 난다 — 그 시점 펌프는 이미 명령을 받아 모션을 시작했을 수
@@ -108,6 +127,18 @@ _RECONNECT_RESEND_SAFE = frozenset({STATUS_QUERY, TERMINATE})
 #   open-loop(명령 받으면 펌프가 알아서 홈)라 **fire-and-forget**(발사 후 고정 대기)으로 처리하고,
 #   진짜 죽은 펌프는 이후 **토출 경로의 Ready 폴**에서 드러난다(v1.0.0 기기설정 툴 검증 방식).
 BROADCAST_ADDR = "_"
+
+
+def _addr_char(addr: int) -> str:
+    """DT 프레임 주소 문자 — 매뉴얼 정본 인코딩 `30H + n`(양 기종 동일 표).
+
+    1..9 는 '1'..'9'(기존과 동일 바이트), 10..15 는 ':'..'?'(SY-01B §3.4 / XCalibur Table 3-2).
+    종전 `f"/{addr}…"` 는 addr=10 에서 `/10…` = "펌프 1 에 명령 '0…'" 오프레임이 됐다
+    (2026-09-03 검증 P2 — 현 배선은 1..9 만 쓰므로 실노출 0·확장 대비 정직화).
+    """
+    if not 1 <= addr <= 15:
+        raise ValueError(f"DT 주소 범위 밖: {addr} (1..15)")
+    return chr(0x30 + addr)
 SAFE_PORT = 12  # 안전 포트 = Air(누액 없는 자세) — v1.1.0 initializeAll [4/4] I12R.
 
 DEFAULT_BAUDRATE = 9600  # 8N1
@@ -270,6 +301,23 @@ class Sy01bEngineAdapter:
     버스 락도 이 인스턴스가 소유한다.
     """
 
+    # 이 어댑터의 기종 프레임(U 등)이 "남의 실물"에 나가는 걸 막는 지문 게이트 스위치(R9 P2-2).
+    #   `type(self) is` 판정은 제3 파생에서 조용히 꺼진다 — **방언 소유를 명시 선언**한다.
+    #   sy01b 방언 계열 파생은 True 유지, 타 기종(tecan)은 False 로 재선언.
+    FOREIGN_FP_GUARD = True
+    # ── 기종별 차이(방언) 클래스 선언 — 파생 어댑터는 "값 재선언"만 하고 기계는 상속한다
+    #   (2026-09-03 5팀 검증 — "명령어만 다르고 코드는 일치" 원칙의 클래스 표현) ──
+    MODEL_ID = "sy01b"  # 결선 키(PUMP_PRESETS·센소리움 pumpModel)와 동일 문자열 — 클래스가 자기 정체 선언.
+    # 정지 프레임 — SY-01B 는 v1.1.0 필드 검증된 `TR`. XCalibur 는 R 이 종료된 문자열을 재개할 수
+    #   있어(§3.5.5) `T` 단독으로 재정의된다. 모든 정지 발사 지점은 이 속성만 본다.
+    TERMINATE_CMD = TERMINATE
+    # 속도 하한 — SY-01B 는 1 까지 관용, XCalibur 는 50 미만이 err3(명령 폐기)라 50 으로 재선언.
+    #   `_speed_cmd` 본문은 공유(복붙 금지 — 부모 공식이 바뀌면 파생도 자동 추종).
+    MIN_SPEED_HZ = 1
+    # err7(미초기화)을 완료 폴에서 만났을 때 — SY-01B 는 "홈 재탐색 중"이라 계속 폴(v1.1.0 parity),
+    #   XCalibur 는 "무모션 즉답 거부"(벤치 실측)라 기다릴 대상이 없어 즉시 실패로 재선언(False).
+    ERR7_REHOMES = True
+
     def __init__(
         self,
         *,
@@ -327,12 +375,18 @@ class Sy01bEngineAdapter:
         #   과 **분리**한다: estop 은 정지 후 복구(초기화)가 이어지지만 shutdown 은 프로세스 종료다.
         #   데몬 감시 스레드가 서버 estop 신호를 보고 set, 복구(초기화)가 clear 한다(공유 이벤트 주입).
         self._estop = estop_event if estop_event is not None else threading.Event()
+        # 부팅 발견(probe) 관찰 명령 — 기본 = 판정 폴(_status_cmd). tecan 은 Q 가 래치를
+        #   소진하므로(벤치 실측) `?` 로 재선언한다(R9 P2-6 — 발견 판정은 응답 여부뿐).
+        self._probe_cmd: "str | None" = None
+        # 모델 지문 게이트 캐시 — 판독 성공한 주소만(R9 P2-3). 재연결·close 에서 비운다.
+        self._fp_checked: set[int] = set()
+        self._fp_fails: dict[int, int] = {}
         # 셋업을 마친 주소 — 매 스텝마다 U200/Z 를 재전송하지 않기 위한 캐시.
         self._initialized: set[int] = set()
         # 펌웨어 버전 관측을 마친 주소(부팅당 1회) — 실물 기종 판별 재료 채집용(아래 probe).
         self._fw_observed: set[int] = set()
         # probe 시 `&` 펌웨어 관측 채집 여부 — 기본 OFF(sy01b 기본 경로 1바이트 불변·R3 P2-4).
-        #   tecan 파생 어댑터만 True 로 켠다(미실측 프레임을 sy01b 함대에 내보내지 않는다).
+        #   tecan 파생 어댑터만 True 로 켠다(미실측 프레임을 sy01b 함대에 내보내지 않는다. ⚠️ 예외 1건 = _model_gate 의 & 지문(U/NVM 오발사 방지가 더 큰 안전 — 1.5s·3회 상한으로 비용 캡·R9.5)).
         self._fw_probe_capture: bool = False
 
     # ── 연결 ────────────────────────────────────────────────────────────────
@@ -343,8 +397,22 @@ class Sy01bEngineAdapter:
                 self._serial = self._factory(self.port, self.baudrate, self.read_timeout_s)
             return self._serial
 
+    def _invalidate_link_caches(self) -> None:
+        """링크 리셋(close/핫플러그 재연결) 시 캐시 일괄 무효화 — 실물 교체·전원 사이클 가능 지점.
+
+        지문 캐시(다음 오픈에서 재검사·R9 P2-3)와 **셋업 캐시**를 함께 비운다(2026-09-03 검증 P2):
+        재연결 동안 펌프 전원이 사이클됐으면 스톨전류(U)·표준축(N0) 같은 셋업이 휘발됐을 수 있는데
+        캐시가 남으면 `_ensure_ready` 가 재셋업을 건너뛴다 — XCalibur 는 N1 잔존 = 무성 1/8 토출.
+        재초기화(Z 홈)는 다음 모션 요청 때 돈다(재연결 시점엔 모션을 만들지 않는다 — 안전측).
+        파생 어댑터는 super() 호출 후 자기 관측 캐시를 추가로 비운다.
+        """
+        self._fp_checked.clear()
+        self._fp_fails.clear()
+        self._initialized.clear()
+
     def close(self) -> None:
         """시리얼 정리(멱등) — 데몬 우아한 종료 경로."""
+        self._invalidate_link_caches()
         with self._open_lock:
             s, self._serial = self._serial, None
         if s is not None:
@@ -377,8 +445,8 @@ class Sy01bEngineAdapter:
             if addr < 1:
                 continue  # 0 = RS485 브로드캐스트 금지
             try:
-                self._txn(addr, TERMINATE)
-            except Exception:  # noqa: BLE001 — 한 펌프 TR 실패가 나머지 정지를 막지 않는다.
+                self._txn(addr, self.TERMINATE_CMD)
+            except Exception:  # noqa: BLE001 — 한 펌프 정지 실패가 나머지 정지를 막지 않는다.
                 if self._log is not None:
                     self._log.warn(
                         "긴급정지 TR 발송 실패", stage=STAGE_STEP_EXEC, pumpAddr=addr
@@ -401,6 +469,7 @@ class Sy01bEngineAdapter:
         반환 = 성공 여부. 실패면 호출자가 원 예외를 그대로 올린다(정직한 실패 — 다음
         트랜잭션이 다시 시도하므로 어댑터를 못 찾는 동안에도 데몬은 계속 산다).
         """
+        # 재연결 = 실물 교체/전원 사이클 가능 — 지문·셋업 캐시 동반 무효(close 안에서 일괄).
         self.close()
         cands: list[str] = []
         if self._port_resolver is not None:
@@ -442,7 +511,7 @@ class Sy01bEngineAdapter:
         (위 `_reconnect_serial` + `_RECONNECT_RESEND_SAFE` — 모션 명령 재전송은 이중 토출 위험).
         """
         timeout_s = read_timeout_s if read_timeout_s is not None else self.read_timeout_s
-        frame = f"{FRAME_START}{addr}{command}{FRAME_END}".encode("ascii")
+        frame = f"{FRAME_START}{_addr_char(addr)}{command}{FRAME_END}".encode("ascii")
         try:
             return self._txn_io(frame, addr, command, timeout_s)
         except OSError as e:
@@ -505,9 +574,15 @@ class Sy01bEngineAdapter:
             )
         return resp
 
-    def _query_status(self, addr: int, *, read_timeout_s: float | None = None) -> tuple[int, bool]:
-        """상태조회(`_status_cmd`) 한 번 — `(error_code, ready)`. 모터 회전 중에도 수락된다."""
-        return parse_status(self._txn(addr, self._status_cmd, read_timeout_s=read_timeout_s))
+    def _query_status(
+        self, addr: int, *, read_timeout_s: float | None = None, cmd: "str | None" = None
+    ) -> tuple[int, bool]:
+        """상태조회(`_status_cmd`) 한 번 — `(error_code, ready)`. 모터 회전 중에도 수락된다.
+
+        `cmd` seam(R9 P2-6) — 부팅 발견(probe)처럼 **관찰만** 하는 호출자는 래치를 소진하지
+        않는 명령(tecan=`?`)을 지정할 수 있다. 기본 = 판정 폴용 `_status_cmd`.
+        """
+        return parse_status(self._txn(addr, cmd or self._status_cmd, read_timeout_s=read_timeout_s))
 
     def _query_status_raw(
         self, addr: int, *, read_timeout_s: float | None = None
@@ -527,7 +602,7 @@ class Sy01bEngineAdapter:
         TR+U200+Z 로 홈을 되찾은 뒤 절대 이동으로 재시도한다(안전 복구).
         """
         try:
-            self._txn(addr, TERMINATE)
+            self._txn(addr, self.TERMINATE_CMD)
         except Exception:  # noqa: BLE001 — TR 실패가 에러 보고를 막지 않는다.
             pass
         self._initialized.discard(addr)
@@ -577,8 +652,10 @@ class Sy01bEngineAdapter:
             if code in (9, 10):
                 self._terminate_and_flag_reinit(addr, code, "펌프 오버로드 래치 — TR+재초기화 강제")
                 return code
-            # 미초기화(7) = 홈 상실 — 셋업 캐시 무효화 후 계속 폴(v1.1.0 parity·홈 재탐색 대기).
-            #   토출 중(addr 등록됨)이면 이 폴이 끝난 뒤 상위 재시도의 `_ensure_ready` 가 재초기화한다.
+            # 미초기화(7) — 기종별 의미가 다르다(ERR7_REHOMES seam·2026-09-03 검증 P2):
+            #   sy01b = "홈 재탐색 중"이라 계속 폴(v1.1.0 parity — 토출 중이면 폴 뒤 상위 재시도의
+            #   `_ensure_ready` 가 재초기화) / XCalibur = "무모션 즉답 거부"(벤치 실측 — 모터가 서
+            #   있는데 30s 를 매달리는 건 제1원칙 1 위반)라 즉시 실패로 올린다.
             if code == 7:
                 self._initialized.discard(addr)
                 if self._log is not None:
@@ -588,6 +665,8 @@ class Sy01bEngineAdapter:
                         pumpAddr=addr,
                         engineCode=7,
                     )
+                if not self.ERR7_REHOMES:
+                    return 7  # 무모션 거부(XCalibur) — 기다릴 모션이 없다. 정직한 실패.
                 time.sleep(POLL_INTERVAL_S)
                 continue
             # ── 모터 정지(Bit5 idle) — 이 명령의 모션이 끝났다 ──
@@ -615,10 +694,14 @@ class Sy01bEngineAdapter:
 
         서버가 정책(전역 × 포트 오버라이드)을 이미 확정해 보냈다. pi 는 그 값이 이 펌프의 물리
         상한을 넘지 않는지만 본다(하드웨어 보호). 제약 = `v ≤ c ≤ V`(느리게 출발·느리게 끝).
+        하한은 기종별 차이(`MIN_SPEED_HZ` — sy01b=1 관용·XCalibur=50 미만 err3)라 클래스 속성만
+        재선언하면 이 공식 전체가 파생에 그대로 적용된다(본문 복붙 금지 — 2026-09-03 검증 P2).
+        ⚠️ start/cutoff 미지정 시 프리셋 **상한**(v1000·c5400)이 그대로 나간다 — 매뉴얼 기본
+        (900/900)보다 공격적이나 v1.2.0 이후 운영이 이 값으로 필드 검증돼 유지(바꾸면 토출 재보정).
         """
         p = self.preset
         top = min(int(top_hz), p.pump_max_top_speed_hz) if top_hz else p.pump_max_top_speed_hz
-        top = max(1, top)
+        top = max(self.MIN_SPEED_HZ, top)
         # 시작·컷오프는 top 을 넘지 못한다(단조성) + 각자의 프리셋 상한 안.
         start = min(p.pump_max_start_speed_hz, top)
         cutoff = max(min(p.pump_max_cutoff_speed_hz, top), start)
@@ -725,6 +808,10 @@ class Sy01bEngineAdapter:
         여기서 **모드로 분기하지 않는다** — v1.1.0 사고 경로가 정확히 "설정 용량을 무시하고 모드
         기본으로 초기화힘을 유도"였다.
         """
+        # 모델 지문 게이트 — 공용 함수(R9 P0-1: _setup 뿐 아니라 폴/브로드캐스트 초기화도
+        #   같은 지점을 타야 한다. 판정을 경로마다 복제하면 하나가 빠지는 구조가 되풀이된다).
+        if (g := self._model_gate((addr,))) != 0:
+            return g
         for pre in self._pre_init_commands(spec):
             code = self._settle(addr, pre, self.read_timeout_s)
             if code != 0:
@@ -817,7 +904,7 @@ class Sy01bEngineAdapter:
         #   그래서 에러 상태의 펌프는 초기화조차 못 해 전원 재투입 전까지 벽돌이 됐다
         #   (project_hey_senlyt_pump_recovery_brick). 결과를 무시하고 셋업으로 간다.
         try:
-            self._txn(addr, TERMINATE)
+            self._txn(addr, self.TERMINATE_CMD)
         except Exception:  # noqa: BLE001 — TR 실패가 복구를 막으면 안 된다(그게 그 사고였다).
             pass
         code = self._setup(addr, spec, init_in_port, init_out_port)
@@ -924,8 +1011,11 @@ class Sy01bEngineAdapter:
         #   시퀀스 도중(특히 홈 고정 대기) 감시 스레드의 estop 이 이 창을 뚫지 못한다(리뷰 P2).
         #   중단 시: 남은 브로드캐스트(홈·안전포트 = 물리 이동)를 발사하지 않고, 셋업 캐시도
         #   등록하지 않은 채 전 펌프 실패(_NO_RESPONSE)로 반환한다 — 운영자가 다시 누르게.
+        # 모델 지문 게이트(R9 P0-1) — 브로드캐스트 U(`/_U…`)는 주소 없이 전 펌프에 꽂힌다.
+        if (g := self._model_gate(targets)) != 0:
+            return {a: g for a in targets}
         # [0/4] 상태 리셋(TR) — 결과 검증 안 함(에러 지우기·브릭 회귀 봉합 취지).
-        self._broadcast(TERMINATE)
+        self._broadcast(self.TERMINATE_CMD)
         if not self._ff_wait(BROADCAST_STEP_GAP_S):
             return self._ff_abort(targets, results)
         # [1/4] 홈 전 셋업(sy01b=스톨전류 U — 과부하 감지선·Code 9 방어) — spec 파생·기종별 차이 지점(seam).
@@ -941,8 +1031,9 @@ class Sy01bEngineAdapter:
             return self._ff_abort(targets, results)
         # [3/4] 주차 — **배출구(output)** (2026-07-21 규칙 "밸브가 쉴 땐 언제나 배출구").
         #   구 SAFE_PORT(12=Air) 주차는 대기 개방 포트라 잔여액이 계속 배수됐다(실기기 확정).
-        #   포트를 모르면(구 서버) 기존 SAFE_PORT 폴백.
-        self._broadcast(f"I{init_out_port if init_out_port is not None else SAFE_PORT}R")
+        #   포트를 모르면 주차 생략(2026-09-03 — polled·_setup 과 동일 계약, SAFE_PORT 강제 폐지).
+        if init_out_port is not None:
+            self._broadcast(f"I{init_out_port}R")
         if not self._ff_wait(BROADCAST_STEP_GAP_S):
             return self._ff_abort(targets, results)
         # ── 생존 게이트(2026-07-19 "기기 뽑혔는데 완료" 봉합) ────────────────────────────
@@ -971,6 +1062,14 @@ class Sy01bEngineAdapter:
         if self._estop.is_set() or self._stop.is_set():
             return self._ff_abort(targets, results)
         for a in targets:
+            # 셋업 마감 훅 — polled phase 4 와 동일 계약(2026-09-03 검증 P2: 이 경로만 빠지면
+            #   tecan 의 N0 검증이 broadcast 초기화에서 사라져 무성 1/8 토출 창이 남는다).
+            #   sy01b 는 no-op(0)라 "브로드캐스트 뒤 주소지정 폴 금지"(버스 오염) 제약과 충돌하지
+            #   않고, tecan 은 브로드캐스트 후 오염 없음이 벤치 실측으로 확정돼 안전하다.
+            fin = self._finalize_setup(a, spec)
+            if fin != 0:
+                results[a] = fin
+                continue
             self._initialized.add(a)
         return results
 
@@ -1045,13 +1144,16 @@ class Sy01bEngineAdapter:
                 return ports_by_addr[a]
             return (init_in_port, init_out_port)
 
+        # 모델 지문 게이트(R9 P0-1) — 실제 제조·정비의 초기화가 타는 큰길이 여기다.
+        if (g := self._model_gate(targets)) != 0:
+            return {a: g for a in targets}
         fire_t0 = time.monotonic()
         # [phase 1] 펌프별 발사 — TR(결과 검증 없음·브릭 회귀 봉합 취지) → 홈 전 셋업(기종별 차이
         #   seam·sy01b=U) → Z. 즉답은 관대(기둥 1: ACK 품질은 실패 사유가 아니다 — 진짜 상태는
         #   phase 2 폴이 판정). 프로브 실측: 0.05s 간격 순차 발사에서 err15 0 — 홈이 겹쳐 돈다.
         for a in targets:
             for fire_cmd in (
-                TERMINATE,
+                self.TERMINATE_CMD,
                 *self._pre_init_commands(spec),
                 spec.init_command_with(*ports_of(a)),
             ):
@@ -1144,7 +1246,13 @@ class Sy01bEngineAdapter:
             if results[a] != 0:
                 continue
             _in, out = ports_of(a)
-            park = out if out is not None else SAFE_PORT
+            # 포트 미지정(None) = 주차 생략 — `_setup` 의 계약("포트를 모르면 주차 생략 = 기존
+            #   동작")과 정합(2026-09-03 검증 P2 정리). 종전 SAFE_PORT(12) 폴백은 배관을 모르는
+            #   호출자(벤치 툴 등)에게 sy01b 배관 상수를 강제해, 3-way 실물에선 매 초기화마다
+            #   I12R err3 경고를 만들었다. 운영 데몬은 항상 포트를 실어 보낸다(D45) — 영향 0.
+            park = out
+            if park is None:
+                continue
             park_code = self._settle(
                 a, f"I{park}R", self.read_timeout_s, poll=True, ack_tolerant=True
             )
@@ -1233,7 +1341,10 @@ class Sy01bEngineAdapter:
             #   상대 `P{steps}` 는 시작 위치가 0 이 아니면 목표가 어긋나고, 그 뒤 상대 배출 `D{steps}`
             #   가 가용 하강거리를 초과해 거부(operand out of range)됐다 — 2026-07-20 QA "점검시 용량
             #   조절 X"(용량↑ 배출만 실패)의 근본. 절대 이동은 현 위치와 무관해 이 축이 사라진다.
-            code = self._settle(addr, f"{speed_in}A{cmd.steps}R", self.motion_timeout_s, poll=True)
+            code = self._settle(
+                addr, f"{speed_in}A{cmd.steps}R",
+                self._motion_deadline_s(cmd.steps, cmd.aspirate_speed_hz), poll=True,
+            )
             if code != 0:
                 return EngineResult(raw_error_code=code, detail="aspirate")
             if aspirate_only:
@@ -1247,7 +1358,11 @@ class Sy01bEngineAdapter:
                     return EngineResult(raw_error_code=code, detail=f"valve O{cmd.out_port}")
             # ④ 배출 — 플런저 전진. **절대 홈 `A0`**(v1.1.0 `dispenseAll`=`movePlungerAbs(0)` 복원).
             #   현 위치와 무관하게 항상 완전 배출 → 잔량·언더슛 없음(상대 `D{steps}` 회귀 봉합).
-            code = self._settle(addr, f"{speed_out}A0R", self.motion_timeout_s, poll=True)
+            code = self._settle(
+                addr, f"{speed_out}A0R",
+                # A0 는 현 위치가 어디든 홈까지 — 최악(풀스트로크) 기준 상한 파생(저속 50Hz 개방 대응).
+                self._motion_deadline_s(cmd.spec.pump_full_stroke, cmd.dispense_speed_hz), poll=True,
+            )
             if code != 0:
                 return EngineResult(raw_error_code=code, detail="dispense")
             return EngineResult(raw_error_code=0)
@@ -1311,7 +1426,11 @@ class Sy01bEngineAdapter:
             code = self._settle(addr, f"O{cmd.out_port}R", self.read_timeout_s, poll=True)
             if code != 0:
                 return EngineResult(raw_error_code=code, detail=f"valve O{cmd.out_port}")
-            code = self._settle(addr, f"{speed_out}A0R", self.motion_timeout_s, poll=True)
+            code = self._settle(
+                addr, f"{speed_out}A0R",
+                # A0 는 현 위치가 어디든 홈까지 — 최악(풀스트로크) 기준 상한 파생(저속 50Hz 개방 대응).
+                self._motion_deadline_s(cmd.spec.pump_full_stroke, cmd.dispense_speed_hz), poll=True,
+            )
             if code != 0:
                 return EngineResult(raw_error_code=code, detail="dispense")
             return EngineResult(raw_error_code=0)
@@ -1342,7 +1461,7 @@ class Sy01bEngineAdapter:
                 #   ⚠️ **셋업/재초기화를 태우지 않는다**(정지가 목적). TR 후 홈 기준이 흔들릴 수 있으므로
                 #   셋업 캐시를 무효화해 다음 토출이 재초기화하게 한다(안전측).
                 self._initialized.discard(addr)
-                raw = self._txn(addr, TERMINATE)
+                raw = self._txn(addr, self.TERMINATE_CMD)
                 # ⛔ **버퍼가 비지 않았다고 성공으로 보지 않는다**(리뷰 P1·2026-07-18). 반이중 RS485 +
                 #   CH340 은 자기 송신을 에코(`/1TR\r`)하는데 이건 ETX 가 없어 read 가 타임아웃까지 돌다
                 #   그 에코를 반환한다 → truthy. 옛 `0 if raw else …` 는 펌프가 죽어도(에코만) 성공으로
@@ -1399,7 +1518,7 @@ class Sy01bEngineAdapter:
             # 이동 성패는 **폴의 실제 완료 확인**이 판정(ack_tolerant · v1.1.0 _validateResponse 가
             #   빈/깨진 즉답을 통과시키고 폴이 판정하던 필드 검증 구조의 미러) — 이 기기의 간헐
             #   프레임 파손(즉답 `C`·`\x07`·무응답)이 즉시 permanent 로 오판되던 것을 봉합.
-            speed = self._speed_cmd(None, None)  # 정비 이동은 프리셋 기본 속도.
+            speed = self._speed_cmd(None, None)  # 정비 이동은 프리셋 **상한** 속도(기본값 아님 — 매뉴얼 기본 900 대비 공격적, §_speed_cmd 주석).
             code = self._settle(
                 addr, f"{speed}A{target}R", self.motion_timeout_s,
                 poll=True, ack_tolerant=True,
@@ -1417,6 +1536,192 @@ class Sy01bEngineAdapter:
         return self._cycle(cmd, aspirate_only=False)
 
     # ── 건강 프로브 (주기 HW 감시·2026-07-19 "데몬이 항상 감시해야" 요구) ────────
+    def model_fingerprint(self, addr: int) -> "str | None":
+        """`&` 펌웨어 파트넘버·버전 readback(read-only) — 모델 지문. 무응답/프레임 없음 = None.
+
+        ⚠️ **err nibble 을 무시하고 데이터 블록만 파싱**한다(R9 P1-1) — Report 응답의 상태
+        바이트엔 latched 에러(초기화 전 err7·오버로드 등)가 실리지만 파트넘버 데이터는 그와
+        무관하게 유효하다(§3.6.1 "error information … is always valid" 의 대우). 에러라고
+        None 을 돌리면 "펌프가 깨끗할 때만 동작하는 게이트"가 된다(실측: 전원 직후 err7).
+        """
+        try:
+            raw = self._txn(addr, "&", read_timeout_s=PROBE_READ_TIMEOUT_S)
+        except Exception:  # noqa: BLE001
+            return None
+        i = raw.find("/0")
+        j = raw.find(chr(ETX), i)
+        data = raw[i + 3:j].strip() if 0 <= i and j > i + 2 else ""
+        return data or None
+
+    def pump_config(self, addr: int) -> "str | None":
+        """`?76` 구성 readback(read-only·벤치 툴용) — 실패/무응답 = None.
+
+        XCalibur 는 `9600|100K|484|3-way|AUTO` 처럼 파이프 구분 텍스트로 답한다(매뉴얼
+        §3.5.8 — 밸브 종류 필드는 Table 3-5 설정값의 **자기 신고**: 물리 감지가 아니라
+        U<n> 으로 써넣은 비휘발 설정의 되읽기). err nibble 은 무시하고 데이터 블록만
+        취한다(model_fingerprint 와 동일 원칙). SY-01B 의 동등 명령은 미실측 — 무응답이면
+        None 을 돌려 소비자(hwtool)가 정적 폴백으로 동작하게 한다("활용-아니면-무시").
+        """
+        try:
+            raw = self._txn(addr, "?76", read_timeout_s=PROBE_READ_TIMEOUT_S)
+        except Exception:  # noqa: BLE001
+            return None
+        i = raw.find("/0")
+        j = raw.find(chr(ETX), i)
+        data = raw[i + 3:j].strip() if 0 <= i and j > i + 2 else ""
+        return data or None
+
+    def _model_gate(self, addrs) -> int:
+        """모델 지문 게이트(2026-09-03·R9 P0-1 응집) — sy01b 기종 프레임(U 등) 발사 전 1회.
+
+        실물 & 지문이 **Tecan 파트넘버**(_TECAN_FP_RE — 벤치 실측 '30064809 C')면 -1003 거부:
+        U 는 XCalibur 에선 NVM 기록이라 한 발도 나가면 안 된다. SY-01B 클론의 & 거동은 미실측
+        — **매치일 때만** 차단(무응답·타 포맷 = fail-open·기존 동작). 진입점 3곳(_setup·
+        initialize_polled·initialize_broadcast)이 전부 이 한 지점을 공유한다.
+        캐시는 **판독 성공 시에만** 기록(R9 P2-3 — 깨진 왕복이 게이트를 영구 비활성화 금지)하고
+        재연결(_reconnect_serial)·close 에서 비운다(다른 실물로 교체 대비).
+        """
+        if not self.FOREIGN_FP_GUARD:
+            return 0
+        for a in addrs:
+            if a in self._fp_checked:
+                continue
+            fp = self.model_fingerprint(a)
+            if fp is None:
+                # 판독 실패(R9.5 P1) — & 는 SY-01B 에서 미실측 프레임이라 무응답이 정상일 수
+                #   있다. 짧은 타임아웃(PROBE 1.5s) + **주소당 3회 상한** 후 이 세션은 포기
+                #   (fail-open 확정 캐시) — 무응답 개체에서 초기화마다 지연이 반복되지 않게.
+                #   재연결/close 가 캐시를 비우므로 실물 교체 시 재검사된다(P2-3 유지).
+                n = self._fp_fails.get(a, 0) + 1
+                self._fp_fails[a] = n
+                if n >= 3:
+                    self._fp_checked.add(a)
+                    if self._log is not None:
+                        self._log.warn(
+                            f"모델 지문(&) 판독 3회 실패 — 이 세션은 지문 게이트를 포기합니다(fail-open)",
+                            stage="step_exec", pumpAddr=a,
+                        )
+                continue
+            self._fp_checked.add(a)
+            if _TECAN_FP_RE.match(fp):
+                if self._log is not None:
+                    self._log.error(
+                        f"모델 불일치 — 실물 지문 {fp!r} = Tecan 계열인데 SY-01B 어댑터로 초기화 시도. "
+                        "기종 프레임(U) 봉인·거부 — 센소리움을 XCalibur 변형으로 바꾸고 재연결하세요",
+                        stage="step_exec", pumpAddr=a,
+                    )
+                return MODEL_MISMATCH_RAW_CODE
+        return 0
+
+    def _motion_deadline_s(self, steps: int, top_hz: "int | None") -> float:
+        """모션 폴 상한 파생 — 저속(50Hz 개방·2026-09-03) 주행이 40s 고정 상한에 걸려
+        "정상 주행 중인데 무응답 실패"가 되는 것을 막는다(검증 P2). 상한은 물리 주행시간
+        (steps/속도)의 1.5배 + 여유 — 빠른 모션엔 기존 상한이 그대로(하방 0)."""
+        top = min(int(top_hz), self.preset.pump_max_top_speed_hz) if top_hz else \
+            self.preset.pump_max_top_speed_hz
+        return max(self.motion_timeout_s, steps / max(top, 1) * 1.5 + 5.0)
+
+    def rotate_valve(
+        self, addr: int, target: "int | str", *, out: bool = False,
+        spec: "SyringeSpec | None" = None,
+    ) -> EngineResult:
+        """회전 밸브 단독 회전(정비/벤치 테스트용·2026-09-03) — 플런저는 움직이지 않는다.
+
+        target: 분배밸브 = 포트 번호(1..N → 흡입측 `I{n}R` / out=True 면 배출측 `O{n}R` —
+        _cycle 배출 회전과 동일 프레임·R9.5 P2) / 비분배(3-way 등) = "i"|"o"(`IR`/`OR`).
+        ⛔ "b"/"e"(bypass)는 받지 않는다 — bypass 진입 후 플런저 이동은 err11 지뢰(XCalibur
+        §3.5.1 = SY-01B V1.2 §4.5.1 Caution — 같은 경고)라 벤치 테스트에 불요·위험.
+        spec 지정 시 `_ensure_ready` 를 먼저 태운다(2026-09-03 검증 P2 — 캐시 무효 상태에서
+        회전 후 다음 모션의 lazy 재셋업 Z 가 방금 돌린 밸브를 덮는 순서 역전 봉합).
+        발사·판정은 `_settle`(poll·ack-tolerant·busy-NAK 재전송) — 검증된 기계 위에서만 돈다
+        (직접 조립판은 즉답 파손 시 "실패 보고+모션 방치"를 만들었다 — 2026-09-03 검증 P1).
+        범위 밖/무효 target 은 기기 err3 로 정직하게 돌아온다 — 툴이 그대로 표시한다.
+        """
+        if isinstance(target, str):
+            t = target.strip().lower()
+            if t not in ("i", "o"):
+                return EngineResult(raw_error_code=3, detail=f"무효 target: {target!r} (i|o|1..N)")
+            body = "IR" if t == "i" else "OR"
+        else:
+            body = f"O{int(target)}R" if out else f"I{int(target)}R"
+        if spec is not None:
+            code = self._ensure_ready(addr, spec)
+            if code != 0:
+                return EngineResult(raw_error_code=code, detail=f"rotate {body} 셋업 실패")
+        code = self._settle(addr, body, self.motion_timeout_s, poll=True, ack_tolerant=True)
+        return EngineResult(raw_error_code=code, detail=f"rotate {body}")
+
+    def plunger_to(
+        self,
+        addr: int,
+        steps: int,
+        spec: SyringeSpec,
+        *,
+        top_speed_hz: "int | None" = None,
+        slope: "int | None" = None,
+    ) -> EngineResult:
+        """플런저 **절대 위치** 이동(벤치 테스트용·2026-09-03) — `A{steps}`.
+
+        절대 이동이라 반복 호출해도 같은 자리(축적 없음 — 제1원칙 4). 소프트웨어 게이트:
+        0 ≤ steps ≤ 풀스트로크(넘으면 기기 err3 전에 여기서 거부 — 이중 방어).
+        `_ensure_ready` 를 먼저 태운다(절대 이동은 홈 기준이 있어야 의미 — run_op 과 동일 계약).
+        top_speed_hz/slope 지정 시 이동 직전 속도 프레임(_speed_cmd — 프리셋 클램프)을 보낸다.
+        모션 발사·판정은 `_settle`(poll·ack-tolerant·busy-NAK 재전송) + 속도 파생 폴 상한
+        (`_motion_deadline_s`) — 즉답이 깨져도 폴이 최종 판정하므로 "실패 보고+모션 방치"가
+        없다(2026-09-03 검증 P1 봉합). 속도 프레임은 모션 무발생이라 즉답 실패 = 정직 중단.
+        """
+        steps = int(steps)
+        mismatch = self._axis_guard(spec)  # spec↔preset 축이 갈리면 모션 0(fail-closed·검증 P3).
+        if mismatch is not None:
+            return mismatch
+        if not 0 <= steps <= spec.pump_full_stroke:
+            return EngineResult(
+                raw_error_code=3,
+                detail=f"스텝 범위 밖: {steps} (0..{spec.pump_full_stroke})",
+            )
+        code = self._ensure_ready(addr, spec)
+        if code != 0:
+            return EngineResult(raw_error_code=code, detail=f"A{steps} 셋업 실패")
+        if top_speed_hz is not None or slope is not None:
+            sp_code = self._settle(
+                addr, self._speed_cmd(top_speed_hz, slope) + "R", self.read_timeout_s
+            )
+            if sp_code != 0:
+                return EngineResult(raw_error_code=sp_code, detail=f"속도 설정 err{sp_code}")
+        code = self._settle(
+            addr, f"A{steps}R", self._motion_deadline_s(spec.pump_full_stroke, top_speed_hz),
+            poll=True, ack_tolerant=True,
+        )
+        return EngineResult(raw_error_code=code, detail=f"A{steps}")
+
+    def plunger_position(self, addr: int) -> "int | None":
+        """`?` 플런저 절대위치 readback(read-only) — 실패/비정수 = None.
+
+        err nibble 은 무시하고 **데이터 블록만** 파싱한다(model_fingerprint 와 동일 원칙·R9.5 P3)
+        — latched err 상태에서도 위치는 실려 오므로 정직 보고("실린 양")가 후퇴하지 않게.
+        """
+        try:
+            raw = self._txn(addr, "?", read_timeout_s=PROBE_READ_TIMEOUT_S)
+        except Exception:  # noqa: BLE001
+            return None
+        i = raw.find("/0")
+        j = raw.find(chr(ETX), i)
+        data = raw[i + 3:j].strip() if 0 <= i and j > i + 2 else ""
+        return int(data) if data.lstrip("-").isdigit() else None
+
+    def valve_position(self, addr: int) -> "str | None":
+        """`?6` 밸브 위치 readback(read-only) — 분배=숫자 문자열 / 비분배='i'|'o' / 실패=None."""
+        try:
+            raw = self._txn(addr, "?6", read_timeout_s=PROBE_READ_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 — 프로브 실패 = None.
+            return None
+        code, _ready = parse_status(raw)
+        if code != 0:
+            return None
+        i = raw.find("/0")
+        j = raw.find(chr(ETX), i)
+        return raw[i + 3:j].strip() if 0 <= i and j > i + 2 else None
+
     def health_probe(self, addr: int) -> str:
         """1발 `?` 건강 판정 — `"ok"`(유효 프레임) / `"garbled"`(깨진 프레임) / `"silent"`(무응답).
 
@@ -1454,7 +1759,9 @@ class Sy01bEngineAdapter:
             if time.monotonic() >= deadline or self._stop.is_set():
                 break
             try:
-                code, _ready = self._query_status(addr, read_timeout_s=PROBE_READ_TIMEOUT_S)
+                code, _ready = self._query_status(
+                    addr, read_timeout_s=PROBE_READ_TIMEOUT_S, cmd=self._probe_cmd
+                )
             except Exception:  # noqa: BLE001 — 포트 오류 = 미장착으로 보고 스캔 지속.
                 return False
             if code != _NO_RESPONSE:

@@ -737,3 +737,10 @@ def build_components(
         hardware_source=hardware_source,
         server_settings=server_settings,
     )
+
+
+# ── 공개 env 해석 표면(2026-09-04 헥사고날 감사 P2) — 형제 도구(hwtool 등)가 daemon 과
+#   동일한 env 해석을 쓰되 **프라이빗 심볼을 관통하지 않게** 하는 안정 별칭. 시그니처 계약:
+#   float_env(environ, key, default) · valve_pins_from_env(raw) — 내부 리팩토링 시 이 별칭은 유지.
+float_env = _float_env
+valve_pins_from_env = _valve_pins_from_env

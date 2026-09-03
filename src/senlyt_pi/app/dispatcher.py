@@ -524,28 +524,6 @@ class Dispatcher:
         return verdict if isinstance(verdict, str) else None
 
 
-def fragrance_notes_to_steps(
-    notes: Sequence[Mapping[str, object]],
-    *,
-    pump_addr_of: Callable[[str], int],
-) -> list[RecipeStep]:
-    """fragrance fragranceResult.notes → RecipeStep 폴백 해석 헬퍼(§6-6 mL→µL 정규화).
-
-    notes[i] = {name, amountMl, ...}. pumpAddr 는 pumpMap(flavor→addr) 을 통해 해석해야 하나,
-    여기서는 dispatcher 주입 interpret 가 매핑을 알고 있다고 전제하고, 단위 정규화만 제공한다.
-    """
-    steps: list[RecipeStep] = []
-    for i, n in enumerate(notes):
-        raw_name = n.get("name") or n.get("nameKo") or ""
-        name = raw_name if isinstance(raw_name, str) else ""
-        raw_amount = n.get("amountMl")
-        amount_ml = float(raw_amount) if isinstance(raw_amount, (int, float)) else 0.0
-        steps.append(
-            RecipeStep(
-                idx=i,
-                pump_addr=pump_addr_of(name),
-                flavor=name,
-                volume=fragrance_ml_to_ul(amount_ml),  # mL→µL(§6-6·Code 11 방지).
-            )
-        )
-    return steps
+# fragrance_notes_to_steps 는 pipeline.recipe_resolver 로 이관(2026-09-04 헥사고날 감사 P2 —
+#   flavor 쪽 동등 함수(flavor_recipe_to_steps)와 대칭 배치·app 은 조립/라우팅만). 호환 재수출:
+from ..pipeline.recipe_resolver import fragrance_notes_to_steps  # noqa: E402,F401

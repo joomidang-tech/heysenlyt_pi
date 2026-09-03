@@ -95,7 +95,7 @@ class TestTraceSpillUnit:
         assert [d["spanId"] for d in got] == ["x2", "x3", "x4"]  # 순서 유지.
 
     def test_cap_trims_oldest_and_counts_dropped(self, tmp_path, monkeypatch):
-        import senlyt_pi.pipeline.trace_spill as spill_mod
+        import senlyt_pi.persistence.trace_spill as spill_mod  # 정본(2026-09-04 이관) — 프라이빗 패치는 shim 이 아닌 정본에.
 
         # trim 은 히스테리시스(_TRIM_SLACK 초과 시에만 O(n) 재작성·상각) — 테스트는 슬랙 0 으로
         #   즉시 발동시켜 FIFO trim·드롭 계수만 검증한다.

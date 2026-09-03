@@ -77,19 +77,17 @@ def _now_iso_ms() -> str:
 #   `includeIfNull:false` 로 키 자체가 빠졌고, admin 기기 카드가 online 인데 "엔진 —"으로 떴다.
 #   실 Pi 라도 USB-RS485 어댑터 미장착이면 자동감지(bootstrap.build_engine)가 fake 로 떨어지는데,
 #   그게 **정상적인 fake 구동**인지 **보고 누락**인지 운영자가 화면에서 구분할 수 없었다.
-_ENGINE_WIRE_NAMES: dict[str, str] = {
-    "Sy01bEngineAdapter": "sy01b",
-    "TecanXCaliburEngineAdapter": "tecan_xcalibur",
-    "FakeEnginePort": "fake",
-}
-
-
 def engine_wire_name(engine: EnginePort) -> str:
-    """엔진 어댑터 → heartbeat engine 표기. 미지 어댑터(테스트 더블 등)는 클래스명 그대로.
+    """엔진 어댑터 → heartbeat engine 표기 — 어댑터 클래스의 `MODEL_ID` 자기 선언을 읽는다.
 
-    관측 필드라 **침묵(None)보다 이름**이 낫다 — 모르는 어댑터도 무엇이 붙었는지 보이게 한다.
+    종전엔 클래스명 문자열 사전(_ENGINE_WIRE_NAMES)으로 역추론했다(2026-09-03 검증 P2 —
+    클래스 rename 시 무성 파손). 이제 어댑터가 스스로 선언한 정체(MODEL_ID: sy01b/
+    tecan_xcalibur/fake)를 그대로 쓴다 — 와이어 값은 바이트 동일(admin OrdersPage 실펌프
+    판정·test_wire_messages 계약 유지). 미지 어댑터(테스트 더블 등)는 클래스명 그대로 —
+    관측 필드라 **침묵(None)보다 이름**이 낫다.
     """
-    return _ENGINE_WIRE_NAMES.get(type(engine).__name__, type(engine).__name__)
+    mid = getattr(type(engine), "MODEL_ID", None)
+    return mid if isinstance(mid, str) and mid else type(engine).__name__
 
 
 def _order_id_of(command_id: str) -> str:

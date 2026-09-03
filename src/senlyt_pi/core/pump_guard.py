@@ -230,6 +230,10 @@ AXIS_MISMATCH_RAW_CODE = -1001
 #   모션도 조립 불가(추측 금지) → permanent(미분류 코드의 보수 분기와 같은 등급). 복구 = 서버
 #   재접속(재fetch 성공 시 재기동) 또는 senlytd 재시작.
 UNDECLARED_HW_RAW_CODE = -1002
+# 모델 지문 불일치(2026-09-03) — sy01b 어댑터가 실물에서 **Tecan 지문**(& 파트넘버)을 읽음.
+#   기종 전용 프레임(U=XCalibur NVM 기록)을 쏘기 전에 정직하게 거부한다. 복구 = 올바른
+#   센소리움(+tecan 변형) 선택 후 재연결.
+MODEL_MISMATCH_RAW_CODE = -1003
 
 
 class EngineErrorClass(enum.Enum):
@@ -248,6 +252,10 @@ def classify_engine_error_code(code: int) -> EngineErrorClass:
     if code == 0:
         return EngineErrorClass.NORMAL
     if code == AXIS_MISMATCH_RAW_CODE:
+        return EngineErrorClass.PERMANENT
+    if code in (UNDECLARED_HW_RAW_CODE, MODEL_MISMATCH_RAW_CODE):
+        # 선언/모델을 고치기 전엔 재시도 무의미 — permanent 명시 분기(R9 P3: 기본 폴백에
+        #   얹지 않고 명시해 "복구 = 센소리움 정정 + 재연결" 지시가 라벨로 전달되게 한다).
         return EngineErrorClass.PERMANENT
     if code in (1, 7, 11, 15):
         return EngineErrorClass.TRANSIENT

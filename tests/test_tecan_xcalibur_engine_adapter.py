@@ -18,6 +18,8 @@ from senlyt_pi.adapters.tecan_xcalibur_engine_adapter import (
     TECAN_MIN_SPEED_HZ,
     TecanXCaliburEngineAdapter,
 )
+import time as _time
+from senlyt_pi.adapters.sy01b_engine_adapter import Sy01bEngineAdapter
 from senlyt_pi.core.pump_guard import PUMP_PRESETS, SyringeSpec
 from senlyt_pi.ports.engine_port import (
     OP_INITIALIZE,
@@ -220,11 +222,14 @@ class TestInheritedMachinery:
         seq = [next(t for t in ("I3", "A600", "O11", "A0R") if t in w) for w in moves]
         assert seq == ["I3", "A600", "O11", "A0R"]
 
-    def test_estop_sends_tr_and_latches(self):
+    def test_estop_sends_bare_t_not_tr(self):
+        # 기종별 차이(2026-09-03 매뉴얼 검증) — XCalibur 는 §3.5.5 "[R] … resumption of a
+        # terminated command string" 때문에 TR 이 "정지→재개"가 될 수 있다. 정지는 `T` 단독.
         fake = FakeSerial()
         a = adapter_with(fake)
         a.emergency_stop_all([1, 2])
-        assert "/1TR\r" in fake.written and "/2TR\r" in fake.written
+        assert "/1T\r" in fake.written and "/2T\r" in fake.written
+        assert all("TR" not in w for w in fake.written)
 
     def test_error_code_propagates_honestly(self):
         # 이동 즉답 err9(플런저 오버로드) → 거짓 성공 없이 그대로 전파(EP-03).
@@ -243,7 +248,8 @@ class TestInheritedMachinery:
 
     def test_q_is_reconnect_resend_safe(self):
         a = TecanXCaliburEngineAdapter(serial_factory=lambda *_a: FakeSerial())
-        assert "Q" in a._resend_safe and "TR" in a._resend_safe
+        # 정지 프레임까지 방언 일관 — 이 기종은 TR 을 아예 안 보내므로 재전송 집합에도 T.
+        assert "Q" in a._resend_safe and "T" in a._resend_safe and "TR" not in a._resend_safe
 
     def test_plunger_full_targets_3000(self):
         fake = FakeSerial()
@@ -275,3 +281,35 @@ class TestSy01bRegressionGuard:
         assert "U200,5R" in joined  # 스톨전류 그대로(기종별 차이 지점(seam) 의 sy01b 기본값 불변)
         assert "N0R" not in joined  # N 은 Tecan 전용
         assert "?" in joined and "Q" not in joined.replace("QR", "")  # 폴은 여전히 `?`
+
+
+class TestDialectSeams2026_09_03:
+    """5팀 검증(아키텍처·코드리뷰·매뉴얼 마스터 3인) 후 신설된 방언 seam 그물."""
+
+    def test_resend_safe_uses_bare_t(self):
+        a = adapter_with(FakeSerial())
+        assert a._resend_safe == {"?", "T", "Q"}  # TR 부재 — 정지 프레임까지 방언 일관.
+
+    def test_speed_floor_via_class_attr_not_copied_body(self):
+        # MIN_SPEED_HZ 재선언만으로 부모 공식이 50 바닥을 적용해야 한다(복붙 금지 그물).
+        a = adapter_with(FakeSerial())
+        assert type(a)._speed_cmd is Sy01bEngineAdapter._speed_cmd  # 본문 미재정의.
+        assert a._speed_cmd(50, 7) == "v50V50c50L7"
+        assert a.MIN_SPEED_HZ == 50 and a.MODEL_ID == "tecan_xcalibur"
+
+    def test_poll_err7_fails_fast_not_30s_hang(self):
+        # XCalibur err7 = 무모션 즉답 거부(벤치 실측) — idle+err7 폴을 만나면 즉시 7 반환.
+        fake = FakeSerial(default=status_frame(7, ready=True))
+        a = adapter_with(fake)
+        t0 = _time.monotonic()
+        assert a._poll_until_ready(1, 30.0) == 7
+        assert _time.monotonic() - t0 < 2.0  # 30s 매달림 금지(제1원칙 1).
+
+    def test_reconnect_clears_setup_cache(self):
+        # 링크 리셋 = 전원 사이클 가능성 — 셋업 캐시가 남으면 N0 휘발 시 무성 1/8 토출.
+        fake = FakeSerial()
+        a = adapter_with(fake)
+        a._initialized.add(1)
+        a._readback_observed.add(1)
+        a.close()
+        assert a._initialized == set() and a._readback_observed == set()

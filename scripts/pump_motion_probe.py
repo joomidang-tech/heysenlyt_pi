@@ -284,6 +284,15 @@ def main():
 
     pump = Pump(port, args.addr)
     try:
+        # ── 지문 인터록(R9 P2-7) — --model 기본이 sy01b 라 플래그 없이 Tecan 벤치에서 돌리면
+        #   U200,5R 이 나간다. 실물 & 지문이 Tecan(30xxxxxx)인데 모델이 sy01b 면 중단.
+        if args.model == "sy01b":
+            _fp_raw = decode(pump.txn("&"))
+            import re as _re
+            _fpm = _re.search(r"(30\d{6}\s*[A-Z]?)", _fp_raw or "")
+            if _fpm:
+                print(f"⛔ 실물 지문 {_fpm.group(1)!r} = Tecan(XCalibur) — --model tecan 으로 다시 실행하세요 (sy01b 프레임 U=NVM 기록 위험). 중단.")
+                return
         # Phase 0 — 베이스라인
         print("\n### Phase 0 — 베이스라인 (?)")
         for i in range(3):

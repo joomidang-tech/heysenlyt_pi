@@ -57,6 +57,7 @@ class TestEarlyExit:
         """기둥 2 — 발사가 전부 주소지정. 브로드캐스트(`/_`) 프레임이 하나도 없어야 한다."""
         fake = FakeSerial()
         a = polled_adapter(fake)
+        a._fp_checked.update({1, 2, 3})  # 지문 게이트 선체크(R9) — 이 테스트의 관심은 와이어 순서.
         a.initialize_polled([1, 2], SPEC_05, ports_by_addr=PORTS)
         assert not any(w.startswith("/_") for w in fake.written), "브로드캐스트 사용 금지(7/19 오염)"
         # 펌프별 TR → U(스톨전류) → Z(포트 지정) 순서로 발사된다.
@@ -143,6 +144,7 @@ class TestHonestErrors:
         stop.set()
         fake = FakeSerial()
         a = polled_adapter(fake, stop_event=stop)
+        a._fp_checked.update({1, 2, 3})  # 지문 게이트 선체크(R9) — 이 테스트의 관심은 와이어 순서.
         results = a.initialize_polled([1, 2], SPEC_05, ports_by_addr=PORTS)
         assert set(results.values()) == {mod._NO_RESPONSE}
         assert a._initialized == set()

@@ -21,8 +21,14 @@ SY-01B 는 Cavro DT 프로토콜의 클론이라 프레임 문법(`/{addr}{cmds}
    N1(미세모드)은 속도 단위가 increments/sec 로 바뀌므로 실기기 프로브로 확정 전 도입 금지.
 3. **상태 폴 = `Q`** — 매뉴얼 §3.6: *"[Q] is the only valid method for obtaining pump status
    in serial mode"* — busy 비트(Bit5)는 Q 응답에서만 신뢰 가능하다(다른 명령의 answer block
-   상태비트는 busy 판정에 쓰지 말 것·§3.6.1 Note). sy01b 의 `?` 는 XCalibur 에선 "위치 리포트"
-   (§3.5.8)다. → `_status_cmd = "Q"` (에러 nibble 해석은 동일 — `parse_status` 그대로).
+   상태비트는 busy 판정에 쓰지 말 것·§3.6.1 Note). `?` 는 양 기종 다 위치 리포트지만, XCalibur
+   는 위 §3.6.1 명시 + Q 래치 소진 실측 때문에 판정/관찰 명령을 갈랐다.
+   → `_status_cmd = "Q"` (에러 nibble 해석은 동일 — `parse_status` 그대로).
+3b. **정지 = `T` 단독** — §3.5.5: *"[R] … resumption of a halted or terminated command
+   string"* — `TR` 한 프레임은 T 가 종료한 그 문자열을 뒤따르는 R 이 **재개**할 수 있다
+   (에러로 멈춘 펌프는 버퍼가 비어 무해하나, 건강한 in-flight 모션의 긴급정지가 위험).
+   T 는 R 불요 Control 명령(§3.3.1·부록 G.9). → `TERMINATE_CMD = "T"`.
+   ⚠️ 모션 중 TR-vs-T 실기기 실측은 백로그(매뉴얼-안전형 선택).
 4. **속도 하한** — v 50..1000 · V 5..6000 · c 50..2700 (§3.5.3). sy01b `_speed_cmd` 는 하한
    1 까지 떨어질 수 있어 XCalibur 에선 err 3(invalid operand)이 된다 → 하한 클램프 추가.
    상한은 프리셋(`tecan_xcalibur`)이 이미 반영(c ≤ 2700 등).
@@ -34,15 +40,31 @@ SY-01B 는 Cavro DT 프로토콜의 클론이라 프레임 문법(`/{addr}{cmds}
    가 Z 재초기화. err 15(Command Overflow)는 "이동 중 새 명령 무시(NAK)" — sy01b 와 동일
    의미론이라 `_settle` 의 busy-NAK 재전송 로직이 그대로 유효하다(§3.6.3: 재초기화 불필요).
 
-⛔ 실기기 프로브 전 미확정 (CLAUDE.md 제1원칙 6 — 추측으로 배포하지 않는다)
+✅ 실기기 실측 확정 (2026-09-03 벤치 브링업 — 정본: heysenlyt-hardware-test-tool/
+   tecan_bringup_full.ipynb, 84왕복 전 프레임 기록. 펌웨어 30064809 C · ?76=
+   "9600|100K|484|3-way|AUTO" · 리니어 엔코더(?4) 장착 개체)
 --------------------------------------------------------------------------
-아래는 매뉴얼 기반 구현이며 **Tecan 실물 도착 후 프로브 실측으로 확정해야 한다**
-(`scripts/pump_link_diag.py`·`scripts/pump_motion_probe.py`):
-  - Q 폴이 홈(Z) 모션 중에도 clean 한지 (sy01b 는 2026-07-22 실측 확정 — Tecan 은 미실측)
-  - 브로드캐스트(`_`) 직후 버스 오염 여부 (sy01b 기기 고유 현상일 수 있음)
-  - HOME_SETTLE_S(30s)·모션 타임아웃이 XCalibur 홈 시간(3000 step ÷ 500Hz = 6s + 여유)에
-    과대한지 — 안전측(길게)이라 동작엔 지장 없음, 하향은 실측 후
-  - N0 이 전원 사이클 간 유지되는지(휘발 여부) — 매 셋업 재전송으로 방어 중이라 무해
+  - Q 폴은 Z 모션 중에도 clean (0.5s 폴 전량 정상 프레임 — sy01b 2026-07-22 와 동일 결론).
+    busy 중 `?` 리포트도 수락(§3.6.1 실측 — _health_cmd="?" 선택 유효).
+  - 브로드캐스트(`_`) 직후 버스 오염 **없음** — sy01b 고유 현상으로 확정. 플러시 로직은
+    무해하므로 유지.
+  - 초기화 실측 7.3s(건식·0.25mL·Third 힘) — HOME_SETTLE_S(30s)는 과대하나 안전측이라
+    유지(하향하려면 실 시린지·액체 조건 재실측 필요).
+  - "[Q] clears the error" **실측 확정**: 에러 후 Q 1발 = 에러 보고(0x63/0x67), 2발 = 0x60
+    — Q 가 래치를 소진한다. `_health_cmd` 를 Q 로 두면 안 되는 이유가 실물로 증명됨.
+    (오버로드 err9/10 래치의 Q 소거는 의도 유발 불가라 미실측·보류 — 방어는 동일.)
+  - 축 밖 A4000: 초기화 전 err7 / 후 err3, **양쪽 다 무모션 즉답 거부** + 위치 불변.
+  - 속도 readback(?1/?2/?3) 라운딩 오차 α=0 (50/200/50 정확 반환) — readback 판정을
+    정확 일치로 걸어도 된다.
+  - 응답 프레임 후행에 CR(0x0D)이 붙는 케이스 관측 — ETX 이후 바이트 관용 필수.
+  - **프로덕션 경로 종단 실측**: 이 어댑터 그대로(serial_factory 주입) probe→health→
+    initialize_polled(4.1s)→aspirate/dispense 10µL(=120 steps·0.25mL/3000축 파생 정확)
+    전부 code 0 — 부피축 계약이 실물에서 성립.
+
+⛔ 여전히 미확정 (실측 불가/보류)
+  - N0 전원 사이클 휘발 여부(Tier D 미실행) — 매 셋업 재전송 방어 유지로 무해.
+  - N0 직접 readback 불가 확정(?76 텍스트에 N 모드 미표시) — 간접판별(?12=12·?24=50)뿐.
+  - 오버로드(err9/10) 래치 거동 — 위 참조.
 """
 
 from __future__ import annotations
@@ -78,6 +100,16 @@ class TecanXCaliburEngineAdapter(Sy01bEngineAdapter):
     (풀스트로크 3000·N0 표준 모드·XCalibur 속도 상한)를 기본으로 쓴다.
     """
 
+    # sy01b 지문 게이트는 자기 기종이므로 비활성(R9 P2-2 — 명시 선언).
+    FOREIGN_FP_GUARD = False
+    MODEL_ID = "tecan_xcalibur"
+    # 정지 = `T` 단독 — `TR` 은 R 이 종료된 명령 문자열을 재개할 수 있다(§3.5.5 · 헤더 3b).
+    TERMINATE_CMD = "T"
+    # 속도 하한 50 — 부모 `_speed_cmd` 공식이 이 값으로 그대로 돈다(본문 재정의 없음 · 검증 P2).
+    MIN_SPEED_HZ = TECAN_MIN_SPEED_HZ
+    # err7 = 무모션 즉답 거부(벤치 실측 — "홈 재탐색 중"이 아니다) → 폴에서 즉시 실패.
+    ERR7_REHOMES = False
+
     def __init__(
         self,
         *,
@@ -108,16 +140,29 @@ class TecanXCaliburEngineAdapter(Sy01bEngineAdapter):
             logger=logger,
             port_resolver=port_resolver,
         )
+        # 주입 preset 가드(2026-09-03 검증 P2) — sy01b preset(c 상한 5400 등)을 실수로 꽂으면
+        #   _speed_cmd 가 매뉴얼 범위 밖(c>2700 = err3·명령 폐기) 프레임을 만든다. fail-closed.
+        pz = self.preset
+        if (pz.pump_max_cutoff_speed_hz > 2700 or pz.pump_max_top_speed_hz > 6000
+                or pz.pump_max_start_speed_hz > 1000):
+            raise ValueError(
+                f"XCalibur 프리셋 범위 밖(v≤1000·V≤6000·c≤2700 — §3.5.3): {pz!r}"
+            )
         # 기종별 차이 지점(seam) 재정의(부모 __init__ 가 sy01b 기본값을 세팅한 뒤 덮는다).
         self._status_cmd = TECAN_STATUS_QUERY
+        # 부팅 발견 probe 는 **?**(위치 리포트) — Q 는 래치를 소진한다(벤치 실측: Q 1발=에러 보고
+        #   →2발=0x60). 발견 판정은 "응답 여부"뿐이라 ? 로 충분하고, health(?)·probe(?)가 같은
+        #   명령이 되어 재발견(R8) 술어 동일성도 오히려 강해진다(R9 P2-6).
+        self._probe_cmd = "?"
         # 관찰 전용(하트비트 health) = `?`(위치 리포트) — Q 와 분리(2026-09-01 검증 P1-a).
         #   §3.6.3 "[Q] clears the error": 주기 관찰이 Q 면 오버로드(err9/10) 래치를 지워
         #   증거가 사라지고, 토출 폴이 에러를 못 보는 거짓 성공 창이 생긴다. `?` 는 에러
         #   nibble 이 항상 유효(§3.6.1)하고 Report 라 busy 중에도 수락 — 관찰엔 충분·무부작용.
         #   판정 폴(_status_cmd=Q)·부팅 발견(probe=Q)은 유지 — 읽고 행동하는 단일 소비자.
         self._health_cmd = "?"
-        # Q 도 `?`·TR 과 같은 멱등(모션 무발생) — 핫플러그 재연결 후 재전송 허용.
-        self._resend_safe = _RECONNECT_RESEND_SAFE | frozenset({TECAN_STATUS_QUERY})
+        # 멱등(모션 무발생) 재전송 허용 집합 — 이 기종의 정지 프레임은 `T`(TR 아님)라
+        #   부모 집합을 그대로 합치지 않고 재선언한다. Q 도 Report 라 멱등.
+        self._resend_safe = frozenset({"?", self.TERMINATE_CMD, TECAN_STATUS_QUERY})
         # tecan 명시 기기만 probe 에서 `&` 펌웨어 관측 채집(R3 P2-4 — sy01b 기본 경로 불변).
         self._fw_probe_capture = True
         # `?76`/`&` readback 관측은 주소당 1회(R3 P2-3) — 관측 목적(포맷 채집)은 1회면 충분하고,
@@ -137,8 +182,10 @@ class TecanXCaliburEngineAdapter(Sy01bEngineAdapter):
         (CLAUDE.md 제1원칙 7)대로 매 셋업마다 명시한다. 모션 없는 멱등 명령이라 브로드캐스트/
         폴 초기화 경로에서도 안전하다(부모 계약 그대로).
 
-        ⛔ 축 불일치 봉인은 부모와 동일(R3 P2-1) — "env tecan + 실물 SY-01B" 조합에서 `N0R`
-        의 SY-01B 거동은 미실측이라 내보내지 않는다(홈 Z 만 진행·토출은 축 가드가 거부).
+        ⚠️ R9 P2-1 정정 — 종전 주석은 _axis_sealed 가 "설정 tecan + 실물 SY-01B" 를 봉인한다고
+        주장했지만, 단일 키 설계에선 spec·preset 이 같은 선언에서 나와 그 봉인이 정상 부팅에서
+        도달 불가다. **역방향(N0R→SY-01B 실물)은 현재 미방어·미실측** — SY-01B 지문(&) 실측 후
+        게이트를 대칭으로 세울 것(백로그). 그때까지 tecan 설정을 실물 SY-01B 에 쓰지 말 것.
         """
         if self._axis_sealed(spec):
             return ()
@@ -198,21 +245,14 @@ class TecanXCaliburEngineAdapter(Sy01bEngineAdapter):
                     )
         return 0
 
-    # ── 기종별 차이 4: 속도 하한 클램프 (v 50..1000 · V 5..6000 · c 50..2700) ─────────
-    def _speed_cmd(self, top_hz: int | None, slope: int | None) -> str:
-        """`v{시작}V{최고}c{컷오프}L{경사}` — 부모와 같은 단조성(v ≤ c ≤ V)에 **하한**을 더한다.
+    # ── 기종별 차이 4: 속도 하한 — `MIN_SPEED_HZ = 50` **재선언뿐**(클래스 속성 위 참조).
+    #   종전엔 부모 `_speed_cmd` 본문을 통째로 복붙하고 한 줄만 바꿨다(2026-09-03 검증 P2 —
+    #   부모 공식이 진화하면 파생만 옛 공식에 남는 드리프트 폭탄). 하한을 값으로 빼고 본문은
+    #   상속한다: top 이 50 바닥에 오르면 start=min(max_start,top)≥50 ·
+    #   cutoff=max(min(max_cutoff,top),start)≥start 로 단조성과 하한이 동시에 성립(동일 증명).
 
-        부모는 하한을 1 로 두는데(sy01b 는 관용), XCalibur 는 범위 밖 파라미터에 err 3
-        (invalid operand)을 내고 명령을 버린다(§3.3.1). 상한 클램프는 프리셋이 담당하므로
-        여기선 세 값 모두 {TECAN_MIN_SPEED_HZ} 바닥만 보강한다 — top 을 먼저 바닥에 올리면
-        start=min(max_start, top) ≥ 50 · cutoff=max(min(max_cutoff, top), start) ≥ start 로
-        단조성과 하한이 동시에 성립한다.
-        """
-        p = self.preset
-        top = min(int(top_hz), p.pump_max_top_speed_hz) if top_hz else p.pump_max_top_speed_hz
-        top = max(TECAN_MIN_SPEED_HZ, top)
-        start = min(p.pump_max_start_speed_hz, top)
-        cutoff = max(min(p.pump_max_cutoff_speed_hz, top), start)
-        lp = min(int(slope), p.pump_max_slope) if slope else p.pump_max_slope
-        lp = max(1, lp)
-        return f"v{start}V{top}c{cutoff}L{lp}"
+    # ── 링크 리셋 캐시 무효화 — 부모(지문·셋업) + 이 기종의 관측 캐시(검증 P3) ──────────
+    def _invalidate_link_caches(self) -> None:
+        super()._invalidate_link_caches()
+        if hasattr(self, "_readback_observed"):
+            self._readback_observed.clear()  # 실물 교체/전원 사이클 후 ?76/& 재관측.

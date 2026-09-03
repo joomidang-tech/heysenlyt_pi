@@ -57,3 +57,9 @@ class UndeclaredEngineAdapter:
     def probe(self, addr: int) -> bool:  # noqa: ARG002
         # 선언이 없으면 버스 방언(2400/9600·?/Q)도 모른다 — 미실측 프레임을 쏘지 않는다(무프로브).
         return False
+
+    def close(self) -> None:  # EnginePort 정식 계약(2026-09-03 승격) — 자원 없음 no-op.
+        return None
+
+    def signal_stop(self) -> None:  # 동상 — 폴링 자체가 없다.
+        return None
