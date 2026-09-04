@@ -6,8 +6,8 @@
   - `SENLYT_ENV`/`SENLYT_SERVER_BASE_URL` → `ServerConfig`(base URL 단일 결정·fail-fast).
   - 등록(POST /api/dispensers/register·실 HTTP) → deviceId·dispenserToken 확보(파일 영속).
   - 실 어댑터 조립: SSE command/commandSet source + HTTP status sink(orders/heartbeat/trace/봉투전이).
-  - **엔진만 FakeEngineAdapter**(유일 mock·v1.1.0 HW 검증). `SENLYT_ENGINE=fake|sy01b` 로 분기,
-    기본(E2E)=fake. sy01b(실 RS485)는 아직 TODO 스텁이라 명시적으로 선택할 때만 조립.
+  - **엔진은 서버 선언(센소리움 pumpModel)대로 실물 어댑터** — 호스트가 Pi 든 맥북이든 같다(2026-09-04).
+    FakeEnginePort 는 테스트·도커 E2E 가 `SENLYT_FAKE_ENGINE=1` 로 명시할 때만(실 Pi 에선 거부).
 
 ⚠️ 이 모듈은 **결선(wiring)만** 한다 — 실제 펌프 소비 루프(SSE→멱등→Sequencer→역보고 상시 구동)는
    안전상 daemon.boot 유보를 유지한다. bootstrap 은 어댑터를 실체로 만들어 DaemonDeps 로 묶는다.
@@ -62,6 +62,12 @@ from ..ports.valve_port import ValvePort
 #   설치 시 안 넣어도 됨("URL만"). 명시하면 그 값 우선(fake|sy01b|tecan) — E2E/개발 고정용.
 #   tecan(=tecan_xcalibur|xcalibur) 은 Cavro XCalibur 실물 전용 — 자동감지로는 절대 선택되지 않는다.
 SENLYT_ENGINE_ENV = "SENLYT_ENGINE"
+# ⛔ 테스트·도커 E2E 전용 — 물리 엔진을 FakeEnginePort 로 바꾸는 **명시** 스위치(2026-09-04).
+#   종전 "GPIO 없는 호스트 = 자동 fake" 규칙을 폐기하면서 도입. 자동 fake 는 맥북 같은 개발기에서
+#   서버 선언(Tecan)을 무시하고 가짜 엔진을 올려 "펌프 0개" 로 보였다(실측). 이제 엔진은 호스트와
+#   무관하게 서버 선언대로 실물 어댑터를 조립하고, fake 는 이 키를 켠 곳에서만 나온다.
+#   실 Pi(GPIO 존재)에서는 켜도 거부(BootstrapError) — 실기기에서 가짜 토출 보고는 최악의 사고.
+SENLYT_FAKE_ENGINE_ENV = "SENLYT_FAKE_ENGINE"
 # pi 실행 모드(주문 큐 mode·flavor|fragrance) — 어느 컬렉션/큐를 구독·역보고할지.
 #   ⚠️ TOFU 후 **서버 배정(identity.mode)이 우선** — 이 env 는 서버 미배정 시 폴백일 뿐(더 이상 필수 아님).
 SENLYT_MODE_ENV = "SENLYT_MODE"
@@ -136,11 +142,17 @@ def _resolve_mode(environ: Mapping[str, str]) -> str:
     return "fragrance" if mode == "fragrance" else "flavor"
 
 
+def _is_truthy(raw: str | None) -> bool:
+    """env 불리언("1"/"true"/"yes"/"on" — 대소문자 무시). senlytd 의 동명 헬퍼와 같은 판정."""
+    return (raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _gpio_available() -> bool:
     """실 라즈베리파이 GPIO 존재 여부 — **Pi4(`/dev/gpiomem`)·Pi5(`/dev/gpiomem0`·RP1) 모두 커버**.
 
-    **자동감지 게이트** — 비-Pi(CI·dev·docker 컨테이너)는 gpiomem 계열이 없어 False → engine/valve 가
-    항상 fake 로 떨어진다(결정적). 실 Pi 에서만 실 하드웨어 자동 선택이 활성화된다.
+    **기주 밸브(GPIO) 자동감지에만 쓴다**(2026-09-04) — 비-Pi(CI·dev·docker·맥북)는 gpiomem 이 없어
+    False → 밸브 없음(off). 펌프 엔진은 이 판정과 무관하게 서버 선언대로 조립한다(시리얼만 있으면 됨).
+    이 값이 True 인 호스트에서는 SENLYT_FAKE_ENGINE 도 거부한다(실기기 가짜 엔진 금지).
     ⚠️ Pi5 는 RP1 칩이라 `/dev/gpiomem` 이 아니라 `/dev/gpiomem0`(뱅크별 gpiomem0..4) — glob 로 둘 다 잡는다
     (`/dev/gpiomem` 단일 경로만 보면 Pi5 에서 gpio 자동감지가 fake 로 오판·2026-07-17 실기기 발견).
     """
@@ -161,10 +173,13 @@ def build_engine(
     #   None(선언 미확정·실 Pi) = UndeclaredEngineAdapter(모션 거부·fail-closed).
     pump_model: "str | None" = None,
 ) -> EnginePort:
-    """엔진 조립 — 주입 우선. 실 Pi 는 **서버 선언(pump_model)** 로, 비-Pi 는 fake 로 조립.
+    """엔진 조립 — 주입 우선. 호스트와 무관하게 **서버 선언(pump_model)** 대로 실물 어댑터를 조립한다.
 
-    설치 시 `SENLYT_ENGINE` 을 안 넣어도 된다("URL만" 목표) — 실 Pi 에 USB-RS485 펌프 어댑터가
-    붙어 있으면 sy01b, 그 외(비-Pi·어댑터 미장착)는 fake 로 자동 결정한다. 명시하면 그 값이 우선.
+    - 선언 sy01b/tecan_xcalibur → 그 어댑터(시리얼 포트는 자동 탐지·미탐지면 어댑터 기본 경로).
+    - 선언 없음 → UndeclaredEngineAdapter(모션 거부·fail-closed).
+    - `SENLYT_FAKE_ENGINE=1`(테스트·E2E 전용) → FakeEnginePort. 실 Pi(GPIO 존재)에서는 거부.
+    2026-09-04 이전의 "비-Pi 면 자동 fake" 는 폐기 — 맥북 같은 개발기도 펌프를 꽂으면 실물로 돌고,
+    안 꽂으면 탐색 결과대로 "미연결"이 정직하게 보고된다. GPIO 유무는 기주 밸브(build_valve)만 가른다.
     `on_pi`·`port_lister` 는 테스트 주입 seam(기본 = 실 판정).
     """
     if engine is not None:
@@ -181,9 +196,14 @@ def build_engine(
             " 결정·부팅 스냅샷으로 수신). 재설치(install.sh)가 이 키를 제거합니다",
             stage=STAGE_PI_RECEIVED,
         )
-    # 비-Pi(개발환경) 자동 fake 는 유지 — 실 Pi 에서 fake 후퇴 금지 원칙(2026-07-19)도 그대로.
-    is_pi = on_pi() if on_pi is not None else _gpio_available()
-    if not is_pi:
+    # 명시 fake(테스트·E2E) — 실 Pi 에서는 거부(가짜 엔진이 실기기 위에서 "토출 완료"를 보고하는 사고 차단).
+    if _is_truthy(environ.get(SENLYT_FAKE_ENGINE_ENV)):
+        is_pi = on_pi() if on_pi is not None else _gpio_available()
+        if is_pi:
+            raise BootstrapError(
+                f"{SENLYT_FAKE_ENGINE_ENV} 는 실 Pi(GPIO 존재)에서 허용되지 않습니다 — "
+                "테스트·도커 E2E 전용 스위치입니다. 키를 제거하고 다시 시작하세요."
+            )
         return FakeEnginePort(estop_event=estop_event)
     if pump_model in ("sy01b", "tecan_xcalibur"):
         # 실 RS485 어댑터의 probe/dispense 는 hw-dev 워크오더(실 시리얼). 스텁이면 self-test 가 미준비를
@@ -213,7 +233,7 @@ def build_engine(
         return _RealAdapter(
             estop_event=estop_event, logger=logger, port_resolver=_resolve_ports
         )
-    # 실 Pi + 선언 미확정(None/미지값) — Undeclared fail-closed(추측 조립 금지 · 상태모델 D3).
+    # 선언 미확정(None/미지값) — Undeclared fail-closed(추측 조립 금지 · 상태모델 D3). 호스트 무관.
     #   ⛔ 폴백 sy01b 금지: tecan 이라 선언됐던 기기가 미확정 부팅에서 sy01b 로 조립되면
     #   초기화 프리앰블 U…R 이 XCalibur NVM 에 기록된다(undeclared_engine_adapter 헤더).
     from ..adapters.undeclared_engine_adapter import UndeclaredEngineAdapter
@@ -261,10 +281,14 @@ def build_valve(
     valve: "ValvePort | None" = None,
     on_pi: Callable[[], bool] | None = None,
 ) -> ValvePort | None:
-    """기주 밸브 조립(§9-1 v2) — 주입 우선. **env 미지정이면 자동감지**(실 Pi → gpio·아니면 fake).
+    """기주 밸브 조립(§9-1 v2) — 주입 우선. **env 미지정이면 자동감지**(GPIO 있음 → gpio·없음 → off).
 
-    설치 시 `SENLYT_VALVE` 를 안 넣어도 된다("URL만" 목표) — 실 Pi(GPIO 존재)면 gpio, 비-Pi 는 fake.
-      - 자동 gpio 결선 실패(gpiozero 부재 등)는 **graceful fallback → fake**(자동 선택이라 부팅 중단 X).
+    설치 시 `SENLYT_VALVE` 를 안 넣어도 된다("URL만" 목표) — GPIO(gpiomem)가 있으면 gpio, 없으면 **없음(None)**.
+      - 2026-09-04: 종전 "비-Pi 는 fake" 폐기. GPIO 가 없는 호스트에서 가짜 밸브가 "열렸다"고 답하면
+        기주가 안 나왔는데 성공 보고가 된다. 없으면 없다고 두고 밸브 스텝은 Sequencer pre-flight 가
+        fail-closed drop(토출 0) — 음료 모드는 "밸브 미결선"이 드러나고 향수 모드는 밸브가 원래 없어 무영향.
+      - 자동 gpio 결선 실패(gpiozero 부재 등)도 같은 이유로 **None**(자동 선택이라 부팅 중단은 없음).
+      - fake 는 `SENLYT_VALVE=fake` 명시(테스트·E2E)일 때만.
       - 명시 `gpio` 는 결선 실패 시 **fail-fast**(BootstrapError) — 운영자가 콕 집었으니 조용히 넘어가지 않음.
       - `off`: None — valve 스텝 수신 시 Sequencer pre-flight 가 fail-closed drop(토출 0).
     """
@@ -284,14 +308,14 @@ def build_valve(
 
     raw = environ.get(SENLYT_VALVE_ENV)
     if raw is None or raw.strip() == "":
-        # 자동감지 — 실 Pi 면 gpio(결선 실패 시 graceful fake), 아니면 fake.
+        # 자동감지 — GPIO 있으면 gpio(결선 실패 시 None), 없으면 None(밸브 없음·가짜 금지).
         is_pi = on_pi() if on_pi is not None else _gpio_available()
         if is_pi:
             try:
                 return _gpio()
-            except Exception:  # noqa: BLE001 — 자동 선택 실패는 안전 폴백(fake), 부팅 중단 없음.
-                return FakeValveAdapter(flow_ml_per_sec=flow, max_open_sec=max_open)
-        return FakeValveAdapter(flow_ml_per_sec=flow, max_open_sec=max_open)
+            except Exception:  # noqa: BLE001 — 자동 선택 실패는 "밸브 없음"(부팅 중단 없음·가짜 없음).
+                return None
+        return None
 
     choice = raw.strip().lower()
     if choice == "off":

@@ -177,7 +177,7 @@ def _make_env(srv_base: str, tmp_path, *, hardware_id: str, mode: str) -> dict[s
         "SENLYT_SERVER_BASE_URL": srv_base,  # ServerConfig 탈출구(프리뷰/prod 슬러그 대신 실서버).
         "SENLYT_HARDWARE_ID": hardware_id,  # read_hardware_id → deviceId(수집 시리얼).
         "DISPENSER_PROVISION_KEY": "prov",  # register Authorization: Bearer.
-        "SENLYT_ENGINE": "fake",  # 유일 mock — FakeEnginePort.
+        "SENLYT_FAKE_ENGINE": "1",  # 유일 mock — FakeEnginePort(명시 스위치·2026-09-04).
         "SENLYT_VALVE": "fake",  # FakeValveAdapter(실 GPIO 없이).
         "SENLYT_MODE": mode,  # 구독/역보고 mode 쿼리.
         "PUMP_ADDRESSES": f"{mode}:1,2",  # RR pump_map — 없으면 모든 스텝 drop(토출 0).

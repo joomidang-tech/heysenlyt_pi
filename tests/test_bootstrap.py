@@ -14,6 +14,8 @@ from senlyt_pi.adapters.device_identity_store import DeviceIdentity, DeviceIdent
 from senlyt_pi.adapters.fake_engine_adapter import FakeEnginePort
 from senlyt_pi.adapters.serial_port_discovery import SerialPortInfo
 from senlyt_pi.adapters.sy01b_engine_adapter import Sy01bEngineAdapter
+from senlyt_pi.adapters.tecan_xcalibur_engine_adapter import TecanXCaliburEngineAdapter
+from senlyt_pi.adapters.undeclared_engine_adapter import UndeclaredEngineAdapter
 from senlyt_pi.adapters.valve_adapter import FakeValveAdapter
 from senlyt_pi.app.bootstrap import (
     BootstrapError,
@@ -48,8 +50,8 @@ def test_assembles_real_adapters_from_env(tmp_path) -> None:
     assert comp.command_source.bearer_token == "tok-1"
     assert comp.status_sink.base_url == "https://v1-1-0.env.senlyt.com"
     assert comp.status_sink.bearer_token == "tok-1"
-    # 엔진 기본 = Fake(유일 mock).
-    assert isinstance(comp.engine, FakeEnginePort)
+    # 엔진 기본 = 선언 없음 → Undeclared(모션 거부). 자동 fake 는 폐기(2026-09-04).
+    assert isinstance(comp.engine, UndeclaredEngineAdapter)
     # logger 에 deviceId 바인딩.
     assert comp.logger.device_id == "dev-A"
 
@@ -73,8 +75,17 @@ def test_explicit_base_url_escape_hatch(tmp_path) -> None:
     assert comp.server_config.base_url == "http://web:3000"
 
 
-def test_engine_default_is_fake() -> None:
-    assert isinstance(build_engine({}), FakeEnginePort)
+def test_engine_default_is_undeclared_not_fake() -> None:
+    """선언 없음 = Undeclared. 호스트가 비-Pi 여도 자동 fake 로 떨어지지 않는다(2026-09-04)."""
+    assert isinstance(build_engine({}), UndeclaredEngineAdapter)
+    assert isinstance(build_engine({}, on_pi=lambda: False), UndeclaredEngineAdapter)
+
+
+def test_engine_fake_only_by_explicit_switch_and_never_on_pi() -> None:
+    """SENLYT_FAKE_ENGINE=1 은 테스트·E2E 전용 — 비-Pi 에선 fake, 실 Pi(GPIO)에선 거부."""
+    assert isinstance(build_engine({"SENLYT_FAKE_ENGINE": "1"}, on_pi=lambda: False), FakeEnginePort)
+    with pytest.raises(BootstrapError):
+        build_engine({"SENLYT_FAKE_ENGINE": "1"}, on_pi=lambda: True)
 
 
 def test_engine_injection_wins() -> None:
@@ -138,10 +149,14 @@ def test_engine_declared_tecan_on_pi_is_tecan() -> None:
     assert isinstance(eng, TecanXCaliburEngineAdapter)
 
 
-def test_engine_autodetect_non_pi_is_fake_even_with_serial() -> None:
-    """비-Pi 는 시리얼이 있어도 fake(자동감지 게이트 = Pi 여부·CI 결정성)."""
-    eng = build_engine({}, on_pi=lambda: False, port_lister=lambda: list(_CH340))
-    assert isinstance(eng, FakeEnginePort)
+def test_engine_non_pi_with_declaration_builds_real_adapter() -> None:
+    """비-Pi(맥북 등)도 서버 선언이 있으면 실물 어댑터 — 펌프를 꽂으면 진짜, 안 꽂으면 탐색대로 미연결."""
+    eng = build_engine(
+        {}, on_pi=lambda: False, port_lister=lambda: list(_CH340), pump_model="tecan_xcalibur"
+    )
+    assert isinstance(eng, TecanXCaliburEngineAdapter)
+    eng2 = build_engine({}, on_pi=lambda: False, port_lister=lambda: [], pump_model="sy01b")
+    assert isinstance(eng2, Sy01bEngineAdapter)
 
 
 def test_engine_env_is_deprecated_and_ignored() -> None:
@@ -159,12 +174,17 @@ def test_engine_env_is_deprecated_and_ignored() -> None:
 
 
 def test_valve_autodetect_non_pi_is_fake() -> None:
-    assert isinstance(build_valve({}, on_pi=lambda: False), FakeValveAdapter)
+    # GPIO 없는 호스트 = 밸브 없음(None). 가짜 밸브가 "열렸다"고 답하는 자동 fake 는 폐기(2026-09-04).
+    assert build_valve({}, on_pi=lambda: False) is None
+    # fake 는 명시(테스트·E2E)일 때만.
+    assert isinstance(build_valve({"SENLYT_VALVE": "fake"}, on_pi=lambda: False), FakeValveAdapter)
 
 
-def test_valve_autodetect_pi_returns_valve_no_crash() -> None:
-    """실 Pi 자동감지 — gpio 시도(gpiozero 부재 시 graceful fake). 어느 쪽이든 부팅 중단 없이 valve 반환."""
-    assert build_valve({}, on_pi=lambda: True) is not None
+def test_valve_autodetect_pi_no_crash_and_no_fake() -> None:
+    """실 Pi 자동감지 — gpio 시도. gpiozero 부재(개발기)면 None(밸브 없음)·부팅 중단 없음.
+    어느 경우에도 가짜 밸브로 폴백하지 않는다(2026-09-04)."""
+    v = build_valve({}, on_pi=lambda: True)
+    assert not isinstance(v, FakeValveAdapter)
 
 
 def test_valve_off_is_none() -> None:

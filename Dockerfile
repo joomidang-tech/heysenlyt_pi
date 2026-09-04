@@ -4,7 +4,7 @@
 # 운영(Pi 실기)은 provision.sh + systemd `senlytd`. 이 이미지는 docker-compose E2E 에서
 # senlytd 데몬을 컨테이너로 띄우기 위한 테스트 전용 규격이다.
 #   - register/SSE/status/heartbeat/trace 어댑터 = 실 HTTP 클라이언트(web:3000 호출)
-#   - 엔진 포트만 FakeEngineAdapter(SENLYT_ENGINE=fake) — 이미지에 시리얼 HW(/dev/senlyt-pump) 없음
+#   - 엔진 포트만 FakeEngineAdapter(SENLYT_FAKE_ENGINE=1 · E2E 전용 명시 스위치) — 이미지에 시리얼 HW(/dev/senlyt-pump) 없음
 #   - 무인 복구(systemd Restart)는 compose `restart: unless-stopped` 로 대체
 
 FROM python:3.12-slim

@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/joomidang-tech/product_heysenlyt_pi
 
 그 뒤 흐름 = **admin에 "승인 대기"로 뜸 → `<서버URL>/admin` 에서 "승인 + 모드 배정" → online**.
 
-- 나머지(deviceId·mode·engine·valve)는 **런타임 자동** — deviceId=HW시리얼 자동수집 · mode=승인 시 배정 · engine/valve=부팅 자동감지(실 Pi+시리얼→sy01b·GPIO→gpio·아니면 fake).
+- 나머지(deviceId·mode·engine·valve)는 **런타임 자동** — deviceId=HW시리얼 자동수집 · mode=승인 시 배정 · engine=admin 센소리움 선언대로 실물 어댑터(호스트 무관·시리얼 자동 탐지) · valve=GPIO 있으면 gpio, 없으면 없음(off). fake 는 테스트·E2E 가 `SENLYT_FAKE_ENGINE=1`/`SENLYT_VALVE=fake` 로 명시할 때만(실 Pi 에선 fake 엔진 거부).
 - 등록에 **비밀키 없음(TOFU)** — 키 없이 신청하고 **운영자 승인**이 관문. 승인 전엔 "승인 대기"로 폴링만(정상).
 - 재실행 안전(멱등) · 부팅 자동시작 · `Restart=always` 무인 복구. 상세 수동 설치는 아래 "실행" 절 참조.
 
