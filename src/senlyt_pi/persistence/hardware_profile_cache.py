@@ -84,7 +84,8 @@ def load_profile(state_dir: str | Path, server_base_url: str) -> "HardwareProfil
         return None
     if isinstance(stroke, bool) or not isinstance(stroke, int) or stroke <= 0:
         return None
-    if isinstance(ports, bool) or not isinstance(ports, int) or ports not in (12, 15):
+    # 후보 열거 금지(2026-09-04) — 포트 수는 센소리움 선언값. 형식 sanity(1..64)만.
+    if isinstance(ports, bool) or not isinstance(ports, int) or not 1 <= ports <= 64:
         return None
     sv = raw.get("sensoriumVersion")
     return HardwareProfile(

@@ -17,7 +17,7 @@ from senlyt_pi.persistence.hardware_profile_cache import (
 
 TECAN_SNAP = {
     "pumpPreset": {"pumpPresetId": "tecan_xcalibur", "pumpFullStroke": 3000, "syringeCapacityMl": 0.5},
-    "hardware": {"sensoriumVersion": "sensorium-fragrance-1.0.0+tecan", "pumpModel": "tecan_xcalibur", "valvePortCount": 15, "source": "device"},
+    "hardware": {"sensoriumVersion": "sensorium-fragrance-1.0.0+tecan", "pumpModel": "tecan_xcalibur", "valvePortCount": 8, "source": "device"},
 }
 
 
@@ -38,9 +38,9 @@ class TestStrictReaders:
         assert pump_model_from_settings(None) is None
 
     def test_valve_port_count_allowlist(self):
-        assert valve_port_count_from_settings(TECAN_SNAP) == 15
+        assert valve_port_count_from_settings(TECAN_SNAP) == 8  # 선언값 그대로 통과(후보 열거 없음)
         assert valve_port_count_from_settings({"hardware": {"valvePortCount": 12}}) == 12
-        # 12|15 밖·불량·부재 = None(→ 12 기본) — 추측 확장 금지.
+        # 형식 sanity 밖·불량·부재 = None(→ 12 기본).
         for bad in (0, -1, 100, "15", True, None):
             assert valve_port_count_from_settings({"hardware": {"valvePortCount": bad}}) is None
         assert valve_port_count_from_settings({}) is None
@@ -48,11 +48,11 @@ class TestStrictReaders:
 
 class TestProfileCache:
     def test_roundtrip_and_url_binding(self, tmp_path):
-        p = HardwareProfile(pump_model="tecan_xcalibur", pump_full_stroke=3000, valve_port_count=15)
+        p = HardwareProfile(pump_model="tecan_xcalibur", pump_full_stroke=3000, valve_port_count=8)
         save_profile(tmp_path, p, "https://senlyt.com")
         loaded = load_profile(tmp_path, "https://senlyt.com")
         assert loaded is not None and loaded.pump_model == "tecan_xcalibur"
-        assert loaded.pump_full_stroke == 3000 and loaded.valve_port_count == 15
+        assert loaded.pump_full_stroke == 3000 and loaded.valve_port_count == 8
         # 타 서버 URL 캐시는 무효 — URL 교체 재설치에서 옛 서버 선언 오용 방지.
         assert load_profile(tmp_path, "https://other.example") is None
 
@@ -69,7 +69,7 @@ class TestProfileCache:
         assert load_profile(tmp_path, "https://senlyt.com") is None
         # 미지 모델 = 무효.
         cache_path(tmp_path).write_text(
-            '{"pumpModel":"future","pumpFullStroke":3000,"valvePortCount":15,"serverBaseUrl":"https://senlyt.com"}',
+            '{"pumpModel":"future","pumpFullStroke":3000,"valvePortCount":8,"serverBaseUrl":"https://senlyt.com"}',
             encoding="utf-8",
         )
         assert load_profile(tmp_path, "https://senlyt.com") is None
@@ -82,13 +82,13 @@ PORT_PARITY_VECTORS: list[tuple[int, int, bool]] = [
     (1, 12, True),
     (12, 12, True),
     (13, 12, False),
-    (15, 12, False),
-    (13, 15, True),
-    (15, 15, True),
-    (16, 15, False),
+    (9, 8, False),
+    (7, 8, True),
+    (8, 8, True),
+    (16, 8, False),
     (0, 12, False),
-    (0, 15, False),
-    (-1, 15, False),
+    (0, 8, False),
+    (-1, 8, False),
 ]
 
 
@@ -129,14 +129,14 @@ class TestResolverFromCache:
     def test_cache_stroke_and_ports_reach_pump_map(self):
         # R-P0-4 — 스냅샷 부재 + tecan 캐시: stroke 3000 이 pump_map 에, 15 가 상한에 닿아야
         #   캐시 부팅이 영구 -1001 로 죽지 않는다. 용량은 비캐시 → 모드 기본 0.5 + 가드 OFF.
-        profile = HardwareProfile(pump_model="tecan_xcalibur", pump_full_stroke=3000, valve_port_count=15)
+        profile = HardwareProfile(pump_model="tecan_xcalibur", pump_full_stroke=3000, valve_port_count=8)
         r = build_resolver(
             {"PUMP_ADDRESSES": "fragrance:1,2,3"}, server_settings=None, hardware_profile=profile
         )
         assert r.pump_map[1].pump_full_stroke == 3000
         assert r.pump_map[1].syringe_capacity_ml == 0.5  # 용량 비캐시(모드 기본).
         assert r.capacity_from_settings is False  # 용량 가드 자동 OFF(오거부 방지).
-        assert r.valve_port_count == 15
+        assert r.valve_port_count == 8  # 선언값(가상 8) 그대로 — 후보 열거 없음
 
     def test_snapshot_wins_over_cache(self):
         profile = HardwareProfile(pump_model="sy01b", pump_full_stroke=12000, valve_port_count=12)
@@ -146,7 +146,7 @@ class TestResolverFromCache:
             hardware_profile=profile,
         )
         assert r.pump_map[1].pump_full_stroke == 3000  # 스냅샷 > 캐시.
-        assert r.valve_port_count == 15
+        assert r.valve_port_count == 8  # 선언값(가상 8) 그대로 — 후보 열거 없음
         assert r.capacity_from_settings is True
 
     def test_no_declaration_keeps_legacy_defaults(self):
@@ -163,7 +163,7 @@ _TECAN_HW_ONLY = {
     "hardware": {
         "sensoriumVersion": "sensorium-fragrance-1.0.0+tecan",
         "pumpModel": "tecan_xcalibur",
-        "valvePortCount": 15,
+        "valvePortCount": 8,
         "source": "device",
     },
 }
@@ -180,7 +180,7 @@ class TestModelAwareStrokeFallback:
         p = hardware_profile_from_snapshot("tecan_xcalibur", _TECAN_HW_ONLY)
         assert p.pump_model == "tecan_xcalibur"
         assert p.pump_full_stroke == 3000  # PUMP_PRESETS["tecan_xcalibur"] — 12000 이 아니다.
-        assert p.valve_port_count == 15
+        assert p.valve_port_count == 8
         assert p.sensorium_version == "sensorium-fragrance-1.0.0+tecan"
         # sy01b 선언은 sy01b 기본으로 — 폴백이 모델을 따라간다는 대칭 확인.
         assert hardware_profile_from_snapshot("sy01b", {"hardware": {"pumpModel": "sy01b"}}).pump_full_stroke == 12000
@@ -205,4 +205,4 @@ class TestModelAwareStrokeFallback:
         assert comp.hardware_profile is not None
         assert comp.hardware_profile.pump_model == "tecan_xcalibur"
         assert comp.hardware_profile.pump_full_stroke == 3000  # sy01b 12000 이 아니다.
-        assert comp.hardware_profile.valve_port_count == 15
+        assert comp.hardware_profile.valve_port_count == 8

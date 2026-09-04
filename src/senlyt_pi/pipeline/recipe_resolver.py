@@ -29,8 +29,8 @@ from ..core.wire_messages import RecipeStep
 from ..ports.valve_port import VALVE_BASES
 
 
-# 회전 밸브 헤드의 물리 구멍 범위 — 기본 12(SY-01B). 실제 상한은 센소리움 선언(12|15 — Tecan
-#   15포트 분배 밸브)이 RecipeResolver.valve_port_count 로 주입된다(2026-09-02 단일 SoT).
+# 회전 밸브 헤드의 물리 구멍 범위 — 기본 12(SY-01B). 실제 상한은 센소리움 선언값(코드는 후보를
+#   미리 알지 않는다)이 RecipeResolver.valve_port_count 로 주입된다(2026-09-02 단일 SoT).
 MIN_PORT = 1
 MAX_PORT = 12  # 기본값 — 서버 portLayout.DEFAULT_MAX_PORT 와 동일.
 
@@ -219,7 +219,7 @@ class RecipeResolver:
         #   build_resolver 가 용량을 파생하며 각인한다(기본 False = 안전측·가드 비활성).
         self.capacity_from_settings: bool = False
         # 유효 포트 상한(2026-09-02 센소리움 SoT) — build_resolver 가 각인. 기본 12(기존 거동).
-        #   모르는 쪽(구 스냅샷)이 15포트 스텝을 받으면 out-of-range drop = 무동작(안전측).
+        #   모르는 쪽(구 스냅샷)이 상한 밖 포트 스텝을 받으면 out-of-range drop = 무동작(안전측).
         self.valve_port_count: int = MAX_PORT
 
     def resolve(self, steps: Sequence[RecipeStep]) -> ResolvedRecipe:

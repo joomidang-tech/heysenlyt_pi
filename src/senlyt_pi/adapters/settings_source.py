@@ -110,8 +110,15 @@ def pump_model_from_settings(settings: Any) -> "str | None":
     return None
 
 
+# 형식 sanity 상한 — 제품 후보가 아니라 '깨진 값' 차단선(밸브 헤드가 이 근처일 리 없다). 선언 SoT 는 서버.
+_PORT_COUNT_SANITY_MAX = 64
+
+
 def valve_port_count_from_settings(settings: Any) -> "int | None":
-    """settings.hardware.valvePortCount(센소리움 파생·서버 주입 필드) → 12|15. 부재/불량 = None(→12).
+    """settings.hardware.valvePortCount(센소리움 파생·서버 주입 필드) → 선언된 포트 수. 부재/불량 = None(→12).
+
+    ⚠️ 후보를 열거하지 않는다(2026-09-04 — 종전엔 허용값을 열거했다): 포트 수는 센소리움 선언이 정하는
+    값이지 pi 가 미리 아는 목록이 아니다. 여기선 형식 sanity(양의 정수·물리적으로 말이 되는 범위)만.
 
     hardware 블록은 **settings 객체 내부**의 서버 주입 필드다(clamp allowlist 밖 — 기기 토큰
     바인딩 SSE 에서만 병합됨). 구 서버 스냅샷엔 없다 = None = 기존 12 거동(하위호환).
@@ -124,7 +131,7 @@ def valve_port_count_from_settings(settings: Any) -> "int | None":
     n = hw.get("valvePortCount")
     if isinstance(n, bool) or not isinstance(n, int):
         return None
-    return n if n in (12, 15) else None
+    return n if 1 <= n <= _PORT_COUNT_SANITY_MAX else None
 
 
 def full_stroke_from_settings(settings: Any) -> int | None:

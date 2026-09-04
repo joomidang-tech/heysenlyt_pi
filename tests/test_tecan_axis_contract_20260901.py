@@ -66,7 +66,7 @@ class FakeSerial:
 #   pumpPreset.pumpPresetId 는 산술 축이다(항상 값이 있어 선언 채널로 못 쓴다).
 TECAN_SETTINGS = {
     "pumpPreset": {"pumpPresetId": "tecan_xcalibur", "syringeCapacityMl": 0.5},
-    "hardware": {"pumpModel": "tecan_xcalibur", "valvePortCount": 15, "source": "device"},
+    "hardware": {"pumpModel": "tecan_xcalibur", "valvePortCount": 12, "source": "device"},  # 현행 선언값(2026-09-04)
 }
 SY01B_SETTINGS = {
     "pumpPreset": {"pumpPresetId": "sy01b", "syringeCapacityMl": 0.5},
