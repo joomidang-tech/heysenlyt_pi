@@ -144,7 +144,6 @@ def _mk_dispatcher(source):
 
 class TestPollStreamIsolation:
     def test_item_exception_does_not_kill_stream(self, monkeypatch) -> None:
-        from senlyt_pi.core.command_set import command_sets_from_snapshot
         from senlyt_pi.core.wire_messages import Command
 
         good = Command.from_json(_cmd("good", MINE))

@@ -372,16 +372,6 @@ def main() -> int:
     # ⛔ SY-01B 전용 프로브(검증 P0-3·2026-09-01) — 이 스크립트는 `U{...}R`(스톨전류)·`?` 폴을
     #   하드코딩한다. XCalibur(Tecan)에서 U 는 NVM 설정 기록(비가역 위험)이라 실행을 거부한다.
     #   Tecan 초기화 폴 특성 실측은 실물 도착 후 이 스크립트의 tecan 판(N0R·Q)을 별도로 만들 것.
-    import os
-# R9 P1-3 — 종전 SENLYT_ENGINE 가드는 은퇴한 env 키에 걸려 항상 통과(no-op)했다.
-    #   가드를 **실물 지문**으로 교체: 버스에서 & 를 읽어 Tecan 파트넘버(30xxxxxx)면 중단.
-    #   이 프로브는 SY-01B 전용(U200,5 송신)이라 XCalibur 에 돌리면 NVM 기록 위험.
-    try:
-        _fp_raw = send(bus, addr_list[0] if addr_list else 1, "&", "S0-지문")
-        _fp = _fp_raw.split("`", 1)[-1].split("\x03", 1)[0].strip() if _fp_raw else ""
-        if __import__("re").match(r"^30\d{6}", _fp):
-            print(f"⛔ 실물 지문 {_fp!r} = Tecan(XCalibur) — 이 프로브는 SY-01B 전용입니다(U=NVM 기록 위험). 중단.")
-            return 2
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", default=None, help="시리얼 포트 (기본: /dev/ttyUSB*/ttyACM* 자동)")
     ap.add_argument("--addrs", default="1,2", help="펌프 주소 콤마 (기본 1,2 — 식향)")
@@ -408,6 +398,19 @@ def main() -> int:
          interval=args.interval, move_steps=args.move_steps)
 
     bus = Bus(port)
+    # ⛔ 실물 지문 가드(R9 P1-3 · 2026-09-04 구문 수정) — 종전 SENLYT_ENGINE env 가드는 은퇴한
+    #   키에 걸려 항상 통과(no-op)했다. 버스에서 & 를 읽어 Tecan 파트넘버(30xxxxxx)면 중단:
+    #   이 프로브는 SY-01B 전용(U200,{n} 송신)이라 XCalibur 에 돌리면 NVM 기록 위험.
+    #   판독 실패/무응답은 통과(fail-open) — 클론의 & 거동 미실측이라 차단은 매치일 때만.
+    try:
+        _fp_row = send(bus, addrs[0] if addrs else "1", "&", "S0-지문")
+        _fp = str(_fp_row.get("raw", "") or "")  # printable 이스케이프 문자열 — 부분 탐색이 안전.
+        if __import__("re").search(r"30\d{6}\s+[A-Z]", _fp):
+            print(f"⛔ 실물 지문 {_fp!r} = Tecan(XCalibur) — 이 프로브는 SY-01B 전용입니다(U=NVM 기록 위험). 중단.")
+            bus.close()
+            return 2
+    except Exception:  # noqa: BLE001 — 지문 판독 실패 = fail-open(프로브 계속).
+        pass
     try:
         s0_baseline(bus, addrs)
         s1_home_when_home(bus, addrs, args.force, args.air, args.out, args.interval)

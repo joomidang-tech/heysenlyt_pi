@@ -12,15 +12,13 @@
 
 from __future__ import annotations
 
-import pytest
-
 from senlyt_pi.adapters.tecan_xcalibur_engine_adapter import (
     TECAN_MIN_SPEED_HZ,
     TecanXCaliburEngineAdapter,
 )
 import time as _time
 from senlyt_pi.adapters.sy01b_engine_adapter import Sy01bEngineAdapter
-from senlyt_pi.core.pump_guard import PUMP_PRESETS, SyringeSpec
+from senlyt_pi.core.pump_guard import SyringeSpec
 from senlyt_pi.ports.engine_port import (
     OP_INITIALIZE,
     OP_PLUNGER_FULL,

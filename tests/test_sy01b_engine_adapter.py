@@ -1046,7 +1046,6 @@ class TestModelFingerprintGate:
         assert not any("U" in w for w in fake.written)
 
     def test_non_tecan_fingerprint_fail_open(self):
-        from senlyt_pi.core.pump_guard import SyringeSpec
 
         fake = FakeSerial(responses=[self._fp_frame("SY-01B V1.2")])  # 미지 지문 = 통과.
         eng = adapter_with(fake)
@@ -1084,7 +1083,6 @@ class TestModelFingerprintGate:
 
     def test_fp_cache_only_on_success_and_cleared_on_close(self):
         """R9 P2-3 — 판독 실패는 캐시하지 않고(다음 기회 재검사), close 가 캐시를 비운다."""
-        from senlyt_pi.core.pump_guard import SyringeSpec
 
         fake = FakeSerial(default=b"")  # 전 왕복 무응답 — 지문 판독 실패.
         eng = adapter_with(fake)

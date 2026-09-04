@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from typing import Callable, Mapping, Sequence
 
 from ..core.command_set import CommandSet, CommandSetStatus
-from ..core.pump_guard import StatusErrorCode, SyringeSpec, fragrance_ml_to_ul
+from ..core.pump_guard import StatusErrorCode, SyringeSpec
 from ..core.wire_messages import Command, Heartbeat, RecipeStep
 from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
 from ..persistence.file_idempotency_ledger import LedgerEntryState
