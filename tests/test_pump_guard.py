@@ -37,11 +37,26 @@ class TestClampPumpPresetBuiltin:
         assert p.pump_syringe_type_code == 200
 
     def test_removed_tecan_id_falls_back_to_sy01b(self):
-        """제거된 Tecan(Cavro) id → sy01b 폴백(2026-07-18 미도입·레거시 저장값 방어)."""
+        """레거시 Cavro id → sy01b 폴백(구 저장값 방어 — 신 id 는 `tecan_xcalibur` 만 유효)."""
         for removed in ("cavro_xlp6000", "cavro_xcalibur"):
             p = clamp_pump_preset({"pumpPresetId": removed})
             assert p.pump_preset_id == "sy01b"
             assert p.pump_full_stroke == 12000
+
+    def test_tecan_id_is_honored_with_table_forced_numbers(self):
+        """tecan_xcalibur 명시 → 존중(2026-09-01 재도입). 수치는 여전히 표 강제(손 튜닝 차단)."""
+        p = clamp_pump_preset({
+            "pumpPresetId": "tecan_xcalibur",
+            "pumpFullStroke": 99999,  # 무시돼야 한다.
+            "pumpMaxCutoffSpeedHz": 99999,
+        })
+        assert p.pump_preset_id == "tecan_xcalibur"
+        assert p.pump_full_stroke == 3000
+        assert p.pump_max_start_speed_hz == 1000
+        assert p.pump_max_top_speed_hz == 6000
+        assert p.pump_max_cutoff_speed_hz == 2700
+        assert p.pump_max_slope == 20
+        assert p.pump_syringe_type_code == 0  # 스톨전류 명령 없음(U 미사용) 표식.
 
     def test_unknown_id_falls_back_to_sy01b(self):
         """unknown id → sy01b 폴백(§6-3.3)."""

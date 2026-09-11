@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from typing import Callable, Mapping, Sequence
 
 from ..core.command_set import CommandSet, CommandSetStatus
-from ..core.pump_guard import StatusErrorCode, fragrance_ml_to_ul
+from ..core.pump_guard import StatusErrorCode, SyringeSpec
 from ..core.wire_messages import Command, Heartbeat, RecipeStep
 from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
 from ..persistence.file_idempotency_ledger import LedgerEntryState
@@ -87,6 +87,7 @@ class Dispatcher:
         commandset_sink: CommandSetStatusSink | None = None,
         logger: "StructuredLogger | None" = None,
         now_s: Callable[[], float] | None = None,
+        pump_map: "Mapping[int, SyringeSpec] | None" = None,
     ) -> None:
         self.device_id = device_id
         self.command_source = command_source
@@ -101,6 +102,47 @@ class Dispatcher:
         self._now_s = now_s if now_s is not None else time.time
         # 완료된 job 리포트(관찰·테스트).
         self.reports: list[JobReport] = []
+        # 용량 축 fail-closed(2026-09-02) — 부팅 스냅샷의 addr→SyringeSpec(RR pump_map 과 동일
+        #   출처). 봉투/명령이 선언한 조립 전제 용량과 대조해 다르면 거부 — 스냅샷 스테일이
+        #   "에러 0 인 채 10~50% 과소토출"로 새던 무성 축을 막는다. 미주입(None)=무검사(하위호환).
+        self._pump_map: dict[int, SyringeSpec] = dict(pump_map) if pump_map is not None else {}
+
+    def _capacity_mismatch(self, declared_ml: float | None) -> "str | None":
+        """선언 용량(서버 조립 전제) ↔ 스냅샷 용량 대조 — 불일치면 사유 문자열, 정합/판정불가면 None.
+
+        버전당 단일 펌프 모델·단일 용량 전제라 pump_map 의 어느 spec 과도 달라지면 불일치다.
+        선언 부재(구서버)·pump_map 부재(미주입)는 검사하지 않는다 — 가드는 정보가 있을 때만.
+        수치는 메시지에 인라인(서버 trace allowlist 는 message 만 통과).
+        """
+        if declared_ml is None or not self._pump_map:
+            return None
+        for addr, spec in self._pump_map.items():
+            if abs(spec.syringe_capacity_ml - declared_ml) > 1e-6:
+                return (
+                    f"용량 축 불일치 — 서버 조립 전제 {declared_ml}mL ≠ 기기 스냅샷 "
+                    f"{spec.syringe_capacity_ml}mL(addr {addr}). 볼륨→스텝 환산이 갈려 무성 "
+                    "과소/과다 토출이 되므로 거부. admin 용량 변경 후 senlytd 재시작 필요"
+                )
+        return None
+
+    def _reject_capacity(self, command_id: str, trace_id: str | None, why: str) -> JobReport:
+        """용량 불일치 거부 — 물리 실행 0·정직한 실패(CMD_VALIDATION_FAILED)·**관측 가능 종단**.
+
+        R4 P1-2: 거부를 sequencer.reject_before_motion 으로 종단해 order status FAILED 가
+        서버에 역보고되고(레거시 축의 유일한 흔적), ledger settle 로 snapshot 재파생분이
+        DUPLICATE 로 접힌다(재거부 소음 0). 사유(수치 인라인)는 WARN 으로 남긴다.
+        """
+        if self._log is not None:
+            self._log.warn(
+                why, stage=STAGE_ERROR, trace_id=trace_id, command_id=command_id,
+            )
+        report = self.sequencer.reject_before_motion(
+            command_id=command_id,
+            trace_id=trace_id or "",
+            error_code=StatusErrorCode.CMD_VALIDATION_FAILED,
+        )
+        self.reports.append(report)
+        return report
 
     def poll(self) -> int:
         """현재 도착분 command 를 소비 — deviceId 필터 후 Sequencer.submit.
@@ -169,6 +211,11 @@ class Dispatcher:
         if command.device_id != self.device_id:
             return None
 
+        # ── 용량 축 fail-closed(2026-09-02) — 선언 용량 ≠ 스냅샷 용량이면 물리 실행 0. ──
+        mismatch = self._capacity_mismatch(command.syringe_capacity_ml)
+        if mismatch is not None:
+            return self._reject_capacity(command.id, command.trace_id, mismatch)
+
         # recipe 해석: 명시 steps 우선, None 이면 폴백 해석(recipeId/fragranceResult/flavor·mL→µL).
         steps: Sequence[RecipeStep] = (
             command.recipe if command.recipe is not None else self.interpret(command)
@@ -184,6 +231,9 @@ class Dispatcher:
 
     def dispatch_once(self, command: Command) -> JobReport:
         """단발 명령 처리(테스트/재처리·resync flush). 스트림 없이 직접 봉합."""
+        mismatch = self._capacity_mismatch(command.syringe_capacity_ml)
+        if mismatch is not None:
+            return self._reject_capacity(command.id, command.trace_id, mismatch)
         steps: Sequence[RecipeStep] = (
             command.recipe if command.recipe is not None else self.interpret(command)
         )
@@ -299,6 +349,19 @@ class Dispatcher:
         # ── delivered 보고 이후 = 종단 책임 구간(2026-07-19 P0) — 어떤 예외도 봉투를
         #    delivered 로 방치하지 않는다(방치 = reclaim 불가·재전달 예외 무한 반복·큐 교착). ──
         try:
+            # ── 용량 축 fail-closed(2026-09-02) — 선언 용량 ≠ 스냅샷 용량이면 물리 실행 0. ──
+            #   제조·정비(세척 포함) 공통: 볼륨(µL)→스텝 환산이 갈린 봉투는 무성 과소/과다라
+            #   실행 전에 정직하게 FAILED 로 종단한다(운영자 조치 = 재시작 후 재발행).
+            cap_mismatch = self._capacity_mismatch(cs.syringe_capacity_ml)
+            if cap_mismatch is not None:
+                report = self._reject_capacity(cs.command_set_id, cs.trace_id, cap_mismatch)
+                # 재전달 중복(이미 거부 종단됨)은 조용히 접는다 — FAILED 재전이는 최초 1회만.
+                if report.outcome is not JobOutcome.DUPLICATE_DROPPED:
+                    self._report_commandset(
+                        cs, CommandSetStatus.FAILED, StatusErrorCode.CMD_VALIDATION_FAILED
+                    )
+                return report
+
             if cs.steps is not None:
                 # 서버 두뇌(buildCommandRecipe)가 완성한 스텝 — 직소비(폴백 해석 우회).
                 steps: Sequence[RecipeStep] = cs.steps
@@ -461,28 +524,6 @@ class Dispatcher:
         return verdict if isinstance(verdict, str) else None
 
 
-def fragrance_notes_to_steps(
-    notes: Sequence[Mapping[str, object]],
-    *,
-    pump_addr_of: Callable[[str], int],
-) -> list[RecipeStep]:
-    """fragrance fragranceResult.notes → RecipeStep 폴백 해석 헬퍼(§6-6 mL→µL 정규화).
-
-    notes[i] = {name, amountMl, ...}. pumpAddr 는 pumpMap(flavor→addr) 을 통해 해석해야 하나,
-    여기서는 dispatcher 주입 interpret 가 매핑을 알고 있다고 전제하고, 단위 정규화만 제공한다.
-    """
-    steps: list[RecipeStep] = []
-    for i, n in enumerate(notes):
-        raw_name = n.get("name") or n.get("nameKo") or ""
-        name = raw_name if isinstance(raw_name, str) else ""
-        raw_amount = n.get("amountMl")
-        amount_ml = float(raw_amount) if isinstance(raw_amount, (int, float)) else 0.0
-        steps.append(
-            RecipeStep(
-                idx=i,
-                pump_addr=pump_addr_of(name),
-                flavor=name,
-                volume=fragrance_ml_to_ul(amount_ml),  # mL→µL(§6-6·Code 11 방지).
-            )
-        )
-    return steps
+# fragrance_notes_to_steps 는 pipeline.recipe_resolver 로 이관(2026-09-04 헥사고날 감사 P2 —
+#   flavor 쪽 동등 함수(flavor_recipe_to_steps)와 대칭 배치·app 은 조립/라우팅만). 호환 재수출:
+from ..pipeline.recipe_resolver import fragrance_notes_to_steps  # noqa: E402,F401

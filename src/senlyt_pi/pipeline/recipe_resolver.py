@@ -24,13 +24,15 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 from ..core.pump_guard import StatusErrorCode, SyringeSpec
+from ..core.pump_guard import fragrance_ml_to_ul
 from ..core.wire_messages import RecipeStep
 from ..ports.valve_port import VALVE_BASES
 
 
-# 회전 밸브 헤드의 물리 구멍 범위 — SY-01B 12포트(서버 portLayout.MIN_PORT/MAX_PORT 와 동일).
+# 회전 밸브 헤드의 물리 구멍 범위 — 기본 12(SY-01B). 실제 상한은 센소리움 선언값(코드는 후보를
+#   미리 알지 않는다)이 RecipeResolver.valve_port_count 로 주입된다(2026-09-02 단일 SoT).
 MIN_PORT = 1
-MAX_PORT = 12
+MAX_PORT = 12  # 기본값 — 서버 portLayout.DEFAULT_MAX_PORT 와 동일.
 
 
 # wire `op`(camelCase·서버 계약) → pi op(snake_case). 여기 없는 op 는 거부(fail-closed).
@@ -44,9 +46,9 @@ WIRE_OP_TO_PI: dict[str, str] = {
 }
 
 
-def _is_port_valid(port: int | None) -> bool:
-    """구멍 번호가 물리적으로 실재하는가(1~12). 서버 `isPortValid` 와 동일 규칙."""
-    return isinstance(port, int) and not isinstance(port, bool) and MIN_PORT <= port <= MAX_PORT
+def _is_port_valid(port: int | None, max_port: int = MAX_PORT) -> bool:
+    """구멍 번호가 물리적으로 실재하는가(1~max_port). 서버 `isPortValid` 와 동일 규칙."""
+    return isinstance(port, int) and not isinstance(port, bool) and MIN_PORT <= port <= max_port
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +215,12 @@ class RecipeResolver:
     def __init__(self, pump_map: Mapping[int, SyringeSpec]) -> None:
         # pumpAddr → SyringeSpec. PUMP_MAP(§9-1) 검증에 사용.
         self.pump_map = dict(pump_map)
+        # 용량 출처(R4.5 P2-A) — pump_map 의 syringe_capacity_ml 이 서버 스냅샷 유래면 True.
+        #   build_resolver 가 용량을 파생하며 각인한다(기본 False = 안전측·가드 비활성).
+        self.capacity_from_settings: bool = False
+        # 유효 포트 상한(2026-09-02 센소리움 SoT) — build_resolver 가 각인. 기본 12(기존 거동).
+        #   모르는 쪽(구 스냅샷)이 상한 밖 포트 스텝을 받으면 out-of-range drop = 무동작(안전측).
+        self.valve_port_count: int = MAX_PORT
 
     def resolve(self, steps: Sequence[RecipeStep]) -> ResolvedRecipe:
         """steps 를 정렬·검증·파생한다. 위반 시 [RecipeValidationError] raise(→ drop).
@@ -253,8 +261,8 @@ class RecipeResolver:
                     #   1,2 는 정지한다. 전부 미매핑이면 아래 empty 가드가 실패로 잡는다(silent COMPLETE 금지).
                     continue
                 # 포트 유효성(1~12 밖·비정수는 안전측 무시 → 해당 동작 생략/기본값 폴백).
-                _vp = s.in_port if s.in_port is not None and 1 <= s.in_port <= 12 else None
-                _op_out = s.out_port if s.out_port is not None and 1 <= s.out_port <= 12 else None
+                _vp = s.in_port if _is_port_valid(s.in_port, self.valve_port_count) else None
+                _op_out = s.out_port if _is_port_valid(s.out_port, self.valve_port_count) else None
                 resolved.append(
                     ResolvedOpStep(
                         idx=s.idx,
@@ -349,7 +357,7 @@ class RecipeResolver:
                 if not aspirations:
                     raise RecipeValidationError("empty_batch", idx=s.idx, pump_addr=s.pump_addr)
                 # 배출 구멍은 실재 범위(1~12)여야 한다(서버가 1차·pi 2차 자물쇠).
-                if not _is_port_valid(s.out_port):
+                if not _is_port_valid(s.out_port, self.valve_port_count):
                     raise RecipeValidationError(
                         "out_port_out_of_range", idx=s.idx, pump_addr=s.pump_addr
                     )
@@ -358,7 +366,7 @@ class RecipeResolver:
                 for a in aspirations:
                     vol = float(a.volume)
                     # 흡입 구멍 실재(1~12) + 흡입≠배출(같으면 밸브를 안 돌리고 빨아 그대로 뱉는 조립 버그).
-                    if not _is_port_valid(a.in_port):
+                    if not _is_port_valid(a.in_port, self.valve_port_count):
                         raise RecipeValidationError(
                             "in_port_out_of_range", idx=s.idx, pump_addr=s.pump_addr
                         )
@@ -453,11 +461,11 @@ class RecipeResolver:
             #     그대로 뱉는 꼴 = 조립 버그).
             #   부피 게이트(위)는 **물리 안전**(과흡입 → Code 11 펌프 파손)이라 pi 가 끝까지 쥔다.
             if s.in_port is not None or s.out_port is not None:
-                if not _is_port_valid(s.in_port):
+                if not _is_port_valid(s.in_port, self.valve_port_count):
                     raise RecipeValidationError(
                         "in_port_out_of_range", idx=s.idx, pump_addr=s.pump_addr
                     )
-                if not _is_port_valid(s.out_port):
+                if not _is_port_valid(s.out_port, self.valve_port_count):
                     raise RecipeValidationError(
                         "out_port_out_of_range", idx=s.idx, pump_addr=s.pump_addr
                     )
@@ -663,4 +671,32 @@ def flavor_recipe_source_to_steps(
         )
         idx += 1
 
+    return steps
+
+
+def fragrance_notes_to_steps(
+    notes: Sequence[Mapping[str, object]],
+    *,
+    pump_addr_of: Callable[[str], int],
+) -> list[RecipeStep]:
+    """fragrance fragranceResult.notes → RecipeStep 폴백 해석 헬퍼(§6-6 mL→µL 정규화).
+
+    notes[i] = {name, amountMl, ...}. pumpAddr 는 pumpMap(flavor→addr) 을 통해 해석해야 하나,
+    여기서는 dispatcher 주입 interpret 가 매핑을 알고 있다고 전제하고, 단위 정규화만 제공한다.
+    (2026-09-04 감사 P2로 app/dispatcher → 여기 이관 — flavor_recipe_to_steps 와 대칭.)
+    """
+    steps: list[RecipeStep] = []
+    for i, n in enumerate(notes):
+        raw_name = n.get("name") or n.get("nameKo") or ""
+        name = raw_name if isinstance(raw_name, str) else ""
+        raw_amount = n.get("amountMl")
+        amount_ml = float(raw_amount) if isinstance(raw_amount, (int, float)) else 0.0
+        steps.append(
+            RecipeStep(
+                idx=i,
+                pump_addr=pump_addr_of(name),
+                flavor=name,
+                volume=fragrance_ml_to_ul(amount_ml),  # mL→µL(§6-6·Code 11 방지).
+            )
+        )
     return steps

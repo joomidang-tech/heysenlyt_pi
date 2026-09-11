@@ -8,9 +8,19 @@ hey_senlyt **v1.2.0** 라즈베리파이4 headless 디스펜서 데몬 (Firebase
 라즈베리파이에서 **한 줄**이면 다운로드부터 systemd 등록·기동까지 됩니다. 명령어는 **하나로 고정**이고, 바꾸는 건 **맨 끝 서버 URL 하나**뿐입니다:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/joomidang-tech/product_heysenlyt_pi/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/main/install.sh \
   | sudo bash -s -- https://senlyt.com
 ```
+
+설치 스크립트는 **항상 main 의 사본**을 씁니다(브랜치와 무관한 한 벌). 어느 소스가 깔리는지는 서버 URL 로 유추하고(`senlyt.com`→`main`, `dev-env`→`dev`, `vX-Y-Z.env`→`vX.Y.Z`), 다른 브랜치·태그·커밋을 시험할 땐 환경변수로 지정합니다:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/main/install.sh \
+  | sudo env SENLYT_INSTALL_REF=test bash -s -- https://senlyt.com          # 브랜치 test
+  | sudo env SENLYT_INSTALL_REF=<40자리 커밋 SHA> bash -s -- https://senlyt.com   # 특정 커밋(축약 SHA 불가)
+```
+
+깔린 소스는 `/etc/senlyt/device.env` 의 `SENLYT_INSTALL_REF`·`SENLYT_INSTALL_COMMIT` 두 줄로 남습니다.
 
 | 환경 | 맨 끝 서버 URL만 교체 |
 |------|----------------------|
@@ -18,11 +28,11 @@ curl -fsSL https://raw.githubusercontent.com/joomidang-tech/product_heysenlyt_pi
 | **dev** | `https://dev-env.senlyt.com` |
 | **버전 프리뷰** | `https://v1-2-0.env.senlyt.com` |
 
-> pi 코드는 항상 **main(승격 안정본)** 에서 받습니다 — 데몬은 서버-불가지(어느 서버를 보든 인자로 받음)라, 환경 구분은 "어느 서버 URL을 보게 하나" 하나로만 합니다. (아직 main에 안 올라간 코드를 먼저 시험할 때만 `SENLYT_INSTALL_BRANCH=dev` 로 브랜치를 덮어쓰고 raw URL 경로도 그 브랜치로 바꿔 실행.)
+> pi 코드는 **서버 URL 과 같은 환경의 브랜치**에서 받습니다(`senlyt.com`→`main`, `dev-env`→`dev`, `vX-Y-Z.env`→`vX.Y.Z`). 데몬은 서버-불가지(어느 서버를 보든 인자로 받음)라, 사람이 바꾸는 건 서버 URL 하나입니다. 다른 소스를 시험할 땐 `SENLYT_INSTALL_REF=<브랜치|태그|전체 SHA>` 로만 덮어쓰고, raw URL 경로는 그대로 `main` 입니다(스크립트가 브랜치와 무관한 한 벌이라 바꿀 이유가 없음).
 
 그 뒤 흐름 = **admin에 "승인 대기"로 뜸 → `<서버URL>/admin` 에서 "승인 + 모드 배정" → online**.
 
-- 나머지(deviceId·mode·engine·valve)는 **런타임 자동** — deviceId=HW시리얼 자동수집 · mode=승인 시 배정 · engine/valve=부팅 자동감지(실 Pi+시리얼→sy01b·GPIO→gpio·아니면 fake).
+- 나머지(deviceId·mode·engine·valve)는 **런타임 자동** — deviceId=HW시리얼 자동수집 · mode=승인 시 배정 · engine=admin 센소리움 선언대로 실물 어댑터(호스트 무관·시리얼 자동 탐지) · valve=GPIO 있으면 gpio, 없으면 없음(off). fake 는 테스트·E2E 가 `SENLYT_FAKE_ENGINE=1`/`SENLYT_VALVE=fake` 로 명시할 때만(실 Pi 에선 fake 엔진 거부).
 - 등록에 **비밀키 없음(TOFU)** — 키 없이 신청하고 **운영자 승인**이 관문. 승인 전엔 "승인 대기"로 폴링만(정상).
 - 재실행 안전(멱등) · 부팅 자동시작 · `Restart=always` 무인 복구. 상세 수동 설치는 아래 "실행" 절 참조.
 

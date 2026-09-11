@@ -65,10 +65,8 @@ jobs:
               ;;
           esac
 
-      - name: install.sh BRANCH 기본값 == 이 브랜치 (버전 브랜치 자를 때 갱신 누락 방지)
+      - name: install.sh 문법·브랜치 무관성 (2026-09-11 — 소스는 SENLYT_INSTALL_REF/서버 URL 로 정한다)
         run: |
-          want="${{ github.ref_name }}"
-          got=$(sed -n 's/^BRANCH="\${SENLYT_INSTALL_BRANCH:-\(.*\)}"$/\1/p' install.sh)
-          [ -n "$got" ] || { echo "::error::install.sh 에서 BRANCH 기본값을 못 읽었다"; exit 1; }
-          [ "$got" = "$want" ] || { echo "::error::install.sh BRANCH 기본값='$got' 인데 이 브랜치는 '$want' — 새 버전 브랜치를 자르며 갱신을 빠뜨렸다"; exit 1; }
-          echo "✅ install.sh 가 자기 브랜치($want)를 설치한다"
+          bash -n install.sh
+          if grep -qE '^BRANCH="\$\{SENLYT_INSTALL_BRANCH:-' install.sh; then echo "::error::install.sh 에 브랜치 하드코딩이 되살아났다 — 소스는 REF/서버 URL 유추로만"; exit 1; fi
+          echo "✅ install.sh 는 브랜치와 무관한 한 벌이다"

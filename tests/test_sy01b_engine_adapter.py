@@ -174,8 +174,8 @@ class TestNoSilentSuccess:
         assert res.raw_error_code == FAKE_EMPTY_RAW_CODE
 
     def test_error_code_surfaces_raw_not_reclassified(self):
-        # 첫 응답(TR)은 정상, 그 다음 U200 에서 Code 9(플런저 오버로드).
-        fake = FakeSerial(responses=[status_frame(0), status_frame(9)])
+        # 첫 응답 = & 지문(모델 게이트·2026-09-03 — 미지 지문이라 통과), TR 정상, U200 에서 Code 9.
+        fake = FakeSerial(responses=[b"/0`SY01B\x03", status_frame(0), status_frame(9)])
         res = adapter_with(fake).dispense(cmd())
         # 어댑터는 **재분류하지 않는다** — raw 9 를 그대로 올리고 분류는 pump_guard 정본이 한다.
         assert res.raw_error_code == 9
@@ -1009,3 +1009,145 @@ class TestDispenseBatch:
         res = a.dispense_batch(cmd)
         assert res.raw_error_code == 9  # 오버로드 그대로 상위로(재분류 안 함).
         assert "O12" not in "".join(fake.written), "흡입 실패 후 배출 회전 미발생"
+
+
+class TestModelFingerprintGate:
+    """모델 지문 게이트(2026-09-03) — "runze 코드는 runze 실물에만": sy01b 어댑터가
+    실물에서 Tecan 지문(& = 30xxxxxx + rev)을 읽으면 기종 프레임(U) 발사 전에 셋업을
+    -1003 으로 거부한다. 미매치/무응답 = fail-open(기존 동작)."""
+
+    def _fp_frame(self, text: str) -> bytes:
+        return b"/0`" + text.encode() + b"\x03"
+
+    def test_tecan_fingerprint_blocks_setup_and_no_U_sent(self):
+        from senlyt_pi.core.pump_guard import MODEL_MISMATCH_RAW_CODE, SyringeSpec
+
+        fake = FakeSerial(responses=[self._fp_frame("30064809 C")])  # & 응답 = 실측 지문.
+        eng = adapter_with(fake)
+        code = eng._setup(1, SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=0.5))
+        assert code == MODEL_MISMATCH_RAW_CODE
+        assert any("&" in w for w in fake.written)          # 지문을 실제로 물었다.
+        assert not any("U" in w for w in fake.written)      # ⛔ U 프레임 0건 — NVM 보호의 핵심.
+        assert not any(w.startswith("/1Z") for w in fake.written)  # 셋업 전체 중단.
+
+    def test_tecan_fingerprint_with_err_nibble_still_blocks(self):
+        """M3 그물(테스트검증) — 지문 판독은 err nibble 을 무시하고 **데이터 블록만** 본다.
+
+        전원 직후 실측 시나리오: & 응답 상태바이트가 err7(초기화 전) latched 인 채 데이터엔
+        "30064809 C" 가 실려 온다. 구형(err 시 None)으로 원복하면 fail-open 으로 새서
+        U200,5 가 XCalibur NVM 에 발사된다 — 이 델타의 핵심 안전 근거라 표적으로 고정.
+        """
+        from senlyt_pi.core.pump_guard import MODEL_MISMATCH_RAW_CODE, SyringeSpec
+
+        fake = FakeSerial(responses=[b"/0g30064809 C\x03"])  # 0x67 'g' = busy+err7 상태바이트.
+        eng = adapter_with(fake)
+        code = eng._setup(1, SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=0.5))
+        assert code == MODEL_MISMATCH_RAW_CODE
+        assert not any("U" in w for w in fake.written)
+
+    def test_non_tecan_fingerprint_fail_open(self):
+
+        fake = FakeSerial(responses=[self._fp_frame("SY-01B V1.2")])  # 미지 지문 = 통과.
+        eng = adapter_with(fake)
+        eng._setup(1, SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=0.5))
+        assert any(w.startswith("/1U") for w in fake.written)  # 기존 sy01b 경로 그대로.
+
+    def test_tecan_adapter_gate_disabled(self):
+        # 파생(tecan) 어댑터는 자기 기종 — 지문 게이트 비활성(자기 &는 관측 채집용 별도 경로).
+        from senlyt_pi.adapters.tecan_xcalibur_engine_adapter import TecanXCaliburEngineAdapter
+
+        fake = FakeSerial()
+        eng = TecanXCaliburEngineAdapter(serial_factory=lambda *_a: fake)
+        assert eng.FOREIGN_FP_GUARD is False  # 명시 클래스 플래그(R9 P2-2)
+
+    def test_gate_covers_polled_and_broadcast_and_dispense_paths(self):
+        """R9 P0-1 봉합 그물 — 게이트는 옆길(_setup)이 아니라 **큰길**에 서야 한다:
+        initialize_polled·initialize_broadcast 두 큰길 경로에서 (dispense 는 _setup 경유라 옆길 테스트가 커버)
+        Tecan 지문이면 U 프레임 0건 + 전 주소 -1003."""
+        from senlyt_pi.core.pump_guard import MODEL_MISMATCH_RAW_CODE, SyringeSpec
+
+        spec = SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=0.5)
+        fp = self._fp_frame("30064809 C")
+
+        fake = FakeSerial(default=fp)  # 모든 왕복에 지문 프레임 — & 가 언제 오든 매치.
+        eng = adapter_with(fake)
+        res = eng.initialize_polled([1, 2], spec)
+        assert res == {1: MODEL_MISMATCH_RAW_CODE, 2: MODEL_MISMATCH_RAW_CODE}
+        assert not any("U" in w for w in fake.written)
+
+        fake2 = FakeSerial(default=fp)
+        eng2 = adapter_with(fake2)
+        res2 = eng2.initialize_broadcast([1], spec)
+        assert res2 == {1: MODEL_MISMATCH_RAW_CODE}
+        assert not any("U" in w for w in fake2.written)
+
+    def test_fp_cache_only_on_success_and_cleared_on_close(self):
+        """R9 P2-3 — 판독 실패는 캐시하지 않고(다음 기회 재검사), close 가 캐시를 비운다."""
+
+        fake = FakeSerial(default=b"")  # 전 왕복 무응답 — 지문 판독 실패.
+        eng = adapter_with(fake)
+        eng._model_gate((1,))
+        assert 1 not in eng._fp_checked
+        eng._fp_checked.add(1)
+        eng.close()
+        assert not eng._fp_checked
+
+
+class TestBenchPrimitivesOnSettleMachinery:
+    """rotate_valve/plunger_to 재조립 그물(2026-09-03 5팀 검증 P1).
+
+    종전 직접 조립판은 즉답이 깨지면 폴 없이 실패를 반환해 "실패 보고 + 모션 방치"를
+    만들었다 — 이제 두 프리미티브는 `_settle`(ack-tolerant·busy-NAK 재전송) 위에서만 돈다.
+    """
+
+    def _warm(self, a):
+        a._initialized.add(1)  # 셋업 캐시 warm — 프레임 스크립트를 프리미티브만으로 유지.
+        return a
+
+    def test_plunger_to_garbled_ack_is_decided_by_poll_not_failure(self):
+        # 즉답 파손(\x07 — 실기기 실측 프레임) → 폴이 완료를 확인하면 성공. A 재전송 0회.
+        fake = FakeSerial(responses=[b"\x07\x03"])  # A500 즉답만 파손, 이후 default ready.
+        a = self._warm(adapter_with(fake))
+        r = a.plunger_to(1, 500, SPEC_05)
+        assert r.raw_error_code == 0
+        assert fake.written.count("/1A500R\r") == 1  # 모션 재전송 금지(이중 토출 방어).
+        assert any(w == "/1?\r" for w in fake.written[1:])  # 폴이 최종 판정했다.
+
+    def test_rotate_busy_nak_waits_ready_then_resends_once(self):
+        # 즉답 err15(Busy NAK = 명령 버려짐) → Ready 대기 후 1회 재전송(_settle 의미론).
+        fake = FakeSerial(responses=[status_frame(15, ready=False)])
+        a = self._warm(adapter_with(fake))
+        r = a.rotate_valve(1, 3)
+        assert r.raw_error_code == 0
+        assert fake.written.count("/1I3R\r") == 2  # 원발사 + NAK 후 재전송.
+
+    def test_plunger_to_runs_setup_when_cache_cold(self):
+        # 절대 이동은 홈 기준 전제 — 캐시 cold 면 셋업(U·Z)이 A 보다 먼저 나간다.
+        fake = FakeSerial()
+        a = adapter_with(fake)
+        assert a.plunger_to(1, 0, SPEC_05).raw_error_code == 0
+        joined = "".join(fake.written)
+        assert "U200," in joined and "Z" in joined
+        assert joined.index("Z") < joined.index("A0R")
+
+    def test_rotate_with_spec_ensures_setup_before_rotation(self):
+        # 회전 후 lazy 재셋업(Z)이 밸브를 덮는 순서 역전 봉합 — spec 지정 시 셋업이 회전보다 먼저.
+        fake = FakeSerial()
+        a = adapter_with(fake)
+        assert a.rotate_valve(1, "o", spec=SPEC_05).raw_error_code == 0
+        joined = "".join(fake.written)
+        assert joined.index("Z") < joined.index("OR")
+
+
+class TestDtAddressEncoding:
+    def test_two_digit_addresses_use_manual_charset(self):
+        # 매뉴얼 §3.4(=XCalibur Table 3-2): 주소 = 30H+n 단일 문자 — 10 은 "10" 이 아니라 ':'.
+        from senlyt_pi.adapters.sy01b_engine_adapter import _addr_char
+
+        assert [_addr_char(n) for n in (1, 9, 10, 15)] == ["1", "9", ":", "?"]
+        import pytest as _pt
+
+        with _pt.raises(ValueError):
+            _addr_char(16)
+        with _pt.raises(ValueError):
+            _addr_char(0)

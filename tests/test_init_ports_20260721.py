@@ -101,18 +101,27 @@ class TestBroadcastInitPorts:
         """브로드캐스트 홈 = `Z1,12,2R` · 주차 = `I2R`(배출구) — 12 주차 폐지."""
         fake = BusScriptedSerial()
         a = adapter_with(fake, read_timeout_s=0.1, init_timeout_s=1.0)
+        a._fp_checked.update({1, 2, 3})  # 지문 게이트 선체크(R9) — 이 테스트의 관심은 와이어 순서.
         results = a.initialize_broadcast([1, 2], SPEC_05, init_in_port=12, init_out_port=2)
         assert results == {1: 0, 2: 0}
         assert fake.written[:4] == ["/_TR\r", "/_U200,5R\r", "/_Z1,12,2R\r", "/_I2R\r"], (
             "초기화 와이어 — 홈은 포트 지정(흡입=air·배출=output)·주차는 배출구"
         )
 
-    def test_broadcast_legacy_keeps_safe_port(self):
-        """포트 부재(구 서버) — 기존 `Z1R`+`I12R` 그대로(하위호환·기존 테스트와 동일)."""
+    def test_broadcast_no_ports_skips_parking(self):
+        """포트 부재 — `Z1R`(펌웨어 기본 포트 홈)만, 주차 프레임 없음.
+
+        2026-09-03 계약 변경: 종전엔 SAFE_PORT(12)로 폴백 주차했지만, 그건 배관을 모르는
+        호출자(벤치 툴 등)에게 sy01b 배관 상수를 강제하는 것이었다(3-way 실물 = 매번 I12R err3).
+        `_setup` 의 문서화된 계약("포트를 모르면 주차 생략")과 정합. 운영 데몬은 D45 이후 항상
+        포트를 실어 보내므로(위 테스트) 운영 경로 영향 0.
+        """
         fake = BusScriptedSerial()
         a = adapter_with(fake, read_timeout_s=0.1, init_timeout_s=1.0)
+        a._fp_checked.update({1, 2, 3})  # 지문 게이트 선체크(R9) — 이 테스트의 관심은 와이어 순서.
         a.initialize_broadcast([1, 2], SPEC_05)
-        assert fake.written[:4] == ["/_TR\r", "/_U200,5R\r", "/_Z1R\r", "/_I12R\r"]
+        assert fake.written[:3] == ["/_TR\r", "/_U200,5R\r", "/_Z1R\r"]
+        assert not any("I12R" in w for w in fake.written)
 
 
 class TestRunOpInitPorts:

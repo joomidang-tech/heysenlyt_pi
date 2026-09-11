@@ -27,6 +27,9 @@ KNOWN_ADAPTER_VID_PID: dict[tuple[int, int], str] = {
     (0x1A86, 0x7523): "CH340",
     (0x1A86, 0x5523): "CH341",
     (0x0403, 0x6001): "FT232R",
+    # Prolific PL2303G 계열 — 2026-09-03 벤치 실측(Tecan 브링업 어댑터). macOS 는 App Store
+    #   "PL2303 Serial" 드라이버 설치 전엔 /dev 노드가 아예 안 생긴다(열거 0 = 드라이버 층).
+    (0x067B, 0x23C3): "PL2303G",
 }
 
 # 블루투스/디버그 등 명백한 비-펌프 포트 제외(v1.1.0 findDevicePort 스킵 패턴).

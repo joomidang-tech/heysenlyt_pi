@@ -77,18 +77,17 @@ def _now_iso_ms() -> str:
 #   `includeIfNull:false` 로 키 자체가 빠졌고, admin 기기 카드가 online 인데 "엔진 —"으로 떴다.
 #   실 Pi 라도 USB-RS485 어댑터 미장착이면 자동감지(bootstrap.build_engine)가 fake 로 떨어지는데,
 #   그게 **정상적인 fake 구동**인지 **보고 누락**인지 운영자가 화면에서 구분할 수 없었다.
-_ENGINE_WIRE_NAMES: dict[str, str] = {
-    "Sy01bEngineAdapter": "sy01b",
-    "FakeEnginePort": "fake",
-}
-
-
 def engine_wire_name(engine: EnginePort) -> str:
-    """엔진 어댑터 → heartbeat engine 표기. 미지 어댑터(테스트 더블 등)는 클래스명 그대로.
+    """엔진 어댑터 → heartbeat engine 표기 — 어댑터 클래스의 `MODEL_ID` 자기 선언을 읽는다.
 
-    관측 필드라 **침묵(None)보다 이름**이 낫다 — 모르는 어댑터도 무엇이 붙었는지 보이게 한다.
+    종전엔 클래스명 문자열 사전(_ENGINE_WIRE_NAMES)으로 역추론했다(2026-09-03 검증 P2 —
+    클래스 rename 시 무성 파손). 이제 어댑터가 스스로 선언한 정체(MODEL_ID: sy01b/
+    tecan_xcalibur/fake)를 그대로 쓴다 — 와이어 값은 바이트 동일(admin OrdersPage 실펌프
+    판정·test_wire_messages 계약 유지). 미지 어댑터(테스트 더블 등)는 클래스명 그대로 —
+    관측 필드라 **침묵(None)보다 이름**이 낫다.
     """
-    return _ENGINE_WIRE_NAMES.get(type(engine).__name__, type(engine).__name__)
+    mid = getattr(type(engine), "MODEL_ID", None)
+    return mid if isinstance(mid, str) and mid else type(engine).__name__
 
 
 def _order_id_of(command_id: str) -> str:
@@ -177,6 +176,19 @@ class DaemonDeps:
     #   빈 채 부팅하면(어댑터 미장착 등) 감시 대상 0 → admin 이 부팅 스냅샷 폴백에 갇혔다.
     #   mode 파생(flavor=[1,2]·fragrance=[1,2,3]) — senlytd 가 주입. None = pump_map 만(하위호환).
     hw_watch_addrs: "tuple[int, ...] | None" = None
+    # 펌프 응답 감지 + 부팅 인식 누락(기대 ⊄ pump_map — 공집합·부분 인식 공통) 시 1회 호출되는
+    #   정책 콜백(R8 P1-1·R8.5 P2) — PUMP_ADDRESSES 각인 제거 후 부팅 1회 스캔이 유일해져, 펌프
+    #   전원이 데몬보다 늦게 켜지면 매핑이 누락된 채 영구 unmapped drop 이 되던 회복 불가를 닫는다.
+    #   정책(재기동)은 app 층(senlytd)이 주입 — 데몬은 관측·발화만. 부분 인식은 제조가 가능한
+    #   상태라 발화 직전 is_busy 를 재확인해 진행 중 작업을 선점하지 않는다.
+    #   None = 비활성(테스트/구성 하위호환).
+    on_pumps_seen_unmapped: Callable[[], None] | None = None
+    # 용량 축 가드 활성 조건(R4 P0-1) — pump_map 의 syringe_capacity_ml 이 **서버 스냅샷 유래**일
+    #   때만 True. 폴백(스냅샷 부재 → 모드 기본 0.5)일 땐 False — 그 0.5 는 관측값이 아니라
+    #   추측값이라, 이를 근거로 서버 선언 용량을 거부하면 부팅 순단 1회로 제조·세척 전량 거부
+    #   (위생 하드락 탈출구 봉쇄 = 현장 방문 전 벽돌)가 된다. 가드는 "서버가 말한 값 vs 서버가
+    #   말한 값" 대조일 때만 의미가 있다. False = 무검사(델타 이전과 동일 거동 + 부팅 WARN).
+    capacity_from_settings: bool = False
 
 
 class SenlytDaemon:
@@ -229,6 +241,8 @@ class SenlytDaemon:
         # 펌프 `?` 프로브로 갱신. admin 연결 칩의 실시간 근거(부팅 스냅샷 pumps 와 별개 축).
         self._pump_health: "dict[int, str] | None" = None
         self._hw_checked_at: str | None = None
+        # R8 P1-1 — 재발견 정책 콜백의 1회 발화 래치(30s 주기 감시가 재기동을 연타하지 않게).
+        self._pumps_seen_unmapped_fired = False
         self._hb_count = 0
         self._shutdown_lock = threading.Lock()
         self._shutdown_done = False
@@ -256,6 +270,10 @@ class SenlytDaemon:
             commandset_source=deps.commandset_source,
             commandset_sink=commandset_sink if callable(commandset_sink) else None,
             logger=deps.logger,  # 정비 신선도 게이트 관측(2026-07-19)
+            # 용량 축 fail-closed(2026-09-02) — RR 과 같은 pump_map(부팅 스냅샷 파생). 봉투/명령의
+            #   선언 용량과 대조해 다르면 실행 전 거부(스냅샷 스테일 무성 과소토출 차단).
+            #   ⚠️ 스냅샷 유래일 때만(R4 P0-1) — 폴백 용량(추측값)으로는 대조하지 않는다.
+            pump_map=resolver.pump_map if deps.capacity_from_settings else None,
         )
         self._recovery = BootRecovery(deps.ledger)
 
@@ -878,12 +896,13 @@ class SenlytDaemon:
         probe = getattr(self.deps.engine, "health_probe", None)
         if not callable(probe) or self._sequencer.is_busy:
             return
-        pumps = sorted(self._sequencer.resolver.pump_map)
-        if not pumps:
-            # 부팅 인식 실패(어댑터 미장착 등)여도 **기대 주소를 계속 실측**한다(실시간 판단 —
-            #   2026-07-19 확정). 그래야 admin 이 "무응답(빨강)"을 정직하게 보여주고, USB 가
-            #   나중에 꽂히면 ok(초록)로 살아나는 것도 보인다.
-            pumps = sorted(self.deps.hw_watch_addrs or ())
+        # 감시 대상 = 매핑 ∪ 기대 주소(R8.5 P2 — 부분 인식에서 **빠진** 주소를 관측해야
+        #   재발견 조건이 성립한다. 매핑만 보면 3펌프 중 2개 부팅 인식 시 3번은 감시조차 안 돼
+        #   영구 unmapped drop). 기대 주소 실측 유지(실시간 판단 — 2026-07-19 확정): admin 이
+        #   "무응답(빨강)"을 정직하게 보고, USB 가 나중에 꽂히면 ok(초록)로 살아난다.
+        mapped = set(self._sequencer.resolver.pump_map)
+        watch = set(self.deps.hw_watch_addrs or ())
+        pumps = sorted(mapped | watch)
         if not pumps:
             return
         health: dict[int, str] = {}
@@ -897,15 +916,34 @@ class SenlytDaemon:
         self._pump_health = health
         self._hw_checked_at = self._now_iso()
         # 펌프는 응답하는데 부팅 인식(pump_map)이 비어 제조가 보류 중인 상태를 표면화(WARN 즉시
-        #   flush — 30s 주기 반복은 "조치 필요 지속" 신호로 의도). 자동 재발견은 백로그(resolver
-        #   재구성 필요) — 현 복구 경로는 senlytd 재시작.
-        if not self._sequencer.resolver.pump_map and any(v == "ok" for v in health.values()):
+        #   flush — 30s 주기 반복은 "조치 필요 지속" 신호로 의도). 자동 복구 = on_pumps_seen_unmapped
+        #   콜백(R8 P1-1 — senlytd 가 우아한 재기동을 주입: 재기동이 boot 스캔을 다시 돌려 resolver
+        #   재조립. Undeclared 재fetch 와 같은 계약). 콜백은 프로세스 생애 1회만 발화 — 재기동 후에도
+        #   스캔이 계속 실패하면(펌프가 health 엔 응답하는데 discover 엔 침묵하는 비정상) 다음
+        #   프로세스가 다시 1회 시도하므로, 사이클 간격은 부팅 시간이 자연 하한이 된다.
+        # 발화 조건(R8.5 P2 일반화) — "기대인데 부팅 인식이 못 잡은 주소(missing)" 중 **ok 응답**이
+        #   있을 때만. ok ⟺ boot probe True(같은 술어·같은 파서 — R8.5 (a) 검증)라 재기동하면 반드시
+        #   찾는 상태에서만 발화한다. ⛔ garbled 는 probe False 와 동치 — 조건에 넣으면 재기동해도
+        #   또 실패하는 무한 재기동 루프가 된다(그물: test_daemon_hardening garbled 케이스).
+        missing = watch - mapped
+        if missing and any(health.get(a) == "ok" for a in missing):
             self._log.warn(
-                "펌프 응답 감지 — 부팅 인식 실패로 제조 보류 중(재시작 시 재개·자동 재발견 백로그)",
+                "펌프 응답 감지 — 부팅 인식 누락으로 제조 제한 중(자동 재기동으로 재스캔 예정)",
                 stage=STAGE_PI_RECEIVED,
                 device_id=self.deps.device_id,
                 pumpHealth={str(a): s for a, s in health.items()},
+                missingAddrs=sorted(missing),
             )
+            if (
+                self.deps.on_pumps_seen_unmapped is not None
+                and not self._pumps_seen_unmapped_fired
+                and not self._sequencer.is_busy  # 부분 인식은 제조 가능 — 진행 중 작업 선점 금지.
+            ):
+                self._pumps_seen_unmapped_fired = True
+                try:
+                    self.deps.on_pumps_seen_unmapped()
+                except Exception:  # noqa: BLE001 — 정책 콜백 실패가 감시 루프를 죽이면 안 된다.
+                    self._log.warn("펌프 재발견 정책 콜백 실패 — 감시 지속", stage=STAGE_PI_RECEIVED)
 
     def _emit_heartbeat(self) -> None:
         """heartbeat 전송(queueDepth 파생) + ship_trace 배치 flush + OQ flush — 전부 best-effort."""
