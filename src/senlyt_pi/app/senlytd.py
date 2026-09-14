@@ -155,6 +155,20 @@ def _make_pump_rediscovery_restart(logger: StructuredLogger, device_id: str) -> 
     return _restart
 
 
+def _make_pump_model_changed_restart(logger: StructuredLogger, device_id: str) -> "Callable[[], None]":
+    """실물 기종 변경 정책(2026-09-14) — 유휴 감시가 확인한 "다른 기종" 을 재기동으로 반영(부팅 감지 재조립)."""
+
+    def _restart() -> None:
+        logger.warn(
+            "실물 펌프 기종 변경 확인 — 정상 종료 후 재기동으로 새 기종 어댑터를 조립합니다",
+            stage=STAGE_PI_RECEIVED,
+            device_id=device_id,
+        )
+        os.kill(os.getpid(), signal.SIGTERM)  # 우아한 종료 → systemd Restart=always 재기동.
+
+    return _restart
+
+
 def _install_signal_handlers(daemon: SenlytDaemon, logger: StructuredLogger) -> None:
     """SIGTERM/SIGINT → 우아한 종료 요청(stop 플래그). 비메인스레드/미지원 플랫폼은 무시."""
     import signal
@@ -218,6 +232,8 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         mode=getattr(components, "mode", None),
         # 하드웨어 선언(스냅샷>캐시) — 캐시 부팅의 stroke·포트 상한 공급원(2026-09-02 단일 SoT).
         hardware_profile=getattr(components, "hardware_profile", None),
+        # 부팅 감지가 찾은 응답 주소(2026-09-14) — 2차 스캔 생략(감지 기종·pump_map 동일 관측).
+        known_pump_addrs=getattr(components, "detected_pump_addrs", None),
     )
     deps = DaemonDeps(
         device_id=components.device_id,
@@ -256,12 +272,21 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
             if _should_arm_pump_rediscovery(resolver.pump_map, components.engine, watch_addrs)
             else None
         ),
+        # 실물 기종 변경 정책(2026-09-14) — 유휴 감시가 2회 연속 다른 기종을 보면 우아한 재기동 → 부팅 감지가
+        #   새 기종으로 재조립(핫스왑 없음 · 재발견 재기동과 같은 계약).
+        on_pump_model_changed=_make_pump_model_changed_restart(logger, components.device_id),
+        hardware_source=getattr(components, "hardware_source", None),
     )
     # ── Undeclared 자가복구(2026-09-02 상태모델 D3) — 선언 미확정 부팅이면 주기 재fetch 스레드. ──
     #   성공(유효 모델 수신) 시 캐시가 기록되고 데몬을 정상 종료시킨다 → systemd Restart=always 가
     #   재기동해 새 선언으로 조립(핫스왑 없이 경계가 명확). 성공했는데 여전히 미지값이면 백오프
     #   지속 + WARN(무한 타이트루프 금지). 도착 봉투는 UndeclaredEngineAdapter 가 정직 실패 처리.
-    if getattr(components, "hardware_source", "") == "undeclared":
+    _hw_src = getattr(components, "hardware_source", "")
+    from ..adapters.undeclared_engine_adapter import UndeclaredEngineAdapter as _Undeclared
+
+    # 엔진이 실제로 Undeclared 일 때만(검증 P2-4) — fake 엔진(E2E·개발기)은 출처가 undeclared 여도 재감지가 실
+    #   시리얼을 열어 재기동 루프를 만들 수 있다.
+    if _hw_src in ("undeclared", "undetected", "mixed") and isinstance(components.engine, _Undeclared):
         from ..adapters.settings_source import (
             fetch_settings_once,
             hardware_profile_from_snapshot,
@@ -275,8 +300,31 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
             state_dir = environ.get(SENLYT_STATE_DIR_ENV, "").strip() or environ.get(
                 "LOG_DIR", ""
             ).strip()
+            from ..adapters.pump_model_detect import detect_pump_model
+            from ..adapters.serial_port_discovery import discover_serial_port
+
             while True:
                 time.sleep(delay)
+                # ① 실물 재감지(2026-09-14) — 엔진이 Undeclared 라 포트를 쥔 주체가 없어 안전. 균일 기종이 잡히면
+                #   재기동(부팅 감지가 같은 결과로 조립). 혼합/판독 불가는 계속 대기.
+                try:
+                    _port = discover_serial_port(environ)
+                    if _port:
+                        _expected = [1, 2] if components.mode == "flavor" else [1, 2, 3]
+                        _det = detect_pump_model(_port, _expected, logger=logger)
+                        if _det.model is not None:
+                            logger.warn(
+                                f"실물 기종 감지(model={_det.model}) — 정상 종료 후 재기동으로 재조립합니다",
+                                stage=STAGE_PI_RECEIVED,
+                            )
+                            os.kill(os.getpid(), signal.SIGTERM)
+                            return
+                except Exception:  # noqa: BLE001 — 재감지 실패 = 다음 주기.
+                    pass
+                if _hw_src != "undeclared":
+                    delay = 60.0  # 재감지는 read-only 2프레임 — 고정 60초(운영자 안내 문구와 일치 · 검증 P2-5).
+                    continue
+                # ② 선언 재fetch(응답 펌프 0 + 선언 없음 — 종전 D3 경로 그대로).
                 try:
                     snap = fetch_settings_once(
                         components.server_config, components.identity.dispenser_token, components.mode

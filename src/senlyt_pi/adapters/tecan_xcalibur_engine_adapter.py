@@ -81,6 +81,7 @@ from .sy01b_engine_adapter import (
     SERIAL_READ_TIMEOUT_S,
     SerialFactory,
     Sy01bEngineAdapter,
+    RUNZE_FP_RE,
 )
 
 # XCalibur 상태조회 — 매뉴얼 §3.6 "[Q] is the only valid method for obtaining pump status".
@@ -100,8 +101,11 @@ class TecanXCaliburEngineAdapter(Sy01bEngineAdapter):
     (풀스트로크 3000·N0 표준 모드·XCalibur 속도 상한)를 기본으로 쓴다.
     """
 
-    # sy01b 지문 게이트는 자기 기종이므로 비활성(R9 P2-2 — 명시 선언).
-    FOREIGN_FP_GUARD = False
+    # 지문 게이트 **대칭화**(2026-09-14) — 종전 False("sy01b 지문 게이트는 자기 기종")는 게이트를 sy01b 전용으로
+    #   본 것. 이제 게이트는 "남의 실물에 내 기종 프레임을 내지 않는다" 의 공통 기계이고, Tecan 이 남으로 보는
+    #   실물은 Runze(`RUNZE_FP_RE` — 2026-09-11 실측 `8.33`). 셋업 첫 프레임 N0R 앞에서 선다.
+    FOREIGN_FP_GUARD = True
+    FOREIGN_FP_RE = RUNZE_FP_RE
     MODEL_ID = "tecan_xcalibur"
     # 정지 = `T` 단독 — `TR` 은 R 이 종료된 명령 문자열을 재개할 수 있다(§3.5.5 · 헤더 3b).
     TERMINATE_CMD = "T"
@@ -163,7 +167,7 @@ class TecanXCaliburEngineAdapter(Sy01bEngineAdapter):
         # 멱등(모션 무발생) 재전송 허용 집합 — 이 기종의 정지 프레임은 `T`(TR 아님)라
         #   부모 집합을 그대로 합치지 않고 재선언한다. Q 도 Report 라 멱등.
         self._resend_safe = frozenset({"?", self.TERMINATE_CMD, TECAN_STATUS_QUERY})
-        # tecan 명시 기기만 probe 에서 `&` 펌웨어 관측 채집(R3 P2-4 — sy01b 기본 경로 불변).
+        # probe `&` 관측 채집 — 2026-09-11 부터 부모(sy01b)도 ON 이라 재선언은 의도 표기용.
         self._fw_probe_capture = True
         # `?76`/`&` readback 관측은 주소당 1회(R3 P2-3) — 관측 목적(포맷 채집)은 1회면 충분하고,
         #   무응답 링크에선 read_timeout×2 가 재셋업(오버로드 복구 직후 포함)마다 붙는다.
@@ -238,6 +242,10 @@ class TecanXCaliburEngineAdapter(Sy01bEngineAdapter):
                 except Exception:  # noqa: BLE001 — 관측 실패는 셋업 성패와 무관.
                     continue
                 text = "".join(ch for ch in raw if 32 <= ord(ch) < 127)
+                if report_cmd == "&":
+                    fp = self._fp_data_block(raw)
+                    if fp:
+                        self._fw_fingerprints[addr] = fp  # 하트비트 보고용(판정 없음·2026-09-11).
                 if self._log is not None:
                     self._log.debug(
                         f"XCalibur readback({report_cmd}) — 실기기 포맷 채집용 관측(판정 없음)",

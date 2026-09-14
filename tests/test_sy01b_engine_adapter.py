@@ -1030,6 +1030,16 @@ class TestModelFingerprintGate:
         assert not any("U" in w for w in fake.written)      # ⛔ U 프레임 0건 — NVM 보호의 핵심.
         assert not any(w.startswith("/1Z") for w in fake.written)  # 셋업 전체 중단.
 
+    def test_fingerprint_value_is_cached_for_heartbeat_report(self):
+        """2026-09-11 — 관측한 & 데이터 블록은 `pump_fingerprints()` 로 노출된다(하트비트 pumpFingerprints 원천).
+        Runze 실측값 `8.33`(기종 프레임 X·판정 없음) — 링크 리셋이면 비워져 재관측된다."""
+        fake = FakeSerial(responses=[self._fp_frame("8.33")])
+        eng = adapter_with(fake)
+        assert eng.model_fingerprint(1) == "8.33"
+        assert eng.pump_fingerprints() == {1: "8.33"}
+        eng._invalidate_link_caches()
+        assert eng.pump_fingerprints() == {}
+
     def test_tecan_fingerprint_with_err_nibble_still_blocks(self):
         """M3 그물(테스트검증) — 지문 판독은 err nibble 을 무시하고 **데이터 블록만** 본다.
 
@@ -1052,13 +1062,24 @@ class TestModelFingerprintGate:
         eng._setup(1, SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=0.5))
         assert any(w.startswith("/1U") for w in fake.written)  # 기존 sy01b 경로 그대로.
 
-    def test_tecan_adapter_gate_disabled(self):
-        # 파생(tecan) 어댑터는 자기 기종 — 지문 게이트 비활성(자기 &는 관측 채집용 별도 경로).
+    def test_tecan_adapter_gate_symmetric(self):
+        """2026-09-14 대칭화 — Tecan 어댑터도 셋업 직전 `&` 를 읽어 **Runze 지문이면 -1003**(N0R 봉인).
+        종전(R9 P2-2) 은 게이트를 sy01b 전용으로 두고 Tecan 은 False 였다 — "선언 tecan + 실물 Runze" 방향이
+        무방비였던 것을 뒤집는다. 자기 지문(30064809 C)이면 종전대로 N0R 이 나간다."""
         from senlyt_pi.adapters.tecan_xcalibur_engine_adapter import TecanXCaliburEngineAdapter
+        from senlyt_pi.core.pump_guard import MODEL_MISMATCH_RAW_CODE, SyringeSpec
 
-        fake = FakeSerial()
+        spec = SyringeSpec(pump_full_stroke=3000, syringe_capacity_ml=0.5)
+        fake = FakeSerial(responses=[self._fp_frame("8.33")])  # Runze 실측 지문.
         eng = TecanXCaliburEngineAdapter(serial_factory=lambda *_a: fake)
-        assert eng.FOREIGN_FP_GUARD is False  # 명시 클래스 플래그(R9 P2-2)
+        assert eng.FOREIGN_FP_GUARD is True
+        assert eng._setup(1, spec) == MODEL_MISMATCH_RAW_CODE
+        assert "N0R" not in "".join(fake.written), fake.written
+        assert eng.last_model_mismatch == (1, "8.33")
+        fake2 = FakeSerial(responses=[self._fp_frame("30064809 C")])
+        eng2 = TecanXCaliburEngineAdapter(serial_factory=lambda *_a: fake2)
+        eng2._setup(1, spec)
+        assert "N0R" in "".join(fake2.written), fake2.written
 
     def test_gate_covers_polled_and_broadcast_and_dispense_paths(self):
         """R9 P0-1 봉합 그물 — 게이트는 옆길(_setup)이 아니라 **큰길**에 서야 한다:

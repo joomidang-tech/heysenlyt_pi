@@ -395,7 +395,8 @@ class TestTecanFinalizeSetup:
         assert res == {1: 0}  # 복구는 산다(벽돌 방지).
         joined = "".join(fake.written)
         assert any("Z" in w for w in fake.written)  # 홈은 나간다.
-        assert "N0R" not in joined and "?76" not in joined and "&" not in joined, fake.written
+        # `&` 는 2026-09-14 대칭 게이트가 셋업 직전에 읽는 read-only Report 라 봉인 대상이 아니다(모션·NVM 무관).
+        assert "N0R" not in joined and "?76" not in joined, fake.written
         # 토출은 축 가드가 거부(-1001) — 봉인 통과(0)가 오토출로 이어지지 않는다.
         assert a.dispense(_dispense_cmd(spec12000, 100.0)).raw_error_code == -1001
 
@@ -413,15 +414,25 @@ class TestTecanFinalizeSetup:
         assert joined.count("N0R") >= 4
 
 
-# ── 8. probe `&` 관측 채집 게이트 — sy01b 기본 경로 1바이트 불변 (R3 P2-4) ──────
+# ── 8. probe `&` 관측 채집 — **양 기종 공통**(2026-09-11 · R3 P2-4 "sy01b 미실측" 전제 해소) ──
+#   2026-09-11 v1-3-0 실기기: Runze SY-01B 3대에 & → `/0`8.33\x03` 정상 수신·이후 제조 정상. & 는 read-only
+#   Report 라 토출 프레임(A16 골든)과 무관. 이제 sy01b 도 부팅 probe 에서 주소당 1회 관측해 하트비트로 보고한다
+#   (판정은 서버). 아래 첫 테스트는 종전 "& 0건" 계약을 **뒤집은** 것이다 — 되돌리면 P0-1(선언 sy01b +
+#   실물 Tecan)을 서버가 못 본다.
 
 
 class TestProbeFirmwareCaptureGate:
-    def test_sy01b_probe_sends_no_ampersand(self):
+    def test_sy01b_probe_captures_ampersand_once_and_exposes_fingerprints(self):
         fake = FakeSerial()
         a = Sy01bEngineAdapter(serial_factory=lambda *_a: fake)
         assert a.probe(1) is True
-        assert not any("&" in w for w in fake.written), fake.written  # 미실측 프레임 0.
+        # 데이터 블록 없는 응답(FakeSerial 기본 상태 프레임)엔 `&` 를 최대 3회 재시도한다(2026-09-14 검증 P1-A —
+        #   잡음 1회로 기기 전체가 Undeclared 로 서지 않게). 관측 자체는 주소당 1회 — 재프로브에 추가 발신 0.
+        n_first = "".join(fake.written).count("&")
+        assert 1 <= n_first <= 3, fake.written
+        assert a.probe(1) is True  # 재프로브에도 관측은 주소당 1회.
+        assert "".join(fake.written).count("&") == n_first, fake.written
+        assert isinstance(a.pump_fingerprints(), dict)  # 보고 표면(값은 FakeSerial 응답에 따라 비어 있을 수 있음).
 
     def test_tecan_probe_captures_ampersand_once(self):
         fake = FakeSerial()
@@ -431,8 +442,10 @@ class TestProbeFirmwareCaptureGate:
         logger = StructuredLogger(service="test", sink=lambda _r: None)
         a = TecanXCaliburEngineAdapter(serial_factory=lambda *_a: fake, logger=logger)
         assert a.probe(1) is True
-        assert a.probe(1) is True  # 재프로브에도 채집은 1회.
-        assert "".join(fake.written).count("&") == 1, fake.written
+        n_first = "".join(fake.written).count("&")
+        assert 1 <= n_first <= 3, fake.written  # 데이터 블록 없으면 최대 3회 재시도(2026-09-14).
+        assert a.probe(1) is True  # 재프로브에도 채집은 1회(추가 발신 0).
+        assert "".join(fake.written).count("&") == n_first, fake.written
 
 
 # ── 7. 크로스레포 parity 자동 대조 (검증 P1-C — 모노레포 컨텍스트 한정) ────────

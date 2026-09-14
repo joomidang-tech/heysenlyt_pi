@@ -183,6 +183,13 @@ class DaemonDeps:
     #   상태라 발화 직전 is_busy 를 재확인해 진행 중 작업을 선점하지 않는다.
     #   None = 비활성(테스트/구성 하위호환).
     on_pumps_seen_unmapped: Callable[[], None] | None = None
+    # 실물 기종 변경 감지(2026-09-14) — 유휴 감시가 `&` 지문을 재관측해 현재 어댑터 MODEL_ID 와 다른 기종을
+    #   **2회 연속** 보면 1회 호출(정책 = senlytd 가 우아한 재기동 주입 → 부팅 감지가 새 기종으로 재조립).
+    #   1회 잠금(프로세스 생애) — 관측이 흔들려도 재기동 루프가 되지 않는다. None = 비활성.
+    on_pump_model_changed: Callable[[], None] | None = None
+    # 하드웨어 출처 관측(2026-09-14) — bootstrap.hardware_source 그대로("detected"·"snapshot"·"cache"·
+    #   "undeclared"·"undetected"·"mixed"). 하트비트 `pumpModelSource` 로 서버·admin 에 "자동 인식" 여부를 알린다.
+    hardware_source: str | None = None
     # 용량 축 가드 활성 조건(R4 P0-1) — pump_map 의 syringe_capacity_ml 이 **서버 스냅샷 유래**일
     #   때만 True. 폴백(스냅샷 부재 → 모드 기본 0.5)일 땐 False — 그 0.5 는 관측값이 아니라
     #   추측값이라, 이를 근거로 서버 선언 용량을 거부하면 부팅 순단 1회로 제조·세척 전량 거부
@@ -243,6 +250,8 @@ class SenlytDaemon:
         self._hw_checked_at: str | None = None
         # R8 P1-1 — 재발견 정책 콜백의 1회 발화 래치(30s 주기 감시가 재기동을 연타하지 않게).
         self._pumps_seen_unmapped_fired = False
+        self._pump_model_changed_fired = False
+        self._pump_model_mismatch_streak = 0  # 유휴 감시에서 "다른 기종" 연속 관측 횟수(2회면 발화).
         self._hb_count = 0
         self._shutdown_lock = threading.Lock()
         self._shutdown_done = False
@@ -896,6 +905,7 @@ class SenlytDaemon:
         probe = getattr(self.deps.engine, "health_probe", None)
         if not callable(probe) or self._sequencer.is_busy:
             return
+        observe = getattr(self.deps.engine, "observe_fingerprint", None)
         # 감시 대상 = 매핑 ∪ 기대 주소(R8.5 P2 — 부분 인식에서 **빠진** 주소를 관측해야
         #   재발견 조건이 성립한다. 매핑만 보면 3펌프 중 2개 부팅 인식 시 3번은 감시조차 안 돼
         #   영구 unmapped drop). 기대 주소 실측 유지(실시간 판단 — 2026-07-19 확정): admin 이
@@ -913,8 +923,27 @@ class SenlytDaemon:
                 health[addr] = str(probe(addr))
             except Exception:  # noqa: BLE001 — 프로브 예외 = 무응답 취급(감시는 best-effort).
                 health[addr] = "silent"
+            # 기종 지문 상시 재관측(2026-09-14) — 응답(ok)한 주소만 `&` 1회. read-only Report 라 비용은 `?` 1발과
+            #   같고, 제조 시작 재확인을 `&` 앞에도 둔다(`?`~`&` 사이 창 봉합). 판정은 아래 한 곳에서.
+            if health[addr] == "ok" and callable(observe):
+                if self._sequencer.is_busy or self._stop.is_set():
+                    return
+                try:
+                    observe(addr)
+                except Exception:  # noqa: BLE001 — 관측 실패는 감시를 막지 않는다.
+                    pass
+        # 무응답 주소의 낡은 지문 evict(검증 P1-2) — 랙 교체 중 늦게 깨어나는 주소가 옛 지문으로 남으면 영구 "혼합".
+        forget = getattr(self.deps.engine, "forget_fingerprint", None)
+        if callable(forget):
+            for addr, h in health.items():
+                if h != "ok":
+                    try:
+                        forget(addr)
+                    except Exception:  # noqa: BLE001
+                        pass
         self._pump_health = health
         self._hw_checked_at = self._now_iso()
+        self._judge_pump_model_change()
         # 펌프는 응답하는데 부팅 인식(pump_map)이 비어 제조가 보류 중인 상태를 표면화(WARN 즉시
         #   flush — 30s 주기 반복은 "조치 필요 지속" 신호로 의도). 자동 복구 = on_pumps_seen_unmapped
         #   콜백(R8 P1-1 — senlytd 가 우아한 재기동을 주입: 재기동이 boot 스캔을 다시 돌려 resolver
@@ -945,6 +974,57 @@ class SenlytDaemon:
                 except Exception:  # noqa: BLE001 — 정책 콜백 실패가 감시 루프를 죽이면 안 된다.
                     self._log.warn("펌프 재발견 정책 콜백 실패 — 감시 지속", stage=STAGE_PI_RECEIVED)
 
+    def _judge_pump_model_change(self) -> None:
+        """유휴 감시 뒤 — 관측 지문의 기종이 현재 어댑터와 다르면(2회 연속) 정책 콜백 1회.
+
+        pi 는 여기서도 **판정을 서버에 넘기지 않는다**: 어댑터 교체는 프로세스 재기동(부팅 감지)이 하고, 이 함수는
+        "재기동할 만큼 확실한가" 만 본다. 혼합(둘 이상 기종)은 재기동해도 같은 착지(Undeclared)라 WARN 만.
+        """
+        engine = self.deps.engine
+        fps_fn = getattr(engine, "pump_fingerprints", None)
+        mid = getattr(type(engine), "MODEL_ID", None)
+        if not callable(fps_fn) or mid not in ("sy01b", "tecan_xcalibur"):
+            return
+        try:
+            from ..adapters.sy01b_engine_adapter import classify_fingerprint
+
+            models = {a: classify_fingerprint(fp) for a, fp in fps_fn().items()}
+        except Exception:  # noqa: BLE001
+            return
+        known = {m for m in models.values() if m is not None}
+        if not known:
+            self._pump_model_mismatch_streak = 0
+            return
+        if len(known) >= 2:
+            self._pump_model_mismatch_streak = 0
+            self._log.warn(
+                "펌프 기종 혼합 관측 — 한 버스에 두 기종(재기동으로 해결되지 않음 · 같은 기종으로 맞춘 뒤 재연결)",
+                stage=STAGE_PI_RECEIVED, device_id=self.deps.device_id,
+                fingerprints={str(a): m for a, m in models.items()},
+            )
+            return
+        observed = next(iter(known))
+        if observed == mid:
+            self._pump_model_mismatch_streak = 0
+            return
+        self._pump_model_mismatch_streak += 1
+        self._log.warn(
+            f"실물 기종 변경 관측({mid} 어댑터 · 실물 {observed}) — 연속 {self._pump_model_mismatch_streak}회"
+            + (" · 자동 재기동으로 재조립합니다" if self._pump_model_mismatch_streak >= 2 else " · 다음 감시에서 재확인"),
+            stage=STAGE_PI_RECEIVED, device_id=self.deps.device_id, observedModel=observed,
+        )
+        if (
+            self._pump_model_mismatch_streak >= 2
+            and self.deps.on_pump_model_changed is not None
+            and not self._pump_model_changed_fired
+            and not self._sequencer.is_busy
+        ):
+            self._pump_model_changed_fired = True
+            try:
+                self.deps.on_pump_model_changed()
+            except Exception:  # noqa: BLE001 — 정책 콜백 실패가 감시 루프를 죽이면 안 된다.
+                self._log.warn("기종 변경 정책 콜백 실패 — 감시 지속", stage=STAGE_PI_RECEIVED)
+
     def _emit_heartbeat(self) -> None:
         """heartbeat 전송(queueDepth 파생) + ship_trace 배치 flush + OQ flush — 전부 best-effort."""
         # 주기 HW 감시(idle 한정) — 첫 비트에 즉시 1회(부팅 ~10s 후 admin 에 실측 도달), 이후 N주기.
@@ -971,6 +1051,16 @@ class SenlytDaemon:
         pumps = sorted(self._sequencer.resolver.pump_map)
         avail = getattr(self.deps.valve, "available_bases", None)
         valves = avail() if callable(avail) else None
+        # 펌프 기종 지문(2026-09-11) — 어댑터가 probe/셋업에서 관측한 `&` 값을 그대로 싣는다(판정 없음).
+        #   fake/undeclared 어댑터엔 메서드가 없다 → 키 미방출(구버전 서버·목 무해).
+        fps_fn = getattr(self.deps.engine, "pump_fingerprints", None)
+        pump_fingerprints = None
+        if callable(fps_fn):
+            try:
+                fps = fps_fn()
+                pump_fingerprints = dict(fps) if fps else None
+            except Exception:  # noqa: BLE001 — 관측 실패가 하트비트를 막지 않는다.
+                pump_fingerprints = None
         return self._dispatcher.build_heartbeat(
             engine=engine_wire_name(self.deps.engine),
             last_error=self._last_error,
@@ -979,6 +1069,8 @@ class SenlytDaemon:
             # 주기 감시 실측(idle 시 ~30s 주기 갱신) — admin 연결 칩의 실시간 근거.
             pump_health=self._pump_health,
             hw_checked_at=self._hw_checked_at,
+            pump_fingerprints=pump_fingerprints,
+            pump_model_source=self.deps.hardware_source,
         )
 
     def _flush_traces(self) -> None:

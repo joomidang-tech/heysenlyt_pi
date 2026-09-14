@@ -33,6 +33,9 @@ class HardwareProfile:
     pump_full_stroke: int
     valve_port_count: int
     sensorium_version: str | None = None  # 관측용 메타(판정에 안 씀)
+    # 출처(2026-09-14) — "declared"(스냅샷/캐시 선언) | "detected"(부팅 실물 지문). 캐시엔 declared 만 저장한다
+    #   (감지 결과를 캐시하면 펌프 전원이 늦게 켜진 오프라인 재부팅이 직전 랙의 기종으로 조립된다).
+    source: str = "declared"
 
 
 def cache_path(state_dir: str | Path) -> Path:

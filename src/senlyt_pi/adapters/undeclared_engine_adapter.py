@@ -30,22 +30,31 @@ _DETAIL = (
 
 
 class UndeclaredEngineAdapter:
-    """모든 모션 거부 EnginePort — 물리 시리얼을 열지 않는다(포트 오픈 0)."""
+    """모든 모션 거부 EnginePort — 물리 시리얼을 열지 않는다(포트 오픈 0).
+
+    `detail` 로 거부 사유를 바꿀 수 있다(2026-09-14) — 선언 부재뿐 아니라 "지문 판독 불가"·"기종 혼합"
+    (부팅 자동 인식이 안전하게 조립할 수 없는 상태)도 같은 fail-closed 착지를 쓴다.
+    """
+
+    MODEL_ID = "undeclared"  # 하트비트 engine 표기 — 서버가 "기종 미확정" 을 식별한다.
+
+    def __init__(self, detail: "str | None" = None) -> None:
+        self._detail = detail or _DETAIL
 
     def aspirate(self, cmd: EngineDispenseCommand) -> EngineResult:  # noqa: ARG002
-        return EngineResult(raw_error_code=UNDECLARED_HW_RAW_CODE, detail=_DETAIL)
+        return EngineResult(raw_error_code=UNDECLARED_HW_RAW_CODE, detail=self._detail)
 
     def dispense(self, cmd: EngineDispenseCommand) -> EngineResult:  # noqa: ARG002
-        return EngineResult(raw_error_code=UNDECLARED_HW_RAW_CODE, detail=_DETAIL)
+        return EngineResult(raw_error_code=UNDECLARED_HW_RAW_CODE, detail=self._detail)
 
     def dispense_batch(self, cmd: EngineBatchCommand) -> EngineResult:  # noqa: ARG002
-        return EngineResult(raw_error_code=UNDECLARED_HW_RAW_CODE, detail=_DETAIL)
+        return EngineResult(raw_error_code=UNDECLARED_HW_RAW_CODE, detail=self._detail)
 
     def initialize(self) -> EngineResult:
-        return EngineResult(raw_error_code=UNDECLARED_HW_RAW_CODE, detail=_DETAIL)
+        return EngineResult(raw_error_code=UNDECLARED_HW_RAW_CODE, detail=self._detail)
 
     def run_op(self, cmd: EngineOpCommand) -> EngineResult:  # noqa: ARG002
-        return EngineResult(raw_error_code=UNDECLARED_HW_RAW_CODE, detail=_DETAIL)
+        return EngineResult(raw_error_code=UNDECLARED_HW_RAW_CODE, detail=self._detail)
 
     def emergency_stop_all(self, addrs: "Iterable[int]") -> None:  # noqa: ARG002
         # 물리 연결이 없으므로 no-op — estop 래치 자체는 데몬 공유 이벤트가 담당.

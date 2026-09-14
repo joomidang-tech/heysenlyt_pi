@@ -99,6 +99,51 @@ _TECAN_FP_RE = _re.compile(r"^30\d{6}\s+[A-Z]\b")
 #   이 패턴은 30-계열(벤치 실측 "30064809 C")만 잡는다. 미매치=fail-open(차단 안 함)이라 오동작은
 #   없지만, 타 로트 XCalibur 에선 정방향 게이트가 열릴 수 있다(실측 지문 축적 시 확장).
 TECAN_FP_RE = _TECAN_FP_RE
+# Runze SY-01B 지문(2026-09-11 v1-3-0 실기기 실측 — 3대 전부 `&` → `8.33`, 펌웨어 버전 소수 하나).
+#   2026-09-14 부팅 자동 인식·Tecan 대칭 게이트의 SoT. 서버 `pumpFingerprint.ts` 의 RUNZE 정규식과 동일.
+RUNZE_FP_RE = _re.compile(r"^\d+\.\d+$")
+# 벤치·실기기에서 **실측한 정확값**(서버 `SENSORIUM_VERSIONS[].pumpFingerprints` 미러 — 두 목록은 같아야 한다).
+#   형식 규칙(위 정규식)보다 앞서 보는 **강한 근거**다. Runze 정규식은 "소수 하나" 라 과광의(검증 P0-1) —
+#   형식만 맞는 지문은 선언과 어긋날 때 조립 근거로 쓰지 않는다(`fingerprint_confidence` · bootstrap 4.5).
+KNOWN_FINGERPRINTS: dict[str, tuple[str, ...]] = {
+    "sy01b": ("8.33",),  # Runze SY-01B 3대 · v1-3-0 · 2026-09-11
+    "tecan_xcalibur": ("30064809 C",),  # XCalibur 벤치 · 2026-09-03
+}
+
+
+def fingerprint_confidence(fp: "str | None") -> "str | None":
+    """지문 근거의 강도 — "exact"(실측 목록 일치) | "format"(정규식만) | None(모름)."""
+    if not isinstance(fp, str):
+        return None
+    t = fp.strip()
+    if not t:
+        return None
+    if any(t in vals for vals in KNOWN_FINGERPRINTS.values()):
+        return "exact"
+    if _TECAN_FP_RE.match(t) or RUNZE_FP_RE.match(t):
+        return "format"
+    return None
+
+
+def classify_fingerprint(fp: "str | None") -> "str | None":
+    """`&` 데이터 블록 → 기종 키("sy01b"|"tecan_xcalibur") — 모르면 None(판정 없음).
+
+    부팅 자동 인식(`adapters.pump_model_detect`)·유휴 상시 감시(daemon)·hwtool 이 같은 판정을 쓴다.
+    정규식 두 개가 지문 판정의 SoT 다 — 복붙하지 말고 여기서 import 한다.
+    """
+    if not isinstance(fp, str):
+        return None
+    t = fp.strip()
+    if not t:
+        return None
+    for model, vals in KNOWN_FINGERPRINTS.items():
+        if t in vals:
+            return model
+    if _TECAN_FP_RE.match(t):
+        return "tecan_xcalibur"
+    if RUNZE_FP_RE.match(t):
+        return "sy01b"
+    return None
 STATUS_ERROR_MASK = 0x0F  # 상태바이트 하위 4비트 = 에러코드
 STATUS_READY_BIT = 0x20  # bit5 = Ready(모터 정지·명령 수락 가능)
 STATUS_QUERY = "?"  # 상태 조회(모터 회전 중에도 수락되는 몇 안 되는 명령)
@@ -305,6 +350,9 @@ class Sy01bEngineAdapter:
     #   `type(self) is` 판정은 제3 파생에서 조용히 꺼진다 — **방언 소유를 명시 선언**한다.
     #   sy01b 방언 계열 파생은 True 유지, 타 기종(tecan)은 False 로 재선언.
     FOREIGN_FP_GUARD = True
+    # 이 어댑터가 "남의 실물" 로 보는 지문 패턴(2026-09-14 대칭화) — sy01b 는 Tecan 지문을, tecan 파생은
+    #   Runze 지문을 재선언한다. `_model_gate` 본문은 공유(방언은 값만).
+    FOREIGN_FP_RE = _TECAN_FP_RE
     # ── 기종별 차이(방언) 클래스 선언 — 파생 어댑터는 "값 재선언"만 하고 기계는 상속한다
     #   (2026-09-03 5팀 검증 — "명령어만 다르고 코드는 일치" 원칙의 클래스 표현) ──
     MODEL_ID = "sy01b"  # 결선 키(PUMP_PRESETS·센소리움 pumpModel)와 동일 문자열 — 클래스가 자기 정체 선언.
@@ -385,9 +433,18 @@ class Sy01bEngineAdapter:
         self._initialized: set[int] = set()
         # 펌웨어 버전 관측을 마친 주소(부팅당 1회) — 실물 기종 판별 재료 채집용(아래 probe).
         self._fw_observed: set[int] = set()
-        # probe 시 `&` 펌웨어 관측 채집 여부 — 기본 OFF(sy01b 기본 경로 1바이트 불변·R3 P2-4).
-        #   tecan 파생 어댑터만 True 로 켠다(미실측 프레임을 sy01b 함대에 내보내지 않는다. ⚠️ 예외 1건 = _model_gate 의 & 지문(U/NVM 오발사 방지가 더 큰 안전 — 1.5s·3회 상한으로 비용 캡·R9.5)).
-        self._fw_probe_capture: bool = False
+        # 관측한 `&` 지문 데이터 블록(주소별) — 하트비트 `pumpFingerprints` 로 서버에 보고한다(2026-09-11).
+        #   ⛔ pi 는 이 값으로 **판정하지 않는다**(관측·보고만). 판정(선언 기종 ↔ 실물)은 서버가 한다.
+        #   링크 리셋에서 비운다(실물 교체·전원 사이클 뒤 재관측).
+        self._fw_fingerprints: dict[int, str] = {}
+        # 제조 직전 게이트가 마지막으로 거부한 (addr, 지문) — 관측 전용(데몬 감시 루프가 읽는다·판정 없음).
+        self.last_model_mismatch: "tuple[int, str] | None" = None
+        # probe 시 `&` 펌웨어 관측 채집 — **양 기종 공통 ON**(2026-09-11).
+        #   종전 OFF 근거 "SY-01B 에서 & 미실측(R3 P2-4)"는 2026-09-11 v1-3-0 실기기에서 해소됐다: Runze SY-01B 3대에
+        #   & 를 보내 `/0`8.33\x03` 정상 수신·이후 제조 정상. & 는 read-only Report 라 토출 프레임을 바꾸지 않고
+        #   (A16 골든 = 서버 조립 스텝 해시·무관), `_model_gate` 는 이미 9/3 부터 sy01b 경로에서 & 를 읽고 있었다.
+        #   양쪽이 다 관측해야 "선언 sy01b + 실물 Tecan" / "선언 tecan + 실물 Runze" 두 방향을 서버가 가른다(P0-1).
+        self._fw_probe_capture: bool = True
 
     # ── 연결 ────────────────────────────────────────────────────────────────
     def _conn(self) -> SerialLike:
@@ -409,6 +466,9 @@ class Sy01bEngineAdapter:
         self._fp_checked.clear()
         self._fp_fails.clear()
         self._initialized.clear()
+        # 지문 관측 캐시도 비운다 — 재연결 = 실물 교체 가능 지점(2026-09-11). 다음 probe 에서 재관측·재보고.
+        self._fw_observed.clear()
+        self._fw_fingerprints.clear()
 
     def close(self) -> None:
         """시리얼 정리(멱등) — 데몬 우아한 종료 경로."""
@@ -921,6 +981,12 @@ class Sy01bEngineAdapter:
         하는데 그러면 전 펌프가 동시 응답한다 — 그래서 캐시만 비운다.
         """
         self._initialized.clear()
+        # 제조 직전 지문 게이트도 함께 재무장(검증 P1-B · 2026-09-14) — `_initialized` 와 `_fp_checked` 는 "이 주소가
+        #   아직 같은 펌프인가" 라는 같은 질문을 지키므로 무효화 이벤트도 같아야 한다. 매 제조 stage 0 초기화가 이걸
+        #   부르니, 전원 채로 갈아끼운 뒤 유휴 관측(30s) 전에 제조가 와도 `_setup` 이 `&` 를 다시 읽고 -1003 으로 선다.
+        #   비용 = 제조당 주소별 `&` 1회(응답하면 ms · 무응답 1.5s 상한).
+        self._fp_checked.clear()
+        self._fp_fails.clear()
         return EngineResult(raw_error_code=0, detail="setup cache cleared")
 
     # ── 브로드캐스트 초기화 (전 펌프 동시 홈 — v1.1.0 RealPumpService.initializeAll 미러) ──────
@@ -1548,10 +1614,51 @@ class Sy01bEngineAdapter:
             raw = self._txn(addr, "&", read_timeout_s=PROBE_READ_TIMEOUT_S)
         except Exception:  # noqa: BLE001
             return None
+        data = self._fp_data_block(raw)
+        if data:
+            self._fw_fingerprints[addr] = data  # 관측값 보고용 캐시(판정 없음).
+        return data or None
+
+    def observe_fingerprint(self, addr: int) -> "str | None":
+        """유휴 상시 감시용 `&` 재관측(2026-09-14) — 값이 **바뀌면** 그 주소의 제조 직전 게이트를 재무장한다.
+
+        `_model_gate` 의 `_fp_checked`/`_fp_fails` 는 링크 리셋에서만 비워진다. 전원 채로 펌프만 갈아끼우면
+        /dev 노드가 그대로라 리셋이 없고, 그러면 옛 판정이 프로세스 생애 동안 남는다 — 재관측이 지문 변화를
+        보면 그 주소만 discard 해 다음 셋업에서 게이트가 다시 돈다. 판정(기종 분류)은 호출자 몫.
+        """
+        prev = self._fw_fingerprints.get(addr)
+        fp = self.model_fingerprint(addr)
+        # prev None 포함(검증 P1-1) — `_model_gate` 가 3회 판독 실패로 fail-open 을 확정 캐시한 주소는 지문이
+        #   비어 있다. 그 뒤 처음 읽힌 지문도 "변화" 다 — 안 그러면 게이트가 프로세스 생애 동안 꺼진 채 남는다.
+        if fp is not None and fp != prev:
+            self._fp_checked.discard(addr)
+            self._fp_fails.pop(addr, None)
+            if self._log is not None:
+                self._log.warn(
+                    f"펌프 지문 변경 관측({prev!r} → {fp!r}) — 실물 교체 의심, 제조 직전 지문 게이트 재무장",
+                    stage=STAGE_STEP_EXEC, pumpAddr=addr,
+                )
+        return fp
+
+    def forget_fingerprint(self, addr: int) -> None:
+        """무응답(silent/garbled) 주소의 지문을 버린다(검증 P1-2) — 낡은 지문이 남으면 랙 교체 중 늦게 깨어나는
+        주소 하나가 영구 "혼합" 을 만들어 재기동도 안 되고 서버 발행도 영구 409 가 된다. 유휴 감시가 부른다."""
+        self._fw_fingerprints.pop(addr, None)
+
+    @staticmethod
+    def _fp_data_block(raw: str) -> str:
+        """`&`/`?76` 응답에서 **데이터 블록만**(err nibble 무시) 뽑는다 — model_fingerprint 와 pump_config 의 공통 파서."""
         i = raw.find("/0")
         j = raw.find(chr(ETX), i)
-        data = raw[i + 3:j].strip() if 0 <= i and j > i + 2 else ""
-        return data or None
+        return raw[i + 3:j].strip() if 0 <= i and j > i + 2 else ""
+
+    def pump_fingerprints(self) -> dict[int, str]:
+        """관측한 `&` 지문(주소→데이터 블록) 사본 — 하트비트 `pumpFingerprints` 원천(2026-09-11).
+
+        ⛔ 판정 없음. 비어 있으면 아직 관측 전(또는 무응답). 서버가 센소리움 선언(pumpModel)과 대조해
+        "기종 불일치 → 미연결" 을 판정하고 발행을 막는다 — pi 의 `_axis_guard`(물리 최후 방어선)는 별개로 유지.
+        """
+        return dict(self._fw_fingerprints)
 
     def pump_config(self, addr: int) -> "str | None":
         """`?76` 구성 readback(read-only·벤치 툴용) — 실패/무응답 = None.
@@ -1603,11 +1710,12 @@ class Sy01bEngineAdapter:
                         )
                 continue
             self._fp_checked.add(a)
-            if _TECAN_FP_RE.match(fp):
+            if self.FOREIGN_FP_RE.match(fp):
+                self.last_model_mismatch = (a, fp)
                 if self._log is not None:
                     self._log.error(
-                        f"모델 불일치 — 실물 지문 {fp!r} = Tecan 계열인데 SY-01B 어댑터로 초기화 시도. "
-                        "기종 프레임(U) 봉인·거부 — 센소리움을 XCalibur 변형으로 바꾸고 재연결하세요",
+                        f"모델 불일치 — 실물 지문 {fp!r} 은(는) {self.MODEL_ID} 어댑터의 기종이 아닙니다. "
+                        "기종 프레임 봉인·거부 — 유휴 감시가 재확인 후 자동 재기동으로 실물 기종에 맞춰 재조립합니다",
                         stage="step_exec", pumpAddr=a,
                     )
                 return MODEL_MISMATCH_RAW_CODE
@@ -1771,16 +1879,27 @@ class Sy01bEngineAdapter:
                 #   `&` 는 XCalibur 매뉴얼에만 근거가 있고 SY-01B 클론에선 **미실측**이라,
                 #   sy01b 기본 경로에 내보내면 "기본 경로 1바이트 불변" 계약을 깬다. 두 키가
                 #   모두 sy01b 인 무성 조합의 실물 판별은 브링업 체크리스트(link_diag)가 담당.
-                if self._fw_probe_capture and addr not in self._fw_observed and self._log is not None:
+                if self._fw_probe_capture and addr not in self._fw_observed:
                     self._fw_observed.add(addr)
                     try:
-                        fw_raw = self._txn(addr, "&", read_timeout_s=PROBE_READ_TIMEOUT_S)
-                        self._log.info(
-                            f"펌프 펌웨어 관측(&) — 실물 기종 판별 재료(판정 없음): "
-                            f"{_printable(fw_raw.strip()) or '(무응답)'}",
-                            stage=STAGE_STEP_EXEC,
-                            pumpAddr=addr,
-                        )
+                        # `&` 도 `?` 처럼 **짧게 재시도**(검증 P1-A · 최대 3회) — 이제 이 한 프레임이 "조립 근거" 라
+                        #   잡음 1회로 기기 전체가 Undeclared(모션 거부)로 서면 안 된다. 성공 즉시 중단.
+                        fw_raw = ""
+                        for _try in range(3):
+                            fw_raw = self._txn(addr, "&", read_timeout_s=PROBE_READ_TIMEOUT_S)
+                            if self._fp_data_block(fw_raw):
+                                break
+                        fp = self._fp_data_block(fw_raw)
+                        if fp:
+                            self._fw_fingerprints[addr] = fp  # 하트비트 보고용(판정 없음·2026-09-11).
+                        if self._log is not None:
+                            self._log.info(
+                                f"펌프 펌웨어 관측(&) — 실물 기종 판별 재료(판정 없음): "
+                                f"{_printable(fw_raw.strip()) or '(무응답)'}",
+                                stage=STAGE_STEP_EXEC,
+                                pumpAddr=addr,
+                                fingerprint=fp or None,
+                            )
                     except Exception:  # noqa: BLE001 — 관측 실패가 발견을 막지 않는다.
                         pass
                 return True  # 프레임이 왔다 = 전원·통신 살아있음(에러 코드여도 '응답함').

@@ -425,6 +425,12 @@ class Heartbeat:
     #   hwCheckedAt = 마지막 프로브 시각(ISO) — "N초 전 확인" 표시용.
     pump_health: "dict[int, str] | None" = None
     hw_checked_at: str | None = None
+    # 펌프 기종 지문(2026-09-11) — pumpFingerprints = {addr: `&` 응답 데이터 블록}(예 SY-01B "8.33" ·
+    #   XCalibur "30064809 C"). ⛔ pi 는 관측·보고만, 판정(선언 기종 ↔ 실물)은 서버. 관측 전이면 키 미방출.
+    pump_fingerprints: "dict[int, str] | None" = None
+    # 기종 출처(2026-09-14) — "detected"(부팅 실물 지문 자동 인식) | "snapshot"/"cache"(선언) | "undeclared" |
+    #   "undetected" | "mixed". admin 이 "자동 인식" 배지와 미확정 사유를 이 값으로 그린다. 부재 = 구버전 pi.
+    pump_model_source: "str | None" = None
     # (선택·2026-08-06 QA "[admin] 튜브필링 UI" 원안) 실행 중 잡 진행 스냅샷
     #   (commandSetId, stepsDone, stepN) — admin 이 "현재 몇 번째 포트인지"를 표시하는 근거.
     #   추가 통신 0(기존 하트비트 편승·유휴면 키 미방출). Sequencer.live_progress 파생.
@@ -447,6 +453,12 @@ class Heartbeat:
             {str(a): s for a, s in self.pump_health.items()} if self.pump_health else None,
         )
         put_if_present(m, "hwCheckedAt", self.hw_checked_at)
+        put_if_present(m, "pumpModelSource", self.pump_model_source)
+        put_if_present(
+            m,
+            "pumpFingerprints",
+            {str(a): s for a, s in self.pump_fingerprints.items()} if self.pump_fingerprints else None,
+        )
         put_if_present(
             m,
             "jobProgress",
