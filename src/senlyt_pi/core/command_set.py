@@ -19,6 +19,7 @@ D15 baseLiquorUsed 동봉(PATCH /api/dispenser/orders/[id])은 불변.
 from __future__ import annotations
 
 import enum
+import logging
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -103,6 +104,10 @@ class CommandSet:
     trace_id: str | None = None  # (선택) orders.traceId 미러(§7)
     error_code: StatusErrorCode | None = None  # (선택) failed 시
     updated_at: str | None = None  # (선택) 마지막 전이 시각
+    # (선택·2026-09-02 용량 축 fail-closed) steps 볼륨(µL)의 조립 전제 시린지 용량(mL) —
+    #   dispatcher 가 부팅 스냅샷 pump_map 용량과 대조해 다르면 CMD_VALIDATION_FAILED.
+    #   부재=구서버 하위호환(무검사). stroke 축 -1001(_axis_guard)의 짝이 되는 용량 축 가드.
+    syringe_capacity_ml: float | None = None
 
     @staticmethod
     def from_json(j: Mapping[str, Any]) -> "CommandSet":
@@ -151,6 +156,7 @@ class CommandSet:
             trace_id=j.get("traceId"),
             error_code=StatusErrorCode.from_wire(j.get("errorCode")),
             updated_at=j.get("updatedAt"),
+            syringe_capacity_ml=_optional_float(j.get("syringeCapacityMl")),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -168,8 +174,58 @@ class CommandSet:
         put_if_present(m, "attempt", self.attempt)
         put_if_present(m, "traceId", self.trace_id)
         put_if_present(m, "errorCode", self.error_code.wire if self.error_code else None)
+        put_if_present(m, "syringeCapacityMl", self.syringe_capacity_ml)  # 왕복 대칭(R4 P3).
         put_if_present(m, "updatedAt", self.updated_at)
         return m
+
+
+def _optional_float(v: Any) -> "float | None":
+    """선택 필드 tolerant reader(R4 P3) — 값이 깨져도 봉투를 죽이지 않는다(None 취급).
+
+    strict 파싱이면 부가 필드 하나가 깨질 때 항목 전체가 skip → queued 잔류 → 큐 교착.
+    선언 불능 = 무검사(하위호환과 같은 안전측)로 강등하는 편이 계약상 맞다.
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        _warn_dropped_optional(v)
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        # ⚠️ 이 강등은 **안전 가드를 조용히 끄는 경로**이기도 하다(선언 소실 = 무검사) —
+        #   흔적 없이 삼키면 "가드가 왜 안 울렸지"를 가릴 수 없다(R4.5 P3).
+        _warn_dropped_optional(v)
+        return None
+
+
+def _warn_dropped_optional(v: Any) -> None:
+    logging.getLogger(__name__).warning(
+        "선택 필드 값 강등 — syringeCapacityMl=%r 파싱 불가 → None(용량 축 가드 비활성). 서버 계약 확인",
+        v,
+    )
+
+
+_BROKEN_WARNED: set[str] = set()
+
+
+def _warn_broken_once(kind: str, item: Mapping[str, Any], err: Exception) -> None:
+    """깨진 snapshot 항목의 skip 흔적 — stdlib logging(→ journald)·항목 id 당 1회.
+
+    core 는 StructuredLogger DI 가 없는 순수 계층이라 stdlib 로만 남긴다 — 판정에 안 쓰이고
+    운영 진단용 흔적이 목적이라 충분하다(구조화 로그가 필요해지면 어댑터로 끌어올릴 것).
+    """
+    # PK 키가 축마다 다르다(R4 P1-3) — 봉투=commandSetId · command=id. 한쪽 키만 보면 봉투는
+    #   전부 "?" 로 접혀 첫 1건만 경고되고 나머지 원인 봉투가 도로 무성이 된다.
+    item_id = str(item.get("commandSetId") or item.get("id") or "?")
+    key = f"{kind}:{item_id}"
+    if key in _BROKEN_WARNED:
+        return
+    _BROKEN_WARNED.add(key)
+    logging.getLogger(__name__).warning(
+        "깨진 %s skip — id=%s err=%s: %s (queued 로 잔류해 큐를 막을 수 있음 — 서버 스텝 계약 확인)",
+        kind, item_id, type(err).__name__, err,
+    )
 
 
 def command_sets_from_snapshot(
@@ -193,8 +249,13 @@ def command_sets_from_snapshot(
             continue
         try:
             cs = CommandSet.from_json(item)
-        except (KeyError, TypeError, ValueError):
-            continue  # 항목 단위 방어 — 깨진 봉투는 skip(나머지 소비 계속).
+        except (KeyError, TypeError, ValueError) as e:
+            # 항목 단위 방어 — 깨진 봉투는 skip(나머지 소비 계속). 단 **무성 금지**(2026-09-02
+            #   감사 P2): skip 된 봉투는 queued 로 남고 서버 reconcile 은 running 만 회수하므로
+            #   그 기기 큐가 조용히 영구 교착한다. 흔적이 있어야 "왜 안 나가지"를 가를 수 있다.
+            #   (id 단위 1회만 — snapshot 재푸시마다 반복 경고 방지.)
+            _warn_broken_once("commandSet", item, e)
+            continue
         if cs.device_id != device_id:
             continue
         if cs.status not in (CommandSetStatus.QUEUED, CommandSetStatus.DELIVERED):

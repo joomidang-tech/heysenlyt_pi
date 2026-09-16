@@ -6,8 +6,8 @@
   - `SENLYT_ENV`/`SENLYT_SERVER_BASE_URL` → `ServerConfig`(base URL 단일 결정·fail-fast).
   - 등록(POST /api/dispensers/register·실 HTTP) → deviceId·dispenserToken 확보(파일 영속).
   - 실 어댑터 조립: SSE command/commandSet source + HTTP status sink(orders/heartbeat/trace/봉투전이).
-  - **엔진만 FakeEngineAdapter**(유일 mock·v1.1.0 HW 검증). `SENLYT_ENGINE=fake|sy01b` 로 분기,
-    기본(E2E)=fake. sy01b(실 RS485)는 아직 TODO 스텁이라 명시적으로 선택할 때만 조립.
+  - **엔진은 서버 선언(센소리움 pumpModel)대로 실물 어댑터** — 호스트가 Pi 든 맥북이든 같다(2026-09-04).
+    FakeEnginePort 는 테스트·도커 E2E 가 `SENLYT_FAKE_ENGINE=1` 로 명시할 때만(실 Pi 에선 거부).
 
 ⚠️ 이 모듈은 **결선(wiring)만** 한다 — 실제 펌프 소비 루프(SSE→멱등→Sequencer→역보고 상시 구동)는
    안전상 daemon.boot 유보를 유지한다. bootstrap 은 어댑터를 실체로 만들어 DaemonDeps 로 묶는다.
@@ -15,10 +15,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # 타입 전용.
+    from ..adapters.pump_model_detect import Detector
+
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from ..adapters.device_identity_store import DeviceIdentity, DeviceIdentityStore
 from ..adapters.fake_engine_adapter import FakeEnginePort
@@ -45,6 +51,7 @@ from ..config.server_target import ServerConfig
 from ..core.pump_guard import PUMP_PRESETS, SyringeSpec, resolve_syringe_capacity_ml
 from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
 from ..persistence.file_idempotency_ledger import FileIdempotencyLedger
+from ..persistence.hardware_profile_cache import HardwareProfile
 from ..persistence.idempotency_ledger import IdempotencyLedger, InMemoryIdempotencyLedger
 from ..pipeline.pump_health import auto_pump_map, discover_pumps
 from ..pipeline.trace_spill import TraceSpill
@@ -53,8 +60,15 @@ from ..ports.engine_port import EnginePort
 from ..ports.valve_port import ValvePort
 
 # 엔진 선택 env(override) — 미지정이면 **자동감지**(실 Pi+시리얼 어댑터→sy01b·아니면 fake). 02_infra §10.
-#   설치 시 안 넣어도 됨("URL만"). 명시하면 그 값 우선(fake|sy01b) — E2E/개발 고정용.
+#   설치 시 안 넣어도 됨("URL만"). 명시하면 그 값 우선(fake|sy01b|tecan) — E2E/개발 고정용.
+#   tecan(=tecan_xcalibur|xcalibur) 은 Cavro XCalibur 실물 전용 — 자동감지로는 절대 선택되지 않는다.
 SENLYT_ENGINE_ENV = "SENLYT_ENGINE"
+# ⛔ 테스트·도커 E2E 전용 — 물리 엔진을 FakeEnginePort 로 바꾸는 **명시** 스위치(2026-09-04).
+#   종전 "GPIO 없는 호스트 = 자동 fake" 규칙을 폐기하면서 도입. 자동 fake 는 맥북 같은 개발기에서
+#   서버 선언(Tecan)을 무시하고 가짜 엔진을 올려 "펌프 0개" 로 보였다(실측). 이제 엔진은 호스트와
+#   무관하게 서버 선언대로 실물 어댑터를 조립하고, fake 는 이 키를 켠 곳에서만 나온다.
+#   실 Pi(GPIO 존재)에서는 켜도 거부(BootstrapError) — 실기기에서 가짜 토출 보고는 최악의 사고.
+SENLYT_FAKE_ENGINE_ENV = "SENLYT_FAKE_ENGINE"
 # pi 실행 모드(주문 큐 mode·flavor|fragrance) — 어느 컬렉션/큐를 구독·역보고할지.
 #   ⚠️ TOFU 후 **서버 배정(identity.mode)이 우선** — 이 env 는 서버 미배정 시 폴백일 뿐(더 이상 필수 아님).
 SENLYT_MODE_ENV = "SENLYT_MODE"
@@ -117,6 +131,15 @@ class DaemonComponents:
     # 부팅 1회 서버 settings 스냅샷(시린지 용량 SoT) — fetch_settings=True 일 때만 채워짐(없으면 None).
     #   RecipeResolver pump_map 의 용량/스트로크를 서버값으로 얹는다(build_resolver 소비).
     server_settings: "Mapping[str, Any] | None" = None
+    # 하드웨어 선언(2026-09-02 단일 SoT) — 스냅샷(엄격 판독) > 로컬 캐시 > None(Undeclared).
+    #   None 이면 engine 은 UndeclaredEngineAdapter(모션 거부)로 조립돼 있다.
+    hardware_profile: "HardwareProfile | None" = None
+    # 하드웨어 출처 관측 — "detected"(부팅 실물 지문·2026-09-14 1순위) | "snapshot" | "cache" |
+    #   "undeclared" | "undetected"(응답은 있는데 지문 판독 불가) | "mixed"(기종 혼합). 뒤 셋은 Undeclared 조립.
+    hardware_source: str = "undeclared"
+    # 부팅 감지에서 `?` 에 응답한 주소(2026-09-14) — build_resolver 가 2차 스캔 없이 그대로 pump_map 으로 쓴다
+    #   ("감지 기종과 pump_map 이 같은 관측에서 나온다" + 부재 주소 프로브 상한 낭비 0). None = 감지 안 함.
+    detected_pump_addrs: "tuple[int, ...] | None" = None
 
 
 def _resolve_mode(environ: Mapping[str, str]) -> str:
@@ -124,11 +147,17 @@ def _resolve_mode(environ: Mapping[str, str]) -> str:
     return "fragrance" if mode == "fragrance" else "flavor"
 
 
+def _is_truthy(raw: str | None) -> bool:
+    """env 불리언("1"/"true"/"yes"/"on" — 대소문자 무시). senlytd 의 동명 헬퍼와 같은 판정."""
+    return (raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _gpio_available() -> bool:
     """실 라즈베리파이 GPIO 존재 여부 — **Pi4(`/dev/gpiomem`)·Pi5(`/dev/gpiomem0`·RP1) 모두 커버**.
 
-    **자동감지 게이트** — 비-Pi(CI·dev·docker 컨테이너)는 gpiomem 계열이 없어 False → engine/valve 가
-    항상 fake 로 떨어진다(결정적). 실 Pi 에서만 실 하드웨어 자동 선택이 활성화된다.
+    **기주 밸브(GPIO) 자동감지에만 쓴다**(2026-09-04) — 비-Pi(CI·dev·docker·맥북)는 gpiomem 이 없어
+    False → 밸브 없음(off). 펌프 엔진은 이 판정과 무관하게 서버 선언대로 조립한다(시리얼만 있으면 됨).
+    이 값이 True 인 호스트에서는 SENLYT_FAKE_ENGINE 도 거부한다(실기기 가짜 엔진 금지).
     ⚠️ Pi5 는 RP1 칩이라 `/dev/gpiomem` 이 아니라 `/dev/gpiomem0`(뱅크별 gpiomem0..4) — glob 로 둘 다 잡는다
     (`/dev/gpiomem` 단일 경로만 보면 Pi5 에서 gpio 자동감지가 fake 로 오판·2026-07-17 실기기 발견).
     """
@@ -145,34 +174,53 @@ def build_engine(
     port_lister: "Callable[[], list] | None" = None,
     estop_event: "threading.Event | None" = None,
     logger: StructuredLogger | None = None,
+    # 서버 선언 펌프 모델(2026-09-02 단일 키) — "sy01b"|"tecan_xcalibur"|None.
+    #   None(선언 미확정·실 Pi) = UndeclaredEngineAdapter(모션 거부·fail-closed).
+    pump_model: "str | None" = None,
+    # Undeclared 착지 사유(2026-09-14) — 선언 부재 외에 "지문 판독 불가"·"기종 혼합" 도 같은 fail-closed.
+    undeclared_detail: "str | None" = None,
 ) -> EnginePort:
-    """엔진 조립 — 주입 우선. **env 미지정이면 자동감지**(실 Pi + 시리얼 어댑터 존재 → sy01b·아니면 fake).
+    """엔진 조립 — 주입 우선. 호스트와 무관하게 **서버 선언(pump_model)** 대로 실물 어댑터를 조립한다.
 
-    설치 시 `SENLYT_ENGINE` 을 안 넣어도 된다("URL만" 목표) — 실 Pi 에 USB-RS485 펌프 어댑터가
-    붙어 있으면 sy01b, 그 외(비-Pi·어댑터 미장착)는 fake 로 자동 결정한다. 명시하면 그 값이 우선.
+    - 선언 sy01b/tecan_xcalibur → 그 어댑터(시리얼 포트는 자동 탐지·미탐지면 어댑터 기본 경로).
+    - 선언 없음 → UndeclaredEngineAdapter(모션 거부·fail-closed).
+    - `SENLYT_FAKE_ENGINE=1`(테스트·E2E 전용) → FakeEnginePort. 실 Pi(GPIO 존재)에서는 거부.
+    2026-09-04 이전의 "비-Pi 면 자동 fake" 는 폐기 — 맥북 같은 개발기도 펌프를 꽂으면 실물로 돌고,
+    안 꽂으면 탐색 결과대로 "미연결"이 정직하게 보고된다. GPIO 유무는 기주 밸브(build_valve)만 가른다.
     `on_pi`·`port_lister` 는 테스트 주입 seam(기본 = 실 판정).
     """
     if engine is not None:
         return engine
     from ..adapters.serial_port_discovery import discover_serial_port
 
+    # ── 단일 키 설계(2026-09-02) — 펌프 모델은 **서버 선언(pump_model 인자)** 이 정한다. ──
+    #   SENLYT_ENGINE env 는 은퇴(잔재 = 무시 + deprecated WARN 1릴리스 → install.sh 가 strip).
+    #   선언은 부팅 스냅샷(엄격 판독) > 로컬 캐시 순으로 build_components 가 해석해 넘긴다.
     raw = environ.get(SENLYT_ENGINE_ENV)
-    if raw is None or raw.strip() == "":
-        # 자동감지(2026-07-19 개정) — **실 Pi 면 무조건 sy01b**. 종전엔 부팅 순간 시리얼 어댑터가
-        #   안 보이면 fake 로 후퇴했는데, 그러면 실기기에서 명령이 전부 **모의로 조용히 성공**해
-        #   운영자가 "done 인데 실물이 안 움직임"으로 오판한다(17:08 실측 — USB 사망 후 재시작이
-        #   fake 로 떠 admin 에 '엔진 fake' 표시). 사용자 확정: "fake 가 기본이 아니라, 연결이 안
-        #   되면 '안 됐다'고 표시되는 게 기본동작". 어댑터 미발견 상태의 sy01b 는 정직하게 실패
-        #   (무응답·pumpHealth silent=빨강)하고, 핫플러그 자가 재연결(_reconnect_serial)이 USB
-        #   등장 시 스스로 붙는다. fake = 비-Pi 개발환경 또는 SENLYT_ENGINE=fake 명시뿐.
+    if raw is not None and raw.strip() != "" and logger is not None:
+        logger.warn(
+            f"SENLYT_ENGINE={raw.strip()} 은 폐기된 키 — 무시됨(펌프 모델은 admin 센소리움 버전이"
+            " 결정·부팅 스냅샷으로 수신). 재설치(install.sh)가 이 키를 제거합니다",
+            stage=STAGE_PI_RECEIVED,
+        )
+    # 명시 fake(테스트·E2E) — 실 Pi 에서는 거부(가짜 엔진이 실기기 위에서 "토출 완료"를 보고하는 사고 차단).
+    if _is_truthy(environ.get(SENLYT_FAKE_ENGINE_ENV)):
         is_pi = on_pi() if on_pi is not None else _gpio_available()
-        choice = "sy01b" if is_pi else "fake"
-    else:
-        choice = raw.strip().lower()
-    if choice == "sy01b":
+        if is_pi:
+            raise BootstrapError(
+                f"{SENLYT_FAKE_ENGINE_ENV} 는 실 Pi(GPIO 존재)에서 허용되지 않습니다 — "
+                "테스트·도커 E2E 전용 스위치입니다. 키를 제거하고 다시 시작하세요."
+            )
+        return FakeEnginePort(estop_event=estop_event)
+    if pump_model in ("sy01b", "tecan_xcalibur"):
         # 실 RS485 어댑터의 probe/dispense 는 hw-dev 워크오더(실 시리얼). 스텁이면 self-test 가 미준비를
         # 표면화(fail-closed) — 부팅·등록 자체는 허용(제조 트래픽만 보류).
-        from ..adapters.sy01b_engine_adapter import Sy01bEngineAdapter
+        if pump_model == "sy01b":
+            from ..adapters.sy01b_engine_adapter import Sy01bEngineAdapter as _RealAdapter
+        else:
+            from ..adapters.tecan_xcalibur_engine_adapter import (
+                TecanXCaliburEngineAdapter as _RealAdapter,
+            )
 
         port = discover_serial_port(environ, port_lister=port_lister)
         # ⚠️ estop_event 주입 = 데몬·시퀀서와 **같은 공유 래치**(§9-4). 이게 있어야 어댑터의 in-flight
@@ -186,13 +234,25 @@ def build_engine(
             return list_candidate_ports(environ, port_lister=port_lister)
 
         if port:
-            return Sy01bEngineAdapter(
+            return _RealAdapter(
                 port=port, estop_event=estop_event, logger=logger, port_resolver=_resolve_ports
             )
-        return Sy01bEngineAdapter(
+        return _RealAdapter(
             estop_event=estop_event, logger=logger, port_resolver=_resolve_ports
         )
-    return FakeEnginePort(estop_event=estop_event)
+    # 선언 미확정(None/미지값) — Undeclared fail-closed(추측 조립 금지 · 상태모델 D3). 호스트 무관.
+    #   ⛔ 폴백 sy01b 금지: tecan 이라 선언됐던 기기가 미확정 부팅에서 sy01b 로 조립되면
+    #   초기화 프리앰블 U…R 이 XCalibur NVM 에 기록된다(undeclared_engine_adapter 헤더).
+    from ..adapters.undeclared_engine_adapter import UndeclaredEngineAdapter
+
+    if logger is not None:
+        logger.warn(
+            undeclared_detail
+            or "하드웨어 선언 미확정 — 모션 거부 어댑터로 부팅(스냅샷·캐시 모두 무효). "
+            "네트워크/admin 센소리움 배정 확인 후 재시작 필요",
+            stage=STAGE_PI_RECEIVED,
+        )
+    return UndeclaredEngineAdapter(detail=undeclared_detail)
 
 
 def _valve_pins_from_env(raw: str | None) -> dict[str, int]:
@@ -229,10 +289,14 @@ def build_valve(
     valve: "ValvePort | None" = None,
     on_pi: Callable[[], bool] | None = None,
 ) -> ValvePort | None:
-    """기주 밸브 조립(§9-1 v2) — 주입 우선. **env 미지정이면 자동감지**(실 Pi → gpio·아니면 fake).
+    """기주 밸브 조립(§9-1 v2) — 주입 우선. **env 미지정이면 자동감지**(GPIO 있음 → gpio·없음 → off).
 
-    설치 시 `SENLYT_VALVE` 를 안 넣어도 된다("URL만" 목표) — 실 Pi(GPIO 존재)면 gpio, 비-Pi 는 fake.
-      - 자동 gpio 결선 실패(gpiozero 부재 등)는 **graceful fallback → fake**(자동 선택이라 부팅 중단 X).
+    설치 시 `SENLYT_VALVE` 를 안 넣어도 된다("URL만" 목표) — GPIO(gpiomem)가 있으면 gpio, 없으면 **없음(None)**.
+      - 2026-09-04: 종전 "비-Pi 는 fake" 폐기. GPIO 가 없는 호스트에서 가짜 밸브가 "열렸다"고 답하면
+        기주가 안 나왔는데 성공 보고가 된다. 없으면 없다고 두고 밸브 스텝은 Sequencer pre-flight 가
+        fail-closed drop(토출 0) — 음료 모드는 "밸브 미결선"이 드러나고 향수 모드는 밸브가 원래 없어 무영향.
+      - 자동 gpio 결선 실패(gpiozero 부재 등)도 같은 이유로 **None**(자동 선택이라 부팅 중단은 없음).
+      - fake 는 `SENLYT_VALVE=fake` 명시(테스트·E2E)일 때만.
       - 명시 `gpio` 는 결선 실패 시 **fail-fast**(BootstrapError) — 운영자가 콕 집었으니 조용히 넘어가지 않음.
       - `off`: None — valve 스텝 수신 시 Sequencer pre-flight 가 fail-closed drop(토출 0).
     """
@@ -252,14 +316,14 @@ def build_valve(
 
     raw = environ.get(SENLYT_VALVE_ENV)
     if raw is None or raw.strip() == "":
-        # 자동감지 — 실 Pi 면 gpio(결선 실패 시 graceful fake), 아니면 fake.
+        # 자동감지 — GPIO 있으면 gpio(결선 실패 시 None), 없으면 None(밸브 없음·가짜 금지).
         is_pi = on_pi() if on_pi is not None else _gpio_available()
         if is_pi:
             try:
                 return _gpio()
-            except Exception:  # noqa: BLE001 — 자동 선택 실패는 안전 폴백(fake), 부팅 중단 없음.
-                return FakeValveAdapter(flow_ml_per_sec=flow, max_open_sec=max_open)
-        return FakeValveAdapter(flow_ml_per_sec=flow, max_open_sec=max_open)
+            except Exception:  # noqa: BLE001 — 자동 선택 실패는 "밸브 없음"(부팅 중단 없음·가짜 없음).
+                return None
+        return None
 
     choice = raw.strip().lower()
     if choice == "off":
@@ -382,6 +446,11 @@ def build_resolver(
     engine: EnginePort | None = None,
     server_settings: "Mapping[str, Any] | None" = None,
     mode: str | None = None,
+    # 하드웨어 선언(2026-09-02 단일 SoT) — 캐시 부팅 시 stroke·포트 상한의 공급원(R-P0-4:
+    #   스냅샷 부재여도 캐시 stroke 로 pump_map 을 맞춰 영구 -1001 을 막는다). 용량은 비캐시.
+    hardware_profile: "HardwareProfile | None" = None,
+    # 부팅 감지가 이미 찾은 응답 주소(2026-09-14) — 주어지면 2차 프로브(discover_pumps) 를 생략한다.
+    known_pump_addrs: "Sequence[int] | None" = None,
 ) -> RecipeResolver:
     """RecipeResolver 조립 — pump_map 을 **자동인식**하고, env 가 있으면 그게 이긴다.
 
@@ -412,14 +481,41 @@ def build_resolver(
     # 서버 settings 프리셋(부팅 스냅샷) → 용량/스트로크 오버라이드(없으면 None → 모드 기본 폴백).
     capacity_override = syringe_capacity_from_settings(server_settings)
     stroke_override = full_stroke_from_settings(server_settings)
+    # 캐시 폴백(R-P0-4) — 스냅샷이 stroke 를 못 줬을 때 캐시 stroke 로 pump_map 을 맞춘다
+    #   (안 맞추면 tecan 캐시 부팅이 어댑터 3000 vs spec 12000 = 영구 -1001). 용량은 비캐시 원칙.
+    if stroke_override is None and hardware_profile is not None:
+        stroke_override = hardware_profile.pump_full_stroke
+    # 실물 감지 조립(2026-09-14)이면 **감지 기종 프리셋 stroke 가 스냅샷보다 우선** — 어댑터와 pump_map 이 같은
+    #   관측에서 나와야 `_axis_guard` 가 구조적으로 안 걸린다. 선언(스냅샷 stroke)이 실물과 다른 경우가 바로
+    #   이 기능이 존재하는 이유라, 그 값을 spec 에 얹으면 영구 -1001 이 된다.
+    if hardware_profile is not None and getattr(hardware_profile, "source", "declared") == "detected":
+        stroke_override = hardware_profile.pump_full_stroke
+    # 포트 상한 — 스냅샷(hardware.valvePortCount) > 캐시 > 12.
+    from ..adapters.settings_source import valve_port_count_from_settings as _vpc
+
+    valve_port_count = _vpc(server_settings) or (
+        hardware_profile.valve_port_count if hardware_profile is not None else None
+    ) or 12
+
+    def _mark(r: RecipeResolver) -> RecipeResolver:
+        # 용량 출처 각인(R4.5 P2-A) — "pump_map 용량이 스냅샷 유래인가"를 여기(용량을 실제로
+        #   파생하는 유일한 곳)서 함께 돌려준다. senlytd 가 이 값을 그대로 Dispatcher 가드에
+        #   넘기므로 술어를 두 번 계산할 일이 없다 — 두 파일이 손으로 같은 불변식을 유지하다
+        #   한쪽만 고쳐져 조용히 어긋나는(=P0-1 부활) 구조를 없앤다.
+        r.capacity_from_settings = capacity_override is not None
+        # 포트 상한 각인(2026-09-02) — RR 2차 게이트가 1..N 으로 판정(§C).
+        r.valve_port_count = valve_port_count
+        return r
 
     raw = environ.get(SENLYT_PUMP_ADDRESSES_ENV)
     if raw and raw.strip():
-        return RecipeResolver(
-            pump_map_from_addresses_env(
-                raw,
-                capacity_override=capacity_override,
-                full_stroke_override=stroke_override,
+        return _mark(
+            RecipeResolver(
+                pump_map_from_addresses_env(
+                    raw,
+                    capacity_override=capacity_override,
+                    full_stroke_override=stroke_override,
+                )
             )
         )
 
@@ -432,17 +528,23 @@ def build_resolver(
         is_flavor = mode_str == "flavor"
         # 모드 → 예상 펌프 주소(소프트웨어 매핑). 식향 2대(1,2) / 향장향 3대(1,2,3). 2026-07-17 확정.
         expected = [1, 2] if is_flavor else [1, 2, 3]
-        found = discover_pumps(probe, expected)
+        found = (
+            sorted(set(int(a) for a in known_pump_addrs))
+            if known_pump_addrs is not None
+            else discover_pumps(probe, expected)
+        )
         if found:
             capacity = (
                 capacity_override
                 if capacity_override is not None
                 else resolve_syringe_capacity_ml(None, is_flavor=is_flavor)
             )
-            return RecipeResolver(
-                auto_pump_map(found, capacity_ml=capacity, full_stroke=stroke_override)
+            return _mark(
+                RecipeResolver(
+                    auto_pump_map(found, capacity_ml=capacity, full_stroke=stroke_override)
+                )
             )
-    return RecipeResolver({})
+    return _mark(RecipeResolver({}))
 
 
 def build_components(
@@ -456,6 +558,11 @@ def build_components(
     fetch_settings: bool = False,
     settings_fetcher: SettingsFetcher | None = None,
     estop_event: "threading.Event | None" = None,
+    # 부팅 실물 감지 seam(2026-09-14) — 테스트는 port_lister=lambda: [] 로 감지를 끄거나 pump_detector 를 주입.
+    port_lister: "Callable[[], list] | None" = None,
+    pump_detector: "Detector | None" = None,
+    # None = fetch_settings 를 따른다(실 부팅만 감지 · 조립 self-test/테스트는 포트를 열지 않는다).
+    detect_hardware: "bool | None" = None,
 ) -> DaemonComponents:
     """환경변수에서 실 어댑터 전체를 조립 — 서버 타겟 결정 + 등록 + 어댑터 결선.
 
@@ -523,15 +630,27 @@ def build_components(
     server_settings: "Mapping[str, Any] | None" = None
     if fetch_settings:
         fetcher = settings_fetcher if settings_fetcher is not None else fetch_settings_once
-        try:
-            server_settings = fetcher(server_config, identity.dispenser_token, mode)
-        except Exception as e:  # noqa: BLE001 — settings fetch 실패는 부팅을 막지 않는다(폴백).
+        # 재시도는 **엔진 무관 3회**(R4 P0-1) — 종전 "sy01b 는 폴백 축이 곧 정답이라 1회" 는
+        #   스트로크 축(12000)에만 참이었다. 용량 축이 fail-closed 가 된 지금, 스냅샷 부재는
+        #   "용량 가드 비활성 + 서버·pi 용량 불일치 가능" 창이라 어느 엔진이든 순단을 흡수한다.
+        attempts = 3
+        for _attempt in range(attempts):
+            try:
+                server_settings = fetcher(server_config, identity.dispenser_token, mode)
+            except Exception as e:  # noqa: BLE001 — settings fetch 실패는 부팅을 막지 않는다(폴백).
+                log.warn(
+                    "부팅 settings fetch 실패 — 모드 기본 용량으로 폴백(best-effort)",
+                    stage=STAGE_ERROR,
+                    error=str(e),
+                )
+                server_settings = None
+            if server_settings is not None or _attempt == attempts - 1:
+                break
             log.warn(
-                "부팅 settings fetch 실패 — 모드 기본 용량으로 폴백(best-effort)",
+                f"settings 스냅샷 부재(시도 {_attempt + 1}/{attempts}) — 재시도 (tecan 축 확정에 필수)",
                 stage=STAGE_ERROR,
-                error=str(e),
             )
-            server_settings = None
+            time.sleep(2.0)
 
     command_source = SseCommandSourceAdapter(
         server_config=server_config,
@@ -548,10 +667,151 @@ def build_components(
         logger=log,
     )
 
-    # 4) 엔진·밸브 자동감지 + 부팅 자가진단 로그(눈에 띄게) — "URL만" 설치에서 실제 하드웨어를
-    #    무엇으로 잡았는지 운영자가 로그로 확인한다(silent auto 금지 — auto + visible self-diagnostic).
-    engine_adapter = build_engine(environ, engine=engine, estop_event=estop_event, logger=log)
+    # 4) 하드웨어 선언 해석(2026-09-02 단일 SoT) — 스냅샷 엄격 판독 > 로컬 캐시 > Undeclared.
+    #    성공한 스냅샷 선언은 캐시에 기록(오프라인 재부팅 폴백 — hardware_profile_cache 헤더).
+    from ..adapters.settings_source import (
+        hardware_profile_from_snapshot,
+        pump_model_from_settings,
+    )
+    from ..persistence.hardware_profile_cache import load_profile, save_profile
+
+    # 캐시 디렉터리 = **명시된 상태 경로만**(SENLYT_STATE_DIR > LOG_DIR). 미설정(테스트·개발 cwd)
+    #   이면 캐시 비활성 — cwd 에 상태 파일을 흘리면 테스트 간 오염·레포 오염이 된다(실기기는
+    #   install.sh 가 SENLYT_STATE_DIR=/var/lib/senlyt 를 각인하므로 항상 활성).
+    _hw_state_dir = (
+        environ.get(SENLYT_STATE_DIR_ENV, "").strip() or environ.get("LOG_DIR", "").strip()
+    )
+    hardware_profile: "HardwareProfile | None" = None
+    hardware_source = "undeclared"
+    _snap_model = pump_model_from_settings(server_settings)
+    if _snap_model is not None:
+        # 조립 규칙(stroke 폴백 = 선언 모델 프리셋 기본 등)은 헬퍼가 SoT — senlytd
+        #   _undeclared_refetch 와 손 동기화하다 한쪽만 어긋나는 것 방지(R6.5 M3).
+        hardware_profile = hardware_profile_from_snapshot(_snap_model, server_settings)
+        hardware_source = "snapshot"
+        if _hw_state_dir:
+            save_profile(_hw_state_dir, hardware_profile, server_config.base_url)
+    else:
+        cached = load_profile(_hw_state_dir, server_config.base_url) if _hw_state_dir else None
+        if cached is not None:
+            hardware_profile = cached
+            hardware_source = "cache"
+            log.warn(
+                f"하드웨어 선언 — 스냅샷 부재, 캐시 폴백(model={cached.pump_model}·"
+                f"stroke={cached.pump_full_stroke}·ports={cached.valve_port_count}). "
+                "용량 축은 미확정(모드 기본 가정·용량 가드 OFF) — 네트워크 복구 후 재시작 권장",
+                stage=STAGE_PI_RECEIVED,
+            )
+
+    # 4.5) **실물 기종 자동 인식**(2026-09-14 · 사용자 요구 "pi 는 Runze 든 Tecan 이든 스스로 인식") — 어댑터를
+    #    조립하기 전에 예상 주소에 `?`→`&` 만 읽어 기종을 정한다. 우선순위: 감지 > 선언(스냅샷>캐시) > Undeclared.
+    #    엔진 주입(테스트)·fake 스위치·후보 포트 없음이면 건너뛴다(감지 없음 = 종전 경로 그대로).
+    detected_pump_addrs: "tuple[int, ...] | None" = None
+    undeclared_detail: "str | None" = None
+    _detect = fetch_settings if detect_hardware is None else detect_hardware
+    if _detect and engine is None and not _is_truthy(environ.get(SENLYT_FAKE_ENGINE_ENV)):
+        from ..adapters.serial_port_discovery import discover_serial_port as _dsp
+
+        _port = _dsp(environ, port_lister=port_lister)
+        if _port:
+            from ..adapters.pump_model_detect import detect_pump_model as _default_detector
+
+            _expected = [1, 2] if mode == "flavor" else [1, 2, 3]
+            _detector = pump_detector if pump_detector is not None else (
+                lambda p, addrs: _default_detector(p, addrs, logger=log)
+            )
+            try:
+                _det = _detector(_port, _expected)
+            except Exception as e:  # noqa: BLE001 — 감지 실패 = 응답 0 취급(종전 경로).
+                log.warn("펌프 기종 자동 인식 실패 — 선언 경로로 조립", stage=STAGE_ERROR, error=str(e))
+                _det = None
+            if _det is not None:
+                # 응답 0 도 "스캔 결과" 다 — 2차 스캔(discover_pumps)을 또 돌지 않는다(검증 P2-2). 늦게 켜진 펌프는
+                #   종전대로 재발견 재기동(on_pumps_seen_unmapped)이 다시 부팅 감지로 데려온다.
+                detected_pump_addrs = tuple(_det.responding)
+            if _det is not None and _det.responding:
+                _declared = hardware_profile.pump_model if hardware_profile is not None else None
+                # ── 근거 강도 비대칭 규칙(검증 P0-1) — 형식 규칙만으로 분류된 기종이 **선언과 어긋나면** 채택하지
+                #   않는다. Runze 정규식(소수 하나)은 미지 XCalibur 로트의 `&`(예 "3.10")도 잡아, 선언 tecan 을 sy01b 로
+                #   뒤집으면 U…R 이 NVM 에 나간다. 실측 정확값(strong)·선언과 일치·선언 없음+Tecan(좁은 정규식)만 채택,
+                #   나머지는 fail-closed(Undeclared) + WARN — 새 로트는 지문을 KNOWN_FINGERPRINTS(+서버 레지스트리)에 등록.
+                #   ⚠️ 비대칭의 이유: Tecan 정규식(`^30\d{6}\s+[A-Z]`)은 좁아 Runze 가 만들 수 없는 꼴이라 형식만으로도
+                #   채택한다(sy01b 선언을 뒤집어 Tecan 어댑터로 — 그 반대인 sy01b 조립이 곧 U-NVM 위험). Runze 형식만은 안 된다.
+                _weak_conflict = (
+                    _det.model == "sy01b" and not _det.strong and _declared != "sy01b"
+                )
+                if _weak_conflict:
+                    log.warn(
+                        f"펌프 지문이 형식 규칙으로만 {_det.model} 로 분류됐고 선언({_declared})과 어긋납니다 — 추측 조립 금지, "
+                        f"모션 거부(fingerprints={ {str(a): v for a, v in _det.fingerprints.items()} }). 실측 지문을 목록에 등록하거나 선언을 확인하세요",
+                        stage=STAGE_PI_RECEIVED,
+                    )
+                    hardware_profile = None
+                    hardware_source = "undetected"
+                    undeclared_detail = (
+                        "펌프 기종 지문이 형식만 일치하고 선언과 어긋남 — 모션 거부. 실측 지문 등록 또는 선언 확인 후 재연결"
+                    )
+                elif _det.model is not None:
+                    if hardware_profile is not None and hardware_profile.pump_model != _det.model:
+                        log.warn(
+                            f"센소리움 선언(model={hardware_profile.pump_model})과 실물(model={_det.model})이 다릅니다 — "
+                            "실물 기종으로 조립합니다(선언은 표시·AI 축에만 남음 · admin 에서 '선언을 실물에 맞추기')",
+                            stage=STAGE_PI_RECEIVED,
+                        )
+                    hardware_profile = HardwareProfile(
+                        pump_model=_det.model,
+                        pump_full_stroke=PUMP_PRESETS[_det.model].pump_full_stroke,
+                        valve_port_count=(
+                            hardware_profile.valve_port_count if hardware_profile is not None else 12
+                        ),
+                        sensorium_version=(
+                            hardware_profile.sensorium_version if hardware_profile is not None else None
+                        ),
+                        source="detected",
+                    )
+                    hardware_source = "detected"
+                else:
+                    # 응답은 있는데 안전하게 조립할 기종을 정할 수 없음 — 선언 추측으로 폴백하지 않는다(fail-closed).
+                    hardware_profile = None
+                    hardware_source = _det.source  # "mixed" | "undetected"
+                    undeclared_detail = (
+                        "펌프 기종 혼합 감지(한 버스에 Runze 와 Tecan) — 모션 거부. 같은 기종으로 맞춘 뒤 재연결"
+                        if _det.mixed
+                        else "펌프가 응답하지만 기종 지문(&)을 판독하지 못함 — 모션 거부. 60초 주기로 재감지"
+                    )
+
+    # 5) 엔진·밸브 조립 + 부팅 자가진단 로그(눈에 띄게) — 무엇으로 잡았는지 운영자가 로그로
+    #    확인한다(silent auto 금지 — auto + visible self-diagnostic).
+    engine_adapter = build_engine(
+        environ,
+        engine=engine,
+        estop_event=estop_event,
+        logger=log,
+        pump_model=hardware_profile.pump_model if hardware_profile is not None else None,
+        undeclared_detail=undeclared_detail,
+        port_lister=port_lister,
+    )
     valve_adapter = build_valve(environ)
+    # 축(stroke) 자가진단 — 단일 키 설계(2026-09-02)에선 어댑터가 설정에서 조립되므로 "설정 vs
+    #   어댑터" 불일치는 동어반복이 됐다. 남는 감시 대상은 **스냅샷 vs 캐시 드리프트**(센소리움을
+    #   바꿨는데 오프라인 캐시로 부팅한 창 — 재시작/네트워크 복구 권고)뿐이다.
+    settings_stroke = full_stroke_from_settings(server_settings)
+    adapter_preset = getattr(engine_adapter, "preset", None)
+    adapter_stroke = adapter_preset.pump_full_stroke if adapter_preset is not None else None
+    # 유효 설정축 — 스냅샷 > 캐시(캐시 부팅은 pump_map 도 캐시 stroke 라 이게 진짜 유효축) > 기본.
+    # 실물 감지 조립(2026-09-14)이면 유효축 = 감지 기종 프리셋(pump_map 도 같은 값) — 스냅샷(선언) stroke 로 보면
+    #   A1 정상 경로에서 매 부팅 "축 드리프트" 거짓 WARN 이 찍힌다(검증 P2-1).
+    effective_stroke = (
+        hardware_profile.pump_full_stroke
+        if hardware_source == "detected" and hardware_profile is not None
+        else settings_stroke
+        if settings_stroke is not None
+        else (
+            hardware_profile.pump_full_stroke
+            if hardware_profile is not None
+            else PUMP_PRESETS["sy01b"].pump_full_stroke
+        )
+    )
     log.event(
         "하드웨어 자가진단 — 엔진·밸브 자동감지 결과",
         stage=STAGE_PI_RECEIVED,
@@ -561,7 +821,37 @@ def build_components(
         mode=mode,
         # 서버 settings 시린지 용량 반영 여부(None=서버 미제공→모드 기본 0.5mL 폴백·안전 급소 관측).
         syringeCapacityMl=syringe_capacity_from_settings(server_settings),
+        settingsSnapshot="present" if server_settings is not None else "absent",
+        # ⚠️ 키 구분(R3 P3-4): 여기는 스냅샷 원본 축(부재=None), 아래 WARN 의 settingsStroke 는
+        #   폴백 적용 후 유효축 — 같은 키로 두 뜻을 찍으면 로그 대조가 어긋난다.
+        settingsStrokeRaw=settings_stroke,
+        adapterStroke=adapter_stroke,
+        # 하드웨어 선언 각인(2026-09-02) — 무엇으로(model·ports) 어디서(source) 조립했는가.
+        hardwareModel=hardware_profile.pump_model if hardware_profile is not None else None,
+        hardwarePorts=hardware_profile.valve_port_count if hardware_profile is not None else None,
+        hardwareSource=hardware_source,
     )
+    if syringe_capacity_from_settings(server_settings) is None:
+        # R4 P0-1 — 스냅샷이 용량을 안 줬다 = 이 부팅의 용량(모드 기본 0.5)은 **추측값**이다.
+        #   용량 축 가드는 비활성(추측으로 서버 선언을 거부하면 벽돌)이고, 서버 설정이 0.5 가
+        #   아니면 소량 주문이 무성 과소/과다로 흐를 수 있다 — 재시작(재fetch)이 정석 복구.
+        log.warn(
+            "settings 스냅샷 부재 — 시린지 용량 미확정(모드 기본 0.5 가정·용량 축 가드 비활성). "
+            "서버 설정 용량이 0.5mL 가 아니면 부피가 어긋난다 — 네트워크 확인 후 senlytd 재시작 권장",
+            stage=STAGE_PI_RECEIVED,
+        )
+    if adapter_stroke is not None and adapter_stroke != effective_stroke:
+        # ⚠️ 숫자를 message 에 인라인 — 서버 trace allowlist 는 message 만 통과시키고 kwargs
+        #   (detail)는 admin 도달 전에 폐기된다. 단일 키 설계에선 이 불일치 = **캐시 부팅인데
+        #   서버 선언이 그 사이 바뀐 드리프트**(또는 스텝 조립 축과 어댑터 축이 갈린 스테일 창).
+        log.warn(
+            f"축 드리프트 — 유효 설정축 {effective_stroke} ≠ 부팅 어댑터축 {adapter_stroke}"
+            f"(선언출처={hardware_source}·snapshot={'present' if server_settings is not None else 'absent'}). "
+            "모션은 축 가드가 거부한다(-1001). 서버 센소리움 선언 확인 후 senlytd 재시작 필요",
+            stage=STAGE_PI_RECEIVED,
+            settingsStroke=effective_stroke,
+            adapterStroke=adapter_stroke,
+        )
 
     return DaemonComponents(
         device_id=identity.device_id,
@@ -574,5 +864,15 @@ def build_components(
         ledger=ledger if ledger is not None else InMemoryIdempotencyLedger(),
         logger=log,
         mode=mode,
+        hardware_profile=hardware_profile,
+        hardware_source=hardware_source,
         server_settings=server_settings,
+        detected_pump_addrs=detected_pump_addrs,
     )
+
+
+# ── 공개 env 해석 표면(2026-09-04 헥사고날 감사 P2) — 형제 도구(hwtool 등)가 daemon 과
+#   동일한 env 해석을 쓰되 **프라이빗 심볼을 관통하지 않게** 하는 안정 별칭. 시그니처 계약:
+#   float_env(environ, key, default) · valve_pins_from_env(raw) — 내부 리팩토링 시 이 별칭은 유지.
+float_env = _float_env
+valve_pins_from_env = _valve_pins_from_env

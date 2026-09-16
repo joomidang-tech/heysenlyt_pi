@@ -37,8 +37,8 @@ from ..obs.log import (
     STAGE_TRANSITION_DONE,
     StructuredLogger,
 )
-from ..pipeline.offline_queue import OfflineQueue
-from ..pipeline.trace_spill import TraceSpill
+from ..persistence.offline_queue import OfflineQueue
+from ..persistence.trace_spill import TraceSpill
 from ..ports.status_sink_port import TraceSpan
 from .http_client import (
     DEFAULT_TIMEOUT_SECONDS,

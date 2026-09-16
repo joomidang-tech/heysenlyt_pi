@@ -139,3 +139,56 @@ class EnginePort(Protocol):
     def clear_estop(self) -> None:
         """긴급정지 래치 해제 — 복구(초기화) 경로가 부른다."""
         ...
+
+    # ── 2026-09-03 정식 승격(검증 5팀 P1-3) — close/signal_stop 은 정비 툴(hwtool)과
+    #   테스트가 이미 소비하던 "사실상 계약"이었다(Protocol 밖 직호출). ⚠️ 데몬 자체는 아직
+    #   둘 다 직접 부르지 않는다(종료 시 fd 는 프로세스 종료로 회수) — "데몬도 쓰니 안전"으로
+    #   오독하지 말 것(2026-09-03 리뷰 정정). Protocol 은 구조적 타이핑이라 승격은
+    #   런타임 no-op — 대신 형상(핀 구세대·불완전 더블)이 타입/계약 테스트에서 드러난다.
+    #   ⚠️ probe·health_probe·initialize_polled 는 여기 넣지 **않는다** — 소비자(daemon·
+    #   senlytd·pump_sequencer)가 getattr 로 "능력 감지"하고, **부재 자체가 의미를 갖는
+    #   설계된 seam** 이다(fake = probe 부재 → 재발견 미주입 / Undeclared = health_probe
+    #   부재 → 데몬 발화 안 함 / polled 부재 → per-pump 폴백). 아래 capability Protocol 로
+    #   분리해 "지원 어댑터의 시그니처"만 타입으로 고정한다.
+
+    def close(self) -> None:
+        """시리얼/자원 정리(멱등) — 종료·재연결 경로. 더블은 no-op 허용."""
+        ...
+
+    def signal_stop(self) -> None:
+        """진행 중 폴링 협조 중단(취소·SIGTERM) — 더블은 no-op 허용."""
+        ...
+
+
+# ── 능력(capability) 확장 Protocol — "있으면 이 시그니처, 없으면 그 자체가 신호" ──────────
+
+
+class ProbeCapableEngine(Protocol):
+    """부팅 자동인식 능력 — 부재 = 관측 불가 더블(재발견 정책 미주입 신호·senlytd)."""
+
+    def probe(self, addr: int) -> bool:
+        """그 주소에 펌프가 응답하는가(모션 무발생·read-only)."""
+        ...
+
+
+class HealthCapableEngine(Protocol):
+    """하트비트 건강 판정 능력 — 부재 = 데몬이 그 어댑터로는 발화하지 않는다는 신호."""
+
+    def health_probe(self, addr: int) -> str:
+        """"ok" | "garbled" | "silent" (read-only·래치 비소진)."""
+        ...
+
+
+class PolledInitEngine(Protocol):
+    """폴 조기완료 초기화 능력 — 부재 = per-pump `run_op(initialize)` 폴백(의도된 거동)."""
+
+    def initialize_polled(
+        self,
+        addrs: "Iterable[int]",
+        spec,
+        init_in_port: "int | None" = None,
+        init_out_port: "int | None" = None,
+        ports_by_addr=None,
+    ) -> "dict[int, int]":
+        """전 펌프 동시 초기화(주소지정 발사 + Bit5 폴 조기완료) — addr→error_code."""
+        ...

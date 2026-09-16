@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import threading
-from typing import Mapping
+import time
+from typing import Callable, Mapping
 
 from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
 from .bootstrap import (
@@ -125,6 +127,48 @@ def _selftest(environ: Mapping[str, str], logger: StructuredLogger) -> int:
     return 0
 
 
+def _should_arm_pump_rediscovery(pump_map: Mapping[int, object], engine: object, watch_addrs: "tuple[int, ...]") -> bool:
+    """재발견 정책 주입 여부(R8.5 P2) — 실 probe 어댑터 + 기대 주소를 **전부** 매핑하지 못했을 때만.
+
+    fake(probe 부재)=미주입 / env 명시·스캔 완전 성공=미주입 / 공집합·부분 인식=주입.
+    Undeclared 는 probe 가 있어 주입되지만 health_probe 부재로 데몬이 발화하지 못한다
+    (그쪽 복구는 자기 재fetch 경로 소관 — 이중 SIGTERM 없음)."""
+    if not callable(getattr(engine, "probe", None)):
+        return False
+    return not set(watch_addrs) <= set(pump_map)
+
+
+def _make_pump_rediscovery_restart(logger: StructuredLogger, device_id: str) -> "Callable[[], None]":
+    """펌프 재발견 정책(R8 P1-1) — 펌프가 살아 응답하는데 부팅 스캔이 놓친 상태를 재기동으로 복구.
+
+    재기동이 boot 스캔을 다시 돌려 resolver 를 재조립한다(핫스왑 재구성 백로그 불요).
+    pump_map 이 빈 상태에서만 불리므로(제조 원천 불가) 진행 중 작업 경합이 없다."""
+
+    def _restart() -> None:
+        logger.warn(
+            "펌프 응답 감지 + 부팅 인식 부재 — 정상 종료 후 재기동으로 버스를 재스캔합니다",
+            stage=STAGE_PI_RECEIVED,
+            device_id=device_id,
+        )
+        os.kill(os.getpid(), signal.SIGTERM)  # 우아한 종료 → systemd Restart=always 재기동.
+
+    return _restart
+
+
+def _make_pump_model_changed_restart(logger: StructuredLogger, device_id: str) -> "Callable[[], None]":
+    """실물 기종 변경 정책(2026-09-14) — 유휴 감시가 확인한 "다른 기종" 을 재기동으로 반영(부팅 감지 재조립)."""
+
+    def _restart() -> None:
+        logger.warn(
+            "실물 펌프 기종 변경 확인 — 정상 종료 후 재기동으로 새 기종 어댑터를 조립합니다",
+            stage=STAGE_PI_RECEIVED,
+            device_id=device_id,
+        )
+        os.kill(os.getpid(), signal.SIGTERM)  # 우아한 종료 → systemd Restart=always 재기동.
+
+    return _restart
+
+
 def _install_signal_handlers(daemon: SenlytDaemon, logger: StructuredLogger) -> None:
     """SIGTERM/SIGINT → 우아한 종료 요청(stop 플래그). 비메인스레드/미지원 플랫폼은 무시."""
     import signal
@@ -173,6 +217,24 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         logger.error("실 어댑터 조립 실패 — 부팅 중단", stage=STAGE_ERROR, error=str(e))
         return 1
 
+    # 엔진을 넘겨 pump_map **자동인식**을 가능하게 한다(PUMP_ADDRESSES 미설정 = "URL만" 설치).
+    #   env 가 있으면 그게 이기고, 없으면 어댑터의 probe 로 버스를 스캔한다.
+    #   server_settings(부팅 스냅샷)로 시린지 용량/스트로크를 서버 SoT 값으로 얹는다(O-18).
+    # 주기 HW 감시·재발견 정책의 기대 주소(모드 파생 — flavor=2펌프[1,2]·그 외=3펌프[1,2,3]).
+    watch_addrs: "tuple[int, ...]" = (
+        (1, 2) if getattr(components, "mode", None) == "flavor" else (1, 2, 3)
+    )
+    resolver = build_resolver(
+        environ,
+        engine=components.engine,
+        server_settings=getattr(components, "server_settings", None),
+        # 서버배정 mode 우선(env 폴백) — 'URL만' 설치 식향 기기가 예상주소[1,2]만 프로브(부팅지연 0).
+        mode=getattr(components, "mode", None),
+        # 하드웨어 선언(스냅샷>캐시) — 캐시 부팅의 stroke·포트 상한 공급원(2026-09-02 단일 SoT).
+        hardware_profile=getattr(components, "hardware_profile", None),
+        # 부팅 감지가 찾은 응답 주소(2026-09-14) — 2차 스캔 생략(감지 기종·pump_map 동일 관측).
+        known_pump_addrs=getattr(components, "detected_pump_addrs", None),
+    )
     deps = DaemonDeps(
         device_id=components.device_id,
         command_source=components.command_source,
@@ -180,20 +242,14 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         engine=components.engine,
         valve=components.valve,
         ledger=ledger,
-        # 엔진을 넘겨 pump_map **자동인식**을 가능하게 한다(PUMP_ADDRESSES 미설정 = "URL만" 설치).
-        #   env 가 있으면 그게 이기고, 없으면 어댑터의 probe 로 버스를 스캔한다.
-        #   server_settings(부팅 스냅샷)로 시린지 용량/스트로크를 서버 SoT 값으로 얹는다(O-18).
-        resolver=build_resolver(
-            environ,
-            engine=components.engine,
-            server_settings=getattr(components, "server_settings", None),
-            # 서버배정 mode 우선(env 폴백) — 'URL만' 설치 식향 기기가 예상주소[1,2]만 프로브(부팅지연 0).
-            mode=getattr(components, "mode", None),
-        ),
+        resolver=resolver,
+        # 용량 축 가드 활성(R4 P0-1·R4.5 P2-A) — 출처 판정은 용량을 파생한 build_resolver 가
+        #   각인한 값을 그대로 쓴다(재계산 금지 — 두 곳 계산이 어긋나면 P0-1 이 부활한다).
+        capacity_from_settings=resolver.capacity_from_settings,
         commandset_source=components.command_source,  # 동일 SSE 어댑터가 두 축 제공.
         # 주기 HW 감시 기대 주소(실시간 판단·2026-07-19) — 부팅 인식이 비어도 이 주소들을 계속
         #   프로브해 pumpHealth 로 보고(어댑터 미장착 = silent 빨강, USB 꽂히면 ok 초록 자동 전환).
-        hw_watch_addrs=(1, 2) if getattr(components, "mode", None) == "flavor" else (1, 2, 3),
+        hw_watch_addrs=watch_addrs,
         logger=components.logger,
         poll_interval_s=_resolve_poll_interval_s(environ),
         heartbeat_interval_s=_resolve_heartbeat_interval_s(environ),
@@ -205,7 +261,100 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         estop_source=lambda: components.status_sink.poll_estop(components.device_id),
         # 어댑터에 주입한 것과 **같은 공유 래치** — 데몬·시퀀서·어댑터가 하나의 estop 이벤트를 본다.
         estop_event=estop_event,
+        # 펌프 재발견 정책(R8 P1-1) — PUMP_ADDRESSES 각인 제거로 부팅 1회 스캔이 유일해진 뒤,
+        #   펌프 전원이 데몬보다 늦게 켜지면 pump_map 이 빈 채 영구 무토출이 되던 회복 불가를
+        #   닫는다. 데몬의 주기 HW 감시가 "펌프 응답 + pump_map 부재"를 확인하면 이 콜백으로
+        #   우아한 재기동 → systemd 가 재기동 → boot 스캔이 이번엔 펌프를 찾는다(Undeclared
+        #   재fetch 와 동일 계약 — 핫스왑 대신 재기동으로 경계를 명확히). pump_map 이 있으면
+        #   (env 명시·스캔 성공) 데몬이 이 콜백을 부르지 않는다.
+        on_pumps_seen_unmapped=(
+            _make_pump_rediscovery_restart(logger, components.device_id)
+            if _should_arm_pump_rediscovery(resolver.pump_map, components.engine, watch_addrs)
+            else None
+        ),
+        # 실물 기종 변경 정책(2026-09-14) — 유휴 감시가 2회 연속 다른 기종을 보면 우아한 재기동 → 부팅 감지가
+        #   새 기종으로 재조립(핫스왑 없음 · 재발견 재기동과 같은 계약).
+        on_pump_model_changed=_make_pump_model_changed_restart(logger, components.device_id),
+        hardware_source=getattr(components, "hardware_source", None),
     )
+    # ── Undeclared 자가복구(2026-09-02 상태모델 D3) — 선언 미확정 부팅이면 주기 재fetch 스레드. ──
+    #   성공(유효 모델 수신) 시 캐시가 기록되고 데몬을 정상 종료시킨다 → systemd Restart=always 가
+    #   재기동해 새 선언으로 조립(핫스왑 없이 경계가 명확). 성공했는데 여전히 미지값이면 백오프
+    #   지속 + WARN(무한 타이트루프 금지). 도착 봉투는 UndeclaredEngineAdapter 가 정직 실패 처리.
+    _hw_src = getattr(components, "hardware_source", "")
+    from ..adapters.undeclared_engine_adapter import UndeclaredEngineAdapter as _Undeclared
+
+    # 엔진이 실제로 Undeclared 일 때만(검증 P2-4) — fake 엔진(E2E·개발기)은 출처가 undeclared 여도 재감지가 실
+    #   시리얼을 열어 재기동 루프를 만들 수 있다.
+    if _hw_src in ("undeclared", "undetected", "mixed") and isinstance(components.engine, _Undeclared):
+        from ..adapters.settings_source import (
+            fetch_settings_once,
+            hardware_profile_from_snapshot,
+            pump_model_from_settings,
+        )
+        from ..persistence.hardware_profile_cache import save_profile
+        from .bootstrap import SENLYT_STATE_DIR_ENV
+
+        def _undeclared_refetch() -> None:
+            delay = 60.0
+            state_dir = environ.get(SENLYT_STATE_DIR_ENV, "").strip() or environ.get(
+                "LOG_DIR", ""
+            ).strip()
+            from ..adapters.pump_model_detect import detect_pump_model
+            from ..adapters.serial_port_discovery import discover_serial_port
+
+            while True:
+                time.sleep(delay)
+                # ① 실물 재감지(2026-09-14) — 엔진이 Undeclared 라 포트를 쥔 주체가 없어 안전. 균일 기종이 잡히면
+                #   재기동(부팅 감지가 같은 결과로 조립). 혼합/판독 불가는 계속 대기.
+                try:
+                    _port = discover_serial_port(environ)
+                    if _port:
+                        _expected = [1, 2] if components.mode == "flavor" else [1, 2, 3]
+                        _det = detect_pump_model(_port, _expected, logger=logger)
+                        if _det.model is not None:
+                            logger.warn(
+                                f"실물 기종 감지(model={_det.model}) — 정상 종료 후 재기동으로 재조립합니다",
+                                stage=STAGE_PI_RECEIVED,
+                            )
+                            os.kill(os.getpid(), signal.SIGTERM)
+                            return
+                except Exception:  # noqa: BLE001 — 재감지 실패 = 다음 주기.
+                    pass
+                if _hw_src != "undeclared":
+                    delay = 60.0  # 재감지는 read-only 2프레임 — 고정 60초(운영자 안내 문구와 일치 · 검증 P2-5).
+                    continue
+                # ② 선언 재fetch(응답 펌프 0 + 선언 없음 — 종전 D3 경로 그대로).
+                try:
+                    snap = fetch_settings_once(
+                        components.server_config, components.identity.dispenser_token, components.mode
+                    )
+                except Exception:  # noqa: BLE001 — 재fetch 실패 = 백오프 지속.
+                    snap = None
+                model = pump_model_from_settings(snap)
+                if model is not None:
+                    if state_dir:  # 명시 상태 경로에서만 캐시(무설정 = cwd 오염 방지·bootstrap 동일).
+                        # 조립 규칙은 헬퍼가 SoT(R6.5 M3) — bootstrap 스냅샷 경로와 바이트 동일 프로파일.
+                        save_profile(
+                            state_dir,
+                            hardware_profile_from_snapshot(model, snap),
+                            components.server_config.base_url,
+                        )
+                    logger.warn(
+                        f"하드웨어 선언 수신(model={model}) — 정상 종료 후 재기동으로 재조립합니다",
+                        stage=STAGE_PI_RECEIVED,
+                    )
+                    os.kill(os.getpid(), signal.SIGTERM)  # 우아한 종료 → systemd 재기동.
+                    return
+                if snap is not None:
+                    logger.warn(
+                        "재fetch 성공했으나 펌프 모델이 여전히 미확정 — 백오프 지속(admin 센소리움 확인)",
+                        stage=STAGE_PI_RECEIVED,
+                    )
+                delay = min(delay * 2, 300.0)
+
+        threading.Thread(target=_undeclared_refetch, name="hw-refetch", daemon=True).start()
+
     daemon = SenlytDaemon(deps)
     _install_signal_handlers(daemon, logger)
 

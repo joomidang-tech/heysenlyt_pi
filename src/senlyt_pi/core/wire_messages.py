@@ -318,10 +318,16 @@ class Command:
     recipe: tuple[RecipeStep, ...] | None  # recipe steps | None
     trace_id: str
     created_at: str  # ISO8601 (resync 기준·재포맷 금지·부록A P-3)
+    # (선택·2026-09-02 용량 축 fail-closed) recipe 볼륨(µL)의 조립 전제 시린지 용량(mL) —
+    #   dispatcher 가 부팅 스냅샷 pump_map 용량과 대조해 다르면 거부. 부재=구서버 하위호환.
+    syringe_capacity_ml: float | None = None
 
     @staticmethod
     def from_json(j: Mapping[str, Any]) -> "Command":
+        from .command_set import _optional_float  # tolerant reader 공유(R4 P3 — 순환 없음).
+
         raw_recipe = j.get("recipe")
+        raw_cap = j.get("syringeCapacityMl")
         return Command(
             id=j["id"],
             order_id=j["orderId"],
@@ -332,6 +338,7 @@ class Command:
             else tuple(RecipeStep.from_json(s) for s in raw_recipe),
             trace_id=j["traceId"],
             created_at=j["createdAt"],
+            syringe_capacity_ml=_optional_float(raw_cap),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -342,6 +349,12 @@ class Command:
             "deviceId": self.device_id,
             # recipe 는 null 도 의미가 있으므로(§9-1 폴백 신호) 명시적으로 방출.
             "recipe": None if self.recipe is None else [s.to_json() for s in self.recipe],
+            # 용량 선언 왕복 대칭(R4.5 P3) — 있을 때만 방출(없으면 키 자체 생략 = 구계약 그대로).
+            **(
+                {"syringeCapacityMl": self.syringe_capacity_ml}
+                if self.syringe_capacity_ml is not None
+                else {}
+            ),
             "traceId": self.trace_id,
             "createdAt": self.created_at,
         }
@@ -412,6 +425,12 @@ class Heartbeat:
     #   hwCheckedAt = 마지막 프로브 시각(ISO) — "N초 전 확인" 표시용.
     pump_health: "dict[int, str] | None" = None
     hw_checked_at: str | None = None
+    # 펌프 기종 지문(2026-09-11) — pumpFingerprints = {addr: `&` 응답 데이터 블록}(예 SY-01B "8.33" ·
+    #   XCalibur "30064809 C"). ⛔ pi 는 관측·보고만, 판정(선언 기종 ↔ 실물)은 서버. 관측 전이면 키 미방출.
+    pump_fingerprints: "dict[int, str] | None" = None
+    # 기종 출처(2026-09-14) — "detected"(부팅 실물 지문 자동 인식) | "snapshot"/"cache"(선언) | "undeclared" |
+    #   "undetected" | "mixed". admin 이 "자동 인식" 배지와 미확정 사유를 이 값으로 그린다. 부재 = 구버전 pi.
+    pump_model_source: "str | None" = None
     # (선택·2026-08-06 QA "[admin] 튜브필링 UI" 원안) 실행 중 잡 진행 스냅샷
     #   (commandSetId, stepsDone, stepN) — admin 이 "현재 몇 번째 포트인지"를 표시하는 근거.
     #   추가 통신 0(기존 하트비트 편승·유휴면 키 미방출). Sequencer.live_progress 파생.
@@ -434,6 +453,12 @@ class Heartbeat:
             {str(a): s for a, s in self.pump_health.items()} if self.pump_health else None,
         )
         put_if_present(m, "hwCheckedAt", self.hw_checked_at)
+        put_if_present(m, "pumpModelSource", self.pump_model_source)
+        put_if_present(
+            m,
+            "pumpFingerprints",
+            {str(a): s for a, s in self.pump_fingerprints.items()} if self.pump_fingerprints else None,
+        )
         put_if_present(
             m,
             "jobProgress",

@@ -87,7 +87,7 @@ def test_build_engine_injects_shared_estop_event():
     from senlyt_pi.app.bootstrap import build_engine
 
     ev = threading.Event()
-    fake = build_engine({"SENLYT_ENGINE": "fake"}, estop_event=ev)
+    fake = build_engine({"SENLYT_FAKE_ENGINE": "1"}, estop_event=ev, on_pi=lambda: False)
     assert fake._estop is ev  # 공유 이벤트가 그대로 주입됨
 
 

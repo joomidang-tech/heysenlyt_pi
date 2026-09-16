@@ -134,16 +134,28 @@ class TestWireOrder:
     def test_broadcast_only_sequence(self):
         fake = BusScriptedSerial()
         a = adapter_with(fake, read_timeout_s=0.1, init_timeout_s=1.0)
+        a._fp_checked.update({1, 2, 3})  # 지문 게이트 선체크(R9) — 이 테스트의 관심은 와이어 순서.
         results = a.initialize_broadcast([1, 2], SPEC_05)
         assert results == {1: 0, 2: 0}
-        # 순서: 상태리셋 → 스톨전류 → 홈 → 안전포트(0.5mL → U200,5 · Z1R · I12)
-        #   + 종료 후 생존 프로브(`?`·단락 — 첫 펌프 생존 확인 시 나머지 생략·2026-07-19).
-        assert fake.written[:4] == ["/_TR\r", "/_U200,5R\r", "/_Z1R\r", "/_I12R\r"], (
-            "초기화 와이어 = 브로드캐스트 4발 — 사이에 주소지정 프레임이 끼면 회귀"
+        # 순서: 상태리셋 → 스톨전류 → 홈(0.5mL → U200,5 · Z1R). 주차는 **포트를 알 때만**
+        #   (2026-09-03 — 포트 미지정 시 SAFE_PORT(12) 강제 폐지: 배관 모르는 호출자에게 sy01b
+        #   배관 상수를 씌우던 폴백 제거·_setup 계약과 정합). + 종료 후 생존 프로브(`?`·단락).
+        assert fake.written[:3] == ["/_TR\r", "/_U200,5R\r", "/_Z1R\r"], (
+            "초기화 와이어 = 브로드캐스트 3발 — 사이에 주소지정 프레임이 끼면 회귀"
         )
-        assert all(w.rstrip("\r").endswith("?") for w in fake.written[4:]), (
+        assert not any("I12R" in w for w in fake.written), "포트 미지정인데 주차 프레임 발사(회귀)"
+        assert all(w.rstrip("\r").endswith("?") for w in fake.written[3:]), (
             "브로드캐스트 이후는 생존 프로브(`?`)만 허용"
         )
+
+    def test_broadcast_parks_at_output_when_port_given(self):
+        # 포트를 알면(운영 경로) 주차는 배출구로 — "밸브가 쉴 땐 언제나 배출구"(2026-07-21).
+        fake = BusScriptedSerial()
+        a = adapter_with(fake, read_timeout_s=0.1, init_timeout_s=1.0)
+        a._fp_checked.update({1, 2, 3})
+        results = a.initialize_broadcast([1, 2], SPEC_05, 12, 11)
+        assert results == {1: 0, 2: 0}
+        assert "/_I11R\r" in fake.written
 
 
 # ── D. 토출 경계 — 셋업 Ready 폴은 그대로(정비 밖 silent-success 금지) ───────────

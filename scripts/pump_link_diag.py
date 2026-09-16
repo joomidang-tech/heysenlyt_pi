@@ -39,6 +39,12 @@ ETX = 0x03
 DEFAULT_BAUD = 9600
 # 시도당 수신 상한 — 유효 응답은 보통 수십 ms 안에 온다. 1.5s = v1.1.0 probe와 동일.
 READ_WINDOW_S = 1.5
+
+# 상태 폴 명령 — 모델 방언(검증 P0-3·2026-09-01): sy01b=`?` / tecan(XCalibur)=`Q`.
+#   XCalibur 에서 `?` 는 상태조회가 아니라 위치 리포트이고, busy 판정은 [Q]만 유효(§3.6).
+#   ⚠️ 단 [Q] 는 latched 오버로드(err9/10)를 **소진**한다(§3.6.3 "[Q] clears the error") —
+#   "읽기 전용" 자기 서술이 tecan 에선 반쯤 거짓이 된다. main() 이 경고를 출력한다.
+POLL_CMD = "?"  # main() 에서 --model 로 확정.
 KNOWN_ADAPTERS = {(0x1A86, 0x7523): "CH340", (0x1A86, 0x5523): "CH341", (0x0403, 0x6001): "FT232R"}
 
 
@@ -130,8 +136,8 @@ def classify(raw: bytes, sent_cmd: str, addr: int | str) -> tuple[str, str]:
 def probe_stats(s: serial.Serial, addr: int, n: int, label: str, verbose: bool = True) -> dict:
     stats = {"VALID": 0, "GARBLED": 0, "SILENT": 0, "ECHO_ONLY": 0}
     for i in range(n):
-        raw, first, etx = txn(s, addr)
-        grade, detail = classify(raw, "?", addr)
+        raw, first, etx = txn(s, addr, POLL_CMD)
+        grade, detail = classify(raw, POLL_CMD, addr)
         stats[grade] += 1
         if verbose:
             t_first = f"{first * 1000:.0f}ms" if first is not None else "-"
@@ -149,7 +155,9 @@ def fmt_stats(st: dict, n: int) -> str:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SY-01B 시리얼 링크 진단 (읽기 전용)")
+    ap = argparse.ArgumentParser(description="시린지펌프 시리얼 링크 진단 (읽기 전용)")
+    ap.add_argument("--model", choices=("sy01b", "tecan"), default="sy01b",
+                    help="펌프 기기 모델 — tecan(XCalibur)은 상태 폴을 Q 로(§3.6)")
     ap.add_argument("--port", help="시리얼 포트 (미지정 시 자동 감지)")
     ap.add_argument("--addrs", default="1,2", help="점검할 펌프 주소 (기본 1,2)")
     ap.add_argument("-n", type=int, default=10, help="주소별 ? 반복 횟수 (기본 10)")
@@ -158,11 +166,18 @@ def main() -> None:
     ap.add_argument("--tr", action="store_true", help="각 주소에 TR(상태 리셋) 1발 선행 — latched 에러 배제용")
     args = ap.parse_args()
 
+    global POLL_CMD
+    if args.model == "tecan":
+        POLL_CMD = "Q"
+
     addrs = [int(a) for a in args.addrs.split(",") if a.strip()]
     bauds = [int(b) for b in args.bauds.split(",") if b.strip()]
 
     print("═" * 100)
-    print("SY-01B 시리얼 링크 진단 — 읽기 전용 (모션 명령 없음)")
+    print(f"시린지펌프 시리얼 링크 진단 — model={args.model} · 폴={POLL_CMD} (모션 명령 없음)")
+    if args.model == "tecan":
+        print("⚠️ XCalibur [Q]는 latched 오버로드(err9/10)를 소진한다(§3.6.3) — 진단이 현장 증거를")
+        print("   지울 수 있다. 오버로드 상태를 보존해야 하면 진단 전 관제 로그를 먼저 확보할 것.")
     print("═" * 100)
 
     print("\n[0] 포트 열거")

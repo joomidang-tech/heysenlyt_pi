@@ -1,6 +1,6 @@
 """pipeline — 파이프라인 (Dart lib/pipeline 미러).
 
-  offline_queue     오프라인 큐(FIFO) + resync cursor
+  offline_queue     (호환 shim — 정본은 persistence.offline_queue · 2026-09-04 이관)
   recipe_resolver   주문 → 정렬·검증·steps 파생 (+ flavorRecipe/flavor_recipes 폴백 헬퍼)
   engine_executor   EnginePort 재시도/오류분류 (EP-03 silent-success 금지)
   status_reporter   phase 단조·역행거부·멱등 StatusReport 조립

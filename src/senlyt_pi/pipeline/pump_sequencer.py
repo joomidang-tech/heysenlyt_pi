@@ -760,6 +760,36 @@ class PumpSequencer:
             self._pool = None
             pool.shutdown(wait=True)
 
+    def reject_before_motion(
+        self, *, command_id: str, trace_id: str, error_code: StatusErrorCode
+    ) -> JobReport:
+        """모션 시작 전 거부의 **관측 가능한** 종단(R4 P1-2) — RR 검증 실패와 동형 처리.
+
+        dispatcher 게이트(용량 축 등)가 submit 앞에서 거부하면 ledger claim 도 order status
+        역보고도 건너뛰어져, 레거시 command 축에선 서버에 아무 흔적이 없다 — 주문은 PENDING
+        으로 남고 snapshot 마다 같은 command 가 재파생·재거부를 반복한다. 이 메서드는 RR 실패
+        블록(:273~)과 같은 절차(claim→settle(실패)→FAILED publish)로 거부를 종단해:
+        ① 주문이 FAILED 로 정직하게 보이고 ② 재파생분은 ledger DUPLICATE 로 조용히 접힌다.
+        """
+        verdict = self.ledger.check_and_claim(command_id, trace_id)
+        if verdict is LedgerVerdict.DUPLICATE:
+            return JobReport(
+                command_id=command_id,
+                outcome=JobOutcome.DUPLICATE_DROPPED,
+                steps_done=0,
+                step_n=0,
+                error_code=StatusErrorCode.DUPLICATE_DROPPED,
+            )
+        self.ledger.mark_settled(command_id, success=False)
+        self._publish(DispensePhase.FAILED, 0, 0, error_code, command_id, trace_id)
+        return JobReport(
+            command_id=command_id,
+            outcome=JobOutcome.VALIDATION_FAILED,
+            steps_done=0,
+            step_n=0,
+            error_code=error_code,
+        )
+
     def _publish_via(
         self,
         reporter: StatusReporter,
