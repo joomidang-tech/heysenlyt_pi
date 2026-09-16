@@ -1,6 +1,6 @@
 # heysenlyt-pi
 
-hey_senlyt **v1.2.0** 라즈베리파이4 headless 디스펜서 데몬 (Firebase 무의존).
+hey_senlyt **v1.3.0** 라즈베리파이4 headless 디스펜서 데몬 (Firebase 무의존).
 3-서비스(**order-web** 주문 / **admin-web** 관제[heysenlyt-web 내 `/admin` 라우트·same-origin] / **pi 디스펜서**) 중 pi 트랙.
 
 ## 🚀 빠른 설치 (라즈베리파이 · 1줄)
@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/main/in
 |------|----------------------|
 | **prod** | `https://senlyt.com` |
 | **dev** | `https://dev-env.senlyt.com` |
-| **버전 프리뷰** | `https://v1-2-0.env.senlyt.com` |
+| **버전 프리뷰** | `https://v1-3-0.env.senlyt.com` |
 
 > pi 코드는 **서버 URL 과 같은 환경의 브랜치**에서 받습니다(`senlyt.com`→`main`, `dev-env`→`dev`, `vX-Y-Z.env`→`vX.Y.Z`). 데몬은 서버-불가지(어느 서버를 보든 인자로 받음)라, 사람이 바꾸는 건 서버 URL 하나입니다. 다른 소스를 시험할 땐 `SENLYT_INSTALL_REF=<브랜치|태그|전체 SHA>` 로만 덮어쓰고, raw URL 경로는 그대로 `main` 입니다(스크립트가 브랜치와 무관한 한 벌이라 바꿀 이유가 없음).
 
@@ -46,6 +46,14 @@ sudo systemctl stop senlytd      # 잠깐 멈춤 (즉시 정지 — 서버 등�
 sudo systemctl start senlytd     # 다시 시작
 sudo systemctl status senlytd --no-pager   # 현재 상태 확인 (running/실패 여부)
 
+# ── 자동시작까지 끊기/되살리기 ──
+sudo systemctl disable --now senlytd   # 지금 정지 + 부팅 자동시작 해제
+sudo systemctl enable --now senlytd    # 되돌리기 (지금 기동 + 자동시작 복구)
+
+# ── 기기 전원 ──
+sudo shutdown -h now             # 전원 끄기 (초록 LED 깜빡임이 멎은 뒤 코드를 뽑는다)
+sudo reboot                      # 재부팅
+
 # ── 로그 ──
 journalctl -u senlytd -f         # 실시간 로그 (Ctrl+C 로 빠져나옴)
                                  #   "하드웨어 자가진단" 줄에서 engine/valve 감지 결과 확인
@@ -60,6 +68,11 @@ journalctl -u senlytd -f         # 실시간 로그 (Ctrl+C 로 빠져나옴)
 
 - **재설치/갱신** — 위 [빠른 설치](#-빠른-설치-라즈베리파이--1줄) 한 줄을 다시 실행하면 됩니다(멱등 — 최신 코드로 pull 후 재기동). 수동으로 멈출 필요 없음.
 - **`stop` 은 "잠깐 멈춤"** — 서버로의 등록·주문 폴링이 모두 멈춥니다. 다시 받으려면 `start`. 완전 제거가 아니라 부팅 시 다시 뜹니다(`disable` 해야 자동시작 해제).
+- **끄는 층이 둘** — `stop`/`disable` 은 **데몬**만 끄고 기기는 켜져 있습니다(SSH·로그 조회 그대로). `shutdown` 은 **기기 자체**를 내립니다. 업데이트는 어느 쪽도 필요 없습니다 — 설치 한 줄이 멱등이라 pull·재기동까지 알아서 합니다.
+
+> ⛔ **제조·정비 중에는 전원을 끊지 않는다.** 플런저가 움직이는 중에 전원이 빠지면 펌프는 위치를 잃은 채로 멈추고, 다음 부팅의 홈 복귀가 어디서 시작되는지 알 수 없는 상태가 됩니다. 먼저 `systemctl stop senlytd` 로 데몬을 세워 모션이 끝나게 하고, 그다음에 `shutdown` 합니다.
+>
+> ⚠️ **그리고 지금은 급하게 전원을 뽑으면 그 부팅의 로그가 통째로 사라집니다.** 데몬 로그는 journald 로 가는데, Raspberry Pi OS 기본값 `Storage=auto` 는 `/var/log/journal` 이 있을 때만 디스크에 쓰고 없으면 `/run`(tmpfs)에 씁니다 — 전원이 끊기면 tmpfs 와 함께 날아갑니다. 2026-08-29 베트남 부스에서 기기가 17분 39초 침묵한 구간의 로그가 정확히 이렇게 소실돼 **"컴퓨터는 살아 있고 프로그램만 멎었나 / 전원이 끊겼나"를 사후에 가르지 못했습니다.** 서버 쪽 관측은 전송에 의존하므로 전송이 불가능한 고장에서는 원리적으로 비어 있고, 그때 남는 유일한 증거가 이 로컬 저널입니다. 영속화(`Storage=persistent` + 200MB 상한)는 **아직 미반영** — 반영 전까지는 이상이 보이면 전원을 내리기 전에 `journalctl -u senlytd -b > ~/senlytd-$(date +%F-%H%M).log` 로 먼저 건져 두세요.
 
 > **배포 산출물 = Python 데몬** (`src/senlyt_pi/` · 콘솔 스크립트 `senlytd` · `python:3.12-slim` + systemd).
 > **Dart 구현(`lib/`·`test/`)은 포팅 오라클** — 동결 계약 SoT를 바이트 동일 포팅해 Python의 parity 기준으로만 쓴다(배포 아님).
