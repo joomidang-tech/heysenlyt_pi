@@ -756,14 +756,18 @@ class Sy01bEngineAdapter:
         상한을 넘지 않는지만 본다(하드웨어 보호). 제약 = `v ≤ c ≤ V`(느리게 출발·느리게 끝).
         하한은 기종별 차이(`MIN_SPEED_HZ` — sy01b=1 관용·XCalibur=50 미만 err3)라 클래스 속성만
         재선언하면 이 공식 전체가 파생에 그대로 적용된다(본문 복붙 금지 — 2026-09-03 검증 P2).
-        ⚠️ start/cutoff 미지정 시 프리셋 **상한**(v1000·c5400)이 그대로 나간다 — 매뉴얼 기본
-        (900/900)보다 공격적이나 v1.2.0 이후 운영이 이 값으로 필드 검증돼 유지(바꾸면 토출 재보정).
+        ⚠️ start/cutoff 는 preset 의 v·c 가 그대로 나간다. 첫 판(2026-09-22 전)엔 표 **상한**(v1000·c5400)이
+        preset 이라 매뉴얼 기본(900/900)보다 공격적으로 돌았고 v1.2.0 이후 그 값으로 필드 검증돼 있었다.
+        §6-3a 둘째 판(2026-09-22)부터 bootstrap 이 **제조사 기본값**(v900·V4000·c900·L14 / XCalibur v900·V1400·
+        c900·L7)을 preset 으로 꽂으므로 튠 없는 기기는 그만큼 느려진다 — 토출 시간 재확인 대상.
         """
         p = self.preset
         top = min(int(top_hz), p.pump_max_top_speed_hz) if top_hz else p.pump_max_top_speed_hz
         top = max(self.MIN_SPEED_HZ, top)
-        # 시작·컷오프는 top 을 넘지 못한다(단조성) + 각자의 프리셋 상한 안.
-        start = min(p.pump_max_start_speed_hz, top)
+        # 시작·컷오프는 top 을 넘지 못한다(단조성) + 각자의 프리셋 상한 안 + 기종 하한(MIN_SPEED_HZ) 위.
+        #   하한 바닥은 방어 한 겹(2026-09-22 검증 P0-1) — 프리셋이 튠으로 낮아져도 v·c 가 XCalibur err3 영역
+        #   (50 미만)으로 내려간 프레임이 나가지 않게. 표 프리셋(v1000·c5400)에선 no-op.
+        start = max(self.MIN_SPEED_HZ, min(p.pump_max_start_speed_hz, top))
         cutoff = max(min(p.pump_max_cutoff_speed_hz, top), start)
         lp = min(int(slope), p.pump_max_slope) if slope else p.pump_max_slope
         lp = max(1, lp)
@@ -1584,7 +1588,7 @@ class Sy01bEngineAdapter:
             # 이동 성패는 **폴의 실제 완료 확인**이 판정(ack_tolerant · v1.1.0 _validateResponse 가
             #   빈/깨진 즉답을 통과시키고 폴이 판정하던 필드 검증 구조의 미러) — 이 기기의 간헐
             #   프레임 파손(즉답 `C`·`\x07`·무응답)이 즉시 permanent 로 오판되던 것을 봉합.
-            speed = self._speed_cmd(None, None)  # 정비 이동은 프리셋 **상한** 속도(기본값 아님 — 매뉴얼 기본 900 대비 공격적, §_speed_cmd 주석).
+            speed = self._speed_cmd(None, None)  # 정비 이동도 어댑터 preset(튠 없으면 제조사 기본값 · 둘째 판)의 v·V·c·L — 제조와 같이 느려진다(§_speed_cmd 주석).
             code = self._settle(
                 addr, f"{speed}A{target}R", self.motion_timeout_s,
                 poll=True, ack_tolerant=True,

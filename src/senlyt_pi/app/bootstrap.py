@@ -44,11 +44,18 @@ from ..adapters.registration_client import (
 from ..adapters.settings_source import (
     fetch_settings_once,
     full_stroke_from_settings,
+    pump_tuning_from_settings,
     syringe_capacity_from_settings,
 )
 from ..adapters.sse_command_source_adapter import SseCommandSourceAdapter
 from ..config.server_target import ServerConfig
-from ..core.pump_guard import PUMP_PRESETS, SyringeSpec, resolve_syringe_capacity_ml
+from ..core.pump_guard import (
+    PUMP_PRESETS,
+    PumpPreset,
+    SyringeSpec,
+    apply_pump_tuning,
+    resolve_syringe_capacity_ml,
+)
 from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
 from ..persistence.file_idempotency_ledger import FileIdempotencyLedger
 from ..persistence.hardware_profile_cache import HardwareProfile
@@ -179,6 +186,9 @@ def build_engine(
     pump_model: "str | None" = None,
     # Undeclared 착지 사유(2026-09-14) — 선언 부재 외에 "지문 판독 불가"·"기종 혼합" 도 같은 fail-closed.
     undeclared_detail: "str | None" = None,
+    # 운영자 속도 튠이 얹힌 어댑터 preset(§6-3a · 2026-09-22) — pump_tuning_from_settings 가 **실물 기종과
+    #   같은 기종**으로 만든 값만 온다. None = 그 기종 제조사 기본값으로 조립(둘째 판). 스트로크·U 는 표 값 그대로다.
+    pump_preset: "PumpPreset | None" = None,
 ) -> EnginePort:
     """엔진 조립 — 주입 우선. 호스트와 무관하게 **서버 선언(pump_model)** 대로 실물 어댑터를 조립한다.
 
@@ -233,12 +243,25 @@ def build_engine(
         def _resolve_ports() -> list[str]:
             return list_candidate_ports(environ, port_lister=port_lister)
 
+        # 튠 preset 은 기종 교차 방지 — 호출측이 실물 기종으로 만들었어도 여기서 한 번 더 대조한다
+        #   (다른 기종의 상한을 이 어댑터에 꽂는 조합을 문법적으로 차단 · P1-6 정신).
+        #   None(스냅샷 부재·캐시 부팅·기종 불일치) = 그 기종 **제조사 기본값**(apply_pump_tuning(표, None) —
+        #   §6-3a 둘째 판 2026-09-22). 표 상한을 그대로 어댑터에 꽂던 첫 판 동작은 폐기.
+        preset = (
+            pump_preset
+            if pump_preset is not None and pump_preset.pump_preset_id == pump_model
+            else apply_pump_tuning(PUMP_PRESETS[pump_model], None)
+        )
         if port:
             return _RealAdapter(
-                port=port, estop_event=estop_event, logger=logger, port_resolver=_resolve_ports
+                port=port,
+                estop_event=estop_event,
+                logger=logger,
+                port_resolver=_resolve_ports,
+                preset=preset,
             )
         return _RealAdapter(
-            estop_event=estop_event, logger=logger, port_resolver=_resolve_ports
+            estop_event=estop_event, logger=logger, port_resolver=_resolve_ports, preset=preset
         )
     # 선언 미확정(None/미지값) — Undeclared fail-closed(추측 조립 금지 · 상태모델 D3). 호스트 무관.
     #   ⛔ 폴백 sy01b 금지: tecan 이라 선언됐던 기기가 미확정 부팅에서 sy01b 로 조립되면
@@ -782,6 +805,15 @@ def build_components(
 
     # 5) 엔진·밸브 조립 + 부팅 자가진단 로그(눈에 띄게) — 무엇으로 잡았는지 운영자가 로그로
     #    확인한다(silent auto 금지 — auto + visible self-diagnostic).
+    # 운영자 속도 튠(§6-3a · 2026-09-22) — 스냅샷 pumpPreset 의 v·V·c·L 을 **실물 기종** 기본값 위에 얹는다.
+    #   스냅샷에 hardware 선언이 없거나(병합 스킵·캐시 부팅) 선언 기종 ≠ 조립 기종이면 None → build_engine 이
+    #   그 기종 **제조사 기본값**으로 조립한다 — 다른 기종 값이 이 펌프로 새지 않는다. 부팅 1회 스냅샷이라
+    #   admin "적용" 뒤 반영 = 재시작(용량 축과 같은 계약). 아래 자가진단 로그의 pumpTuning/pumpSpeedCeil 로 드러난다.
+    tuned_preset = (
+        pump_tuning_from_settings(server_settings, hardware_profile.pump_model)
+        if hardware_profile is not None
+        else None
+    )
     engine_adapter = build_engine(
         environ,
         engine=engine,
@@ -790,6 +822,7 @@ def build_components(
         pump_model=hardware_profile.pump_model if hardware_profile is not None else None,
         undeclared_detail=undeclared_detail,
         port_lister=port_lister,
+        pump_preset=tuned_preset,
     )
     valve_adapter = build_valve(environ)
     # 축(stroke) 자가진단 — 단일 키 설계(2026-09-02)에선 어댑터가 설정에서 조립되므로 "설정 vs
@@ -830,6 +863,22 @@ def build_components(
         hardwareModel=hardware_profile.pump_model if hardware_profile is not None else None,
         hardwarePorts=hardware_profile.valve_port_count if hardware_profile is not None else None,
         hardwareSource=hardware_source,
+        # 속도 튠 관측(§6-3a) — "default"=제조사 기본값 그대로(튠 없음/스냅샷 부재/기종 불일치) · "tuned"=운영자 값.
+        #   판정은 **어댑터가 실제로 든 preset**(주입을 거부·무시한 경우 포함)으로 — 실제 v·V·c·L 을 함께 찍어
+        #   admin 화면 값과 대조할 수 있게 한다.
+        pumpTuning=(
+            "tuned"
+            if adapter_preset is not None
+            and adapter_preset.pump_preset_id in PUMP_PRESETS
+            and adapter_preset != apply_pump_tuning(PUMP_PRESETS[adapter_preset.pump_preset_id], None)
+            else "default"
+        ),
+        pumpSpeedCeil=(
+            f"v{adapter_preset.pump_max_start_speed_hz}V{adapter_preset.pump_max_top_speed_hz}"
+            f"c{adapter_preset.pump_max_cutoff_speed_hz}L{adapter_preset.pump_max_slope}"
+            if adapter_preset is not None
+            else None
+        ),
     )
     if syringe_capacity_from_settings(server_settings) is None:
         # R4 P0-1 — 스냅샷이 용량을 안 줬다 = 이 부팅의 용량(모드 기본 0.5)은 **추측값**이다.

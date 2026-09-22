@@ -35,6 +35,7 @@ from ..core.pump_guard import (
     PUMP_PRESETS,
     PumpPreset,
     SyringeSpec,
+    apply_pump_tuning,
     clamp_pump_preset,
     resolve_syringe_capacity_ml,
 )
@@ -138,6 +139,32 @@ def full_stroke_from_settings(settings: Any) -> int | None:
     """MachineSettings.pumpPreset → clamp된 pumpFullStroke. 부재 → None(sy01b 12000 폴백 유도)."""
     preset = _preset_of(settings)
     return preset.pump_full_stroke if preset is not None else None
+
+
+def pump_tuning_from_settings(settings: Any, model: str) -> PumpPreset | None:
+    """스냅샷 pumpPreset 의 속도 축(v·V·c·L)을 **실물 기종 `model`** 의 표 위에 얹은 어댑터 preset (§6-3a · 2026-09-22).
+
+    서버가 settings SSE 병합에서 `pumpPreset` 에 (선언 기종 표 + 운영자 튠)을 실어 보낸다. pi 는 그 수치를
+    **`pumpPresetId == model` 일 때만** 소비한다 — 선언≠실물(2026-09-14 자동 인식이 선언을 뒤집은 부팅)이면
+    다른 기종의 값이 이 펌프로 새지 않게 None 으로 착지한다. 수치는 기종 매뉴얼 범위로 한 번 더 잘리고
+    단조성(v ≤ c ≤ V)을 맞춘다 — 서버와 byte-parity 라 정상 입력에선 no-op 이다. 스냅샷에 없는 축은 그 기종
+    **제조사 기본값**(PUMP_TUNING_DEFAULTS)이다.
+
+    반환 None 의 뜻은 "튠 정보 없음/해당 없음" 이지 오류가 아니다 — 호출측(bootstrap)은 None 이면 그 기종
+    제조사 기본값으로 조립한다(§6-3a 둘째 판 2026-09-22).
+    """
+    if model not in PUMP_PRESETS or not isinstance(settings, Mapping):
+        return None
+    # 게이트는 **hardware 블록의 선언 기종**(pump_model_from_settings · R6 P0-1 의 유일 판독 채널)이다 —
+    #   `pumpPreset.pumpPresetId` 는 병합이 스킵된 프레임에도 늘 "sy01b" 로 채워져 있어 "튠이 얹힌 프레임"과
+    #   "함대 원본 프레임"을 구분하지 못한다(검증 P2-4). 병합이 실제로 일어난 프레임(hardware 있음)에서만,
+    #   그 선언이 실물 기종과 같을 때만 수치를 소비한다.
+    if pump_model_from_settings(settings) != model:
+        return None
+    raw = settings.get("pumpPreset")
+    if not isinstance(raw, Mapping) or raw.get("pumpPresetId") != model:
+        return None
+    return apply_pump_tuning(PUMP_PRESETS[model], raw)
 
 
 def hardware_profile_from_snapshot(model: str, settings: Any) -> "HardwareProfile":
