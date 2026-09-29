@@ -188,7 +188,44 @@ def hardware_profile_from_snapshot(model: str, settings: Any) -> "HardwareProfil
         or PUMP_PRESETS[model].pump_full_stroke,
         valve_port_count=valve_port_count_from_settings(settings) or 12,
         sensorium_version=str(sv) if sv is not None else None,
+        # (2026-09-29) 설정상 펌프 주소 — 오프라인 부팅 프로브 대상(향연 4대). 판정축 아님.
+        pump_addrs=tuple(pump_addrs_from_settings(settings)),
     )
+
+
+def default_pump_addrs(mode: str | None) -> list[int]:
+    """모드 기본 펌프 주소 — 식향 2대(1,2) / 그 외(향장향) 3대(1,2,3). 헤이센릿 함대 구성(2026-07-17 확정)."""
+    return [1, 2] if (mode or "").strip().lower() == "flavor" else [1, 2, 3]
+
+
+def expected_pump_addrs(
+    mode: str | None, settings: Any = None, hardware_profile: Any = None
+) -> list[int]:
+    """부팅 인식·주기 감시가 **프로브할** 펌프 주소 — `expected_pump_addrs_with_source` 의 주소만."""
+    return expected_pump_addrs_with_source(mode, settings, hardware_profile)[0]
+
+
+def expected_pump_addrs_with_source(
+    mode: str | None, settings: Any = None, hardware_profile: Any = None
+) -> "tuple[list[int], str]":
+    """프로브 대상 = 모드 기본 ∪ (서버 스냅샷 `pumpPorts` 키 **또는** 캐시 `pump_addrs`) — (주소, 출처).
+
+    2026-09-29 — 향연(ICAD)은 Tecan 12채널 **4대**다. 모드 파생([1,2,3])만 프로브하면 addr 4 가 영영 pump_map 에
+      안 올라가 그 펌프에 꽂힌 향료가 전부 unmapped drop 된다. 서버는 기기 세대의 통 배치(역할 포트 포함 · 펌프 대수만큼)를
+      설정 스냅샷 `pumpPorts` 로 내려 주므로, 그 키를 합친다. 헤이센릿 기기는 스냅샷 키 = 모드 기본이라 바이트 불변.
+    우선순위: **온라인 스냅샷 > 로컬 캐시(hardware-profile.json `pumpAddrs`) > 모드 기본.** 스냅샷이 있으면 캐시는
+      보지 않는다(옛 캐시가 이미 뺀 펌프를 되살리지 않게). 캐시 부재·손상 = 빈 튜플 = 모드 기본(fail-safe).
+    ⚠️ 이건 **프로브 대상**일 뿐 — 물리 존재는 여전히 프로브 응답이 SoT(없는 주소는 응답 없음 = 매핑 안 됨).
+    출처: "snapshot" | "cache" | "mode-default"
+    """
+    base = set(default_pump_addrs(mode))
+    snap = pump_addrs_from_settings(settings)
+    if snap:
+        return sorted(base | set(snap)), "snapshot"
+    cached = tuple(getattr(hardware_profile, "pump_addrs", ()) or ())
+    if cached:
+        return sorted(base | set(int(a) for a in cached)), "cache"
+    return sorted(base), "mode-default"
 
 
 def pump_addrs_from_settings(settings: Any) -> list[int]:

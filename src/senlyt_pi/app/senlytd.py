@@ -22,6 +22,7 @@ import threading
 import time
 from typing import Callable, Mapping
 
+from ..adapters.settings_source import expected_pump_addrs
 from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
 from .bootstrap import (
     BootstrapError,
@@ -220,9 +221,15 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
     # 엔진을 넘겨 pump_map **자동인식**을 가능하게 한다(PUMP_ADDRESSES 미설정 = "URL만" 설치).
     #   env 가 있으면 그게 이기고, 없으면 어댑터의 probe 로 버스를 스캔한다.
     #   server_settings(부팅 스냅샷)로 시린지 용량/스트로크를 서버 SoT 값으로 얹는다(O-18).
-    # 주기 HW 감시·재발견 정책의 기대 주소(모드 파생 — flavor=2펌프[1,2]·그 외=3펌프[1,2,3]).
-    watch_addrs: "tuple[int, ...]" = (
-        (1, 2) if getattr(components, "mode", None) == "flavor" else (1, 2, 3)
+    # 주기 HW 감시·재발견 정책의 기대 주소 — 모드 기본(flavor=[1,2]·그 외=[1,2,3]) ∪ 서버 설정 스냅샷 펌프 키
+    #   (향연 4대 · 2026-09-29 — `expected_pump_addrs`).
+    watch_addrs: "tuple[int, ...]" = tuple(
+        expected_pump_addrs(
+            getattr(components, "mode", None),
+            getattr(components, "server_settings", None),
+            # 오프라인 캐시 부팅(스냅샷 없음)에도 향연 4번 펌프를 감시 — 캐시 pumpAddrs(2026-09-29).
+            getattr(components, "hardware_profile", None),
+        )
     )
     resolver = build_resolver(
         environ,
@@ -310,7 +317,7 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
                 try:
                     _port = discover_serial_port(environ)
                     if _port:
-                        _expected = [1, 2] if components.mode == "flavor" else [1, 2, 3]
+                        _expected = list(watch_addrs)  # 향연 4대(2026-09-29) — 부팅 감시와 같은 주소
                         _det = detect_pump_model(_port, _expected, logger=logger)
                         if _det.model is not None:
                             logger.warn(

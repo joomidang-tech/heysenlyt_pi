@@ -4,6 +4,9 @@
 같은 구성으로 조립한다(없으면 Undeclared fail-closed — bootstrap 상태모델 D3).
 
 캐시가 SoT 로 삼는 축은 **{pumpModel, pumpFullStroke, valvePortCount} 셋뿐**이다(R-P0-4).
+(2026-09-29) `pumpAddrs` — 스냅샷 `pumpPorts` 키(설정상 펌프 주소 집합)를 **프로브 대상 보조축**으로 함께 남긴다.
+  향연(ICAD)은 Tecan 4대라, 오프라인 부팅이 모드 기본 [1,2,3]만 프로브하면 addr 4 가 빠진다. 이 값은 판정축이
+  아니다 — 없거나 손상이면 **빈 튜플**(= 모드 기본으로 폴백)이고, 프로파일 자체를 무효로 만들지 않는다(옛 캐시 호환).
 ⛔ syringeCapacityMl 은 캐시하지 않는다 — 캐시 부팅에서 용량을 먹이면
 `capacity_from_settings=True` 가 되어 스테일 캐시 vs 봉투 선언 불일치로 전건 오거부가
 된다. 캐시 부팅 = 용량 미확정(모드 기본 0.5 가정·용량 가드 자동 OFF) = 기존 오프라인
@@ -36,6 +39,8 @@ class HardwareProfile:
     # 출처(2026-09-14) — "declared"(스냅샷/캐시 선언) | "detected"(부팅 실물 지문). 캐시엔 declared 만 저장한다
     #   (감지 결과를 캐시하면 펌프 전원이 늦게 켜진 오프라인 재부팅이 직전 랙의 기종으로 조립된다).
     source: str = "declared"
+    # (2026-09-29) 설정상 펌프 주소(스냅샷 `pumpPorts` 키) — 오프라인 부팅의 프로브 대상 보조축. 빈 튜플 = 모름(모드 기본).
+    pump_addrs: tuple[int, ...] = ()
 
 
 def cache_path(state_dir: str | Path) -> Path:
@@ -55,6 +60,7 @@ def save_profile(state_dir: str | Path, profile: HardwareProfile, server_base_ur
                     "pumpFullStroke": profile.pump_full_stroke,
                     "valvePortCount": profile.valve_port_count,
                     "sensoriumVersion": profile.sensorium_version,
+                    "pumpAddrs": list(profile.pump_addrs),
                     "serverBaseUrl": server_base_url,
                     "savedAt": datetime.now(timezone.utc).isoformat(),
                 },
@@ -96,4 +102,23 @@ def load_profile(state_dir: str | Path, server_base_url: str) -> "HardwareProfil
         pump_full_stroke=stroke,
         valve_port_count=ports,
         sensorium_version=sv if isinstance(sv, str) else None,
+        pump_addrs=_parse_pump_addrs(raw.get("pumpAddrs")),
     )
+
+
+_MAX_PUMP_ADDR = 15  # RS485 주소 1..15(0 = 브로드캐스트). 형식 sanity 만.
+
+
+def _parse_pump_addrs(raw: object) -> tuple[int, ...]:
+    """캐시 `pumpAddrs` → 주소 튜플. 부재(옛 캐시)·손상·범위 밖 = **빈 튜플**(모드 기본 폴백) — 부팅을 막지 않는다.
+
+    하나라도 이상하면 통째로 버린다 — 일부만 살리면 "4대인데 3대로" 같은 반쪽 목록이 확정값처럼 쓰인다.
+    """
+    if not isinstance(raw, list):
+        return ()
+    out: set[int] = set()
+    for a in raw:
+        if isinstance(a, bool) or not isinstance(a, int) or not 1 <= a <= _MAX_PUMP_ADDR:
+            return ()
+        out.add(a)
+    return tuple(sorted(out))

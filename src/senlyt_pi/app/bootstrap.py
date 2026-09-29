@@ -42,6 +42,8 @@ from ..adapters.registration_client import (
     read_hardware_id,
 )
 from ..adapters.settings_source import (
+    expected_pump_addrs,
+    expected_pump_addrs_with_source,
     fetch_settings_once,
     full_stroke_from_settings,
     pump_tuning_from_settings,
@@ -549,8 +551,9 @@ def build_resolver(
         #   상한(~6s)을 낭비한다. 기능은 물리 프로브가 SoT 라 어느 경로든 정확하나, 부팅 지연·설계 정합.
         mode_str = (mode or environ.get(SENLYT_MODE_ENV, "") or "").strip().lower()
         is_flavor = mode_str == "flavor"
-        # 모드 → 예상 펌프 주소(소프트웨어 매핑). 식향 2대(1,2) / 향장향 3대(1,2,3). 2026-07-17 확정.
-        expected = [1, 2] if is_flavor else [1, 2, 3]
+        # 모드 → 예상 펌프 주소(소프트웨어 매핑). 식향 2대(1,2) / 향장향 3대(1,2,3) + 서버 설정의 펌프 키
+        #   (향연 4대 · 2026-09-29 — `expected_pump_addrs`).
+        expected = expected_pump_addrs(mode_str, server_settings, hardware_profile)
         found = (
             sorted(set(int(a) for a in known_pump_addrs))
             if known_pump_addrs is not None
@@ -721,7 +724,8 @@ def build_components(
             hardware_source = "cache"
             log.warn(
                 f"하드웨어 선언 — 스냅샷 부재, 캐시 폴백(model={cached.pump_model}·"
-                f"stroke={cached.pump_full_stroke}·ports={cached.valve_port_count}). "
+                f"stroke={cached.pump_full_stroke}·ports={cached.valve_port_count}·"
+                f"pumpAddrs={list(cached.pump_addrs) or '모드 기본'}). "
                 "용량 축은 미확정(모드 기본 가정·용량 가드 OFF) — 네트워크 복구 후 재시작 권장",
                 stage=STAGE_PI_RECEIVED,
             )
@@ -739,7 +743,9 @@ def build_components(
         if _port:
             from ..adapters.pump_model_detect import detect_pump_model as _default_detector
 
-            _expected = [1, 2] if mode == "flavor" else [1, 2, 3]
+            # 향연 4대(2026-09-29) — 모드 기본 ∪ (스냅샷 펌프 키 > 캐시 pumpAddrs). 오프라인 캐시 부팅도 addr 4 를 프로브한다.
+            _expected, _addr_src = expected_pump_addrs_with_source(mode, server_settings, hardware_profile)
+            log.info(f"펌프 프로브 대상 {_expected} (출처={_addr_src})", stage=STAGE_PI_RECEIVED)
             _detector = pump_detector if pump_detector is not None else (
                 lambda p, addrs: _default_detector(p, addrs, logger=log)
             )
@@ -790,6 +796,7 @@ def build_components(
                         sensorium_version=(
                             hardware_profile.sensorium_version if hardware_profile is not None else None
                         ),
+                        pump_addrs=(hardware_profile.pump_addrs if hardware_profile is not None else ()),
                         source="detected",
                     )
                     hardware_source = "detected"
