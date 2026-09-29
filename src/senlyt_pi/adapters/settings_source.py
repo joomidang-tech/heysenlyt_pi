@@ -6,6 +6,8 @@
 (정본 = 서버·단방향). 방어적 이중 clamp: 수신 프리셋도 `core.pump_guard.clamp_pump_preset`
 로 한 번 더 통과시킨다(서버↔pi 바이트-parity 이므로 정상 입력에선 no-op — §11 O-17 결).
 
+(2026-09-29) 부팅 뒤 변경은 `settings_watcher.SettingsWatcher` 가 상시 구독으로 감지해(서버 `settingsHash` 대조) **유휴일 때
+   우아한 재시작**으로 반영한다 — 여전히 핫스왑은 없다(재조립은 재시작 = 이 스냅샷 경로).
 ⚠️ **실시간 스왑 아님 — 부팅 스냅샷 1회**(감사 P2 최소 봉합·2026-07-18). 가동 중 운영자의 admin
    설정(syringeCapacityMl 등) 변경은 **재기동 시** pi 에 반영된다. 상시 SSE settings 구독(진행 중
    제조와 무경합 스왑)은 별도 웨이브(밸브 flowRate SoT 승격과 함께). 부팅 fetch 실패는
@@ -182,6 +184,8 @@ def hardware_profile_from_snapshot(model: str, settings: Any) -> "HardwareProfil
 
     hw = settings.get("hardware") if isinstance(settings, Mapping) else None
     sv = hw.get("sensoriumVersion") if isinstance(hw, Mapping) else None
+    cid = hw.get("contractId") if isinstance(hw, Mapping) else None
+    tuned = pump_tuning_from_settings(settings, model)
     return HardwareProfile(
         pump_model=model,
         pump_full_stroke=full_stroke_from_settings(settings)
@@ -190,6 +194,19 @@ def hardware_profile_from_snapshot(model: str, settings: Any) -> "HardwareProfil
         sensorium_version=str(sv) if sv is not None else None,
         # (2026-09-29) 설정상 펌프 주소 — 오프라인 부팅 프로브 대상(향연 4대). 판정축 아님.
         pump_addrs=tuple(pump_addrs_from_settings(settings)),
+        # (2026-09-29 기기 설정 한 벌) 오프라인 추정 보조축 — 계약 · 용량 · 유효 튠(판정축 아님 · 용량 가드는 켜지 않는다).
+        contract_id=str(cid if cid is not None else sv) if (cid or sv) else None,
+        syringe_capacity_ml=syringe_capacity_from_settings(settings),
+        pump_tuning=(
+            {
+                "pumpMaxStartSpeedHz": tuned.pump_max_start_speed_hz,
+                "pumpMaxTopSpeedHz": tuned.pump_max_top_speed_hz,
+                "pumpMaxCutoffSpeedHz": tuned.pump_max_cutoff_speed_hz,
+                "pumpMaxSlope": tuned.pump_max_slope,
+            }
+            if tuned is not None
+            else None
+        ),
     )
 
 

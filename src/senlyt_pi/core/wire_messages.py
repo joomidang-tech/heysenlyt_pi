@@ -431,6 +431,12 @@ class Heartbeat:
     # 기종 출처(2026-09-14) — "detected"(부팅 실물 지문 자동 인식) | "snapshot"/"cache"(선언) | "undeclared" |
     #   "undetected" | "mixed". admin 이 "자동 인식" 배지와 미확정 사유를 이 값으로 그린다. 부재 = 구버전 pi.
     pump_model_source: "str | None" = None
+    # (2026-09-29 기기 설정 한 벌) 부팅 스냅샷의 AI 계약 id · 서버 설정 해시(되돌려 보냄 — pi 는 계산 안 함) · 프로브한 주소.
+    #   서버가 해시를 지금 값과 대조해 "pi 가 옛 설정으로 돈다"를 관제에 보이고, 프로브 주소로 배정 게이트가 "응답 없음"과
+    #   "프로브 범위 밖"을 가른다. 부재 = 구버전 pi.
+    applied_contract_id: "str | None" = None
+    settings_hash: "str | None" = None
+    probe_addrs: "list[int] | None" = None
     # (선택·2026-08-06 QA "[admin] 튜브필링 UI" 원안) 실행 중 잡 진행 스냅샷
     #   (commandSetId, stepsDone, stepN) — admin 이 "현재 몇 번째 포트인지"를 표시하는 근거.
     #   추가 통신 0(기존 하트비트 편승·유휴면 키 미방출). Sequencer.live_progress 파생.
@@ -454,6 +460,9 @@ class Heartbeat:
         )
         put_if_present(m, "hwCheckedAt", self.hw_checked_at)
         put_if_present(m, "pumpModelSource", self.pump_model_source)
+        put_if_present(m, "appliedContractId", self.applied_contract_id)
+        put_if_present(m, "settingsHash", self.settings_hash)
+        put_if_present(m, "probeAddrs", self.probe_addrs)
         put_if_present(
             m,
             "pumpFingerprints",

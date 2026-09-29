@@ -170,6 +170,20 @@ def _make_pump_model_changed_restart(logger: StructuredLogger, device_id: str) -
     return _restart
 
 
+def _make_settings_changed_restart(logger: StructuredLogger, device_id: str) -> "Callable[[], None]":
+    """기기 설정 변경 정책(2026-09-29) — 유휴 확인된 설정 변경을 재기동으로 반영(부팅 스냅샷 재조립 · 핫스왑 없음)."""
+
+    def _restart() -> None:
+        logger.warn(
+            "기기 설정 변경 — 정상 종료 후 재기동으로 새 설정(AI 계약·용량·튠·펌프 주소)을 조립합니다",
+            stage=STAGE_PI_RECEIVED,
+            device_id=device_id,
+        )
+        os.kill(os.getpid(), signal.SIGTERM)  # 우아한 종료 → systemd Restart=always 재기동.
+
+    return _restart
+
+
 def _install_signal_handlers(daemon: SenlytDaemon, logger: StructuredLogger) -> None:
     """SIGTERM/SIGINT → 우아한 종료 요청(stop 플래그). 비메인스레드/미지원 플랫폼은 무시."""
     import signal
@@ -242,6 +256,25 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         # 부팅 감지가 찾은 응답 주소(2026-09-14) — 2차 스캔 생략(감지 기종·pump_map 동일 관측).
         known_pump_addrs=getattr(components, "detected_pump_addrs", None),
     )
+    # ── 기기 설정 상시 구독(2026-09-29 · adapters/settings_watcher) — 부팅 스냅샷과 다른 설정 해시가 오면 유휴일 때 재기동. ──
+    from ..adapters.settings_watcher import (
+        SettingsWatcher,
+        contract_id_from_settings,
+        settings_hash_from_settings,
+    )
+
+    _boot_snapshot = getattr(components, "server_settings", None)
+    settings_watch: "SettingsWatcher | None" = None
+    _identity = getattr(components, "identity", None)
+    if _identity is not None and getattr(components, "server_config", None) is not None:
+        settings_watch = SettingsWatcher(
+            components.server_config,
+            _identity.dispenser_token,
+            getattr(components, "mode", None) or "flavor",
+            boot_settings_hash=settings_hash_from_settings(_boot_snapshot),
+            logger=logger,
+        )
+        settings_watch.start()
     deps = DaemonDeps(
         device_id=components.device_id,
         command_source=components.command_source,
@@ -283,6 +316,14 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         #   새 기종으로 재조립(핫스왑 없음 · 재발견 재기동과 같은 계약).
         on_pump_model_changed=_make_pump_model_changed_restart(logger, components.device_id),
         hardware_source=getattr(components, "hardware_source", None),
+        settings_watch=settings_watch,
+        on_settings_changed=(
+            _make_settings_changed_restart(logger, components.device_id)
+            if settings_watch is not None
+            else None
+        ),
+        applied_contract_id=contract_id_from_settings(_boot_snapshot),
+        applied_settings_hash=settings_hash_from_settings(_boot_snapshot),
     )
     # ── Undeclared 자가복구(2026-09-02 상태모델 D3) — 선언 미확정 부팅이면 주기 재fetch 스레드. ──
     #   성공(유효 모델 수신) 시 캐시가 기록되고 데몬을 정상 종료시킨다 → systemd Restart=always 가

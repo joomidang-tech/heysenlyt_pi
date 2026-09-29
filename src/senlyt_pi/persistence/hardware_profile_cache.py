@@ -7,10 +7,12 @@
 (2026-09-29) `pumpAddrs` — 스냅샷 `pumpPorts` 키(설정상 펌프 주소 집합)를 **프로브 대상 보조축**으로 함께 남긴다.
   향연(ICAD)은 Tecan 4대라, 오프라인 부팅이 모드 기본 [1,2,3]만 프로브하면 addr 4 가 빠진다. 이 값은 판정축이
   아니다 — 없거나 손상이면 **빈 튜플**(= 모드 기본으로 폴백)이고, 프로파일 자체를 무효로 만들지 않는다(옛 캐시 호환).
-⛔ syringeCapacityMl 은 캐시하지 않는다 — 캐시 부팅에서 용량을 먹이면
-`capacity_from_settings=True` 가 되어 스테일 캐시 vs 봉투 선언 불일치로 전건 오거부가
-된다. 캐시 부팅 = 용량 미확정(모드 기본 0.5 가정·용량 가드 자동 OFF) = 기존 오프라인
-거동과 동일 + WARN.
+(2026-09-29 · 기기 설정 한 벌) `contractId`·`syringeCapacityMl`·`pumpTuning`(유효 v·V·c·L) — 오프라인 부팅의 **추정값**을
+  "모드 기본 0.5·제조사 기본 튠"에서 "마지막으로 받은 이 기기 설정"으로 바꾼다(기기마다 시린지를 바꿀 수 있게 된 뒤 0.5 추정은
+  틀릴 확률이 커졌다). ⛔ 그래도 **용량 가드는 켜지 않는다**(`capacity_from_settings` 는 라이브 스냅샷일 때만 True — R4 P0-1):
+  스테일 캐시 vs 봉투 선언 불일치로 전건 오거부가 되면 안 된다. 셋 다 판정축이 아니라 추정 보조축 — 부재·손상이면 None
+  (종전 폴백)이고 프로파일 자체를 무효로 만들지 않는다(옛 캐시 호환). 온라인이 되면 설정 감시자가 서버 해시와 달라진 것을
+  보고 유휴 재시작으로 라이브 스냅샷에 맞춘다.
 
 - serverBaseUrl 불일치 캐시는 무효 — URL 교체 재설치 시 옛 서버 선언 오용 방지(정체성
   저장과 같은 규약).
@@ -41,6 +43,10 @@ class HardwareProfile:
     source: str = "declared"
     # (2026-09-29) 설정상 펌프 주소(스냅샷 `pumpPorts` 키) — 오프라인 부팅의 프로브 대상 보조축. 빈 튜플 = 모름(모드 기본).
     pump_addrs: tuple[int, ...] = ()
+    # (2026-09-29) 마지막 스냅샷의 AI 계약 · 시린지 용량 · 유효 튠(v·V·c·L) — 오프라인 추정 보조축(위 헤더).
+    contract_id: str | None = None
+    syringe_capacity_ml: float | None = None
+    pump_tuning: "dict[str, int] | None" = None
 
 
 def cache_path(state_dir: str | Path) -> Path:
@@ -61,6 +67,9 @@ def save_profile(state_dir: str | Path, profile: HardwareProfile, server_base_ur
                     "valvePortCount": profile.valve_port_count,
                     "sensoriumVersion": profile.sensorium_version,
                     "pumpAddrs": list(profile.pump_addrs),
+                    "contractId": profile.contract_id,
+                    "syringeCapacityMl": profile.syringe_capacity_ml,
+                    "pumpTuning": profile.pump_tuning,
                     "serverBaseUrl": server_base_url,
                     "savedAt": datetime.now(timezone.utc).isoformat(),
                 },
@@ -103,7 +112,40 @@ def load_profile(state_dir: str | Path, server_base_url: str) -> "HardwareProfil
         valve_port_count=ports,
         sensorium_version=sv if isinstance(sv, str) else None,
         pump_addrs=_parse_pump_addrs(raw.get("pumpAddrs")),
+        contract_id=_parse_contract_id(raw.get("contractId")),
+        syringe_capacity_ml=_parse_capacity(raw.get("syringeCapacityMl")),
+        pump_tuning=_parse_tuning(raw.get("pumpTuning")),
     )
+
+
+_TUNING_KEYS = ("pumpMaxStartSpeedHz", "pumpMaxTopSpeedHz", "pumpMaxCutoffSpeedHz", "pumpMaxSlope")
+
+
+def _parse_contract_id(raw: object) -> "str | None":
+    return raw if isinstance(raw, str) and 0 < len(raw) <= 80 else None
+
+
+def _parse_capacity(raw: object) -> "float | None":
+    """9종 allowlist 밖·손상 = None(모드 기본 폴백). 판정은 pump_guard 정본."""
+    from ..core.pump_guard import resolve_syringe_capacity_ml
+
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    v = resolve_syringe_capacity_ml(raw, is_flavor=True)
+    return v if v == raw else None
+
+
+def _parse_tuning(raw: object) -> "dict[str, int] | None":
+    """네 축이 전부 양의 정수일 때만(반쪽 튠 금지). 범위 clamp 는 어댑터 조립이 한 번 더 한다."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, int] = {}
+    for k in _TUNING_KEYS:
+        v = raw.get(k)
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            return None
+        out[k] = v
+    return out
 
 
 _MAX_PUMP_ADDR = 15  # RS485 주소 1..15(0 = 브로드캐스트). 형식 sanity 만.

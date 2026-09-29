@@ -196,6 +196,13 @@ class DaemonDeps:
     #   (위생 하드락 탈출구 봉쇄 = 현장 방문 전 벽돌)가 된다. 가드는 "서버가 말한 값 vs 서버가
     #   말한 값" 대조일 때만 의미가 있다. False = 무검사(델타 이전과 동일 거동 + 부팅 WARN).
     capacity_from_settings: bool = False
+    # 기기 설정 상시 구독(2026-09-29 · adapters/settings_watcher.SettingsWatcher) — `changed_reason()` 이 사유를 돌려주면
+    #   유휴(제조·세척·대기 큐 없음)일 때 `on_settings_changed` 를 1회 부른다(정책 = senlytd 우아한 재시작). None = 비활성.
+    settings_watch: "Any | None" = None
+    on_settings_changed: Callable[[], None] | None = None
+    # 부팅 스냅샷의 AI 계약·설정 해시(서버 계산값 그대로) — 하트비트로 되돌려 보내 서버가 stale 을 판정한다.
+    applied_contract_id: "str | None" = None
+    applied_settings_hash: "str | None" = None
 
 
 class SenlytDaemon:
@@ -251,6 +258,7 @@ class SenlytDaemon:
         # R8 P1-1 — 재발견 정책 콜백의 1회 발화 래치(30s 주기 감시가 재기동을 연타하지 않게).
         self._pumps_seen_unmapped_fired = False
         self._pump_model_changed_fired = False
+        self._settings_changed_fired = False
         self._pump_model_mismatch_streak = 0  # 유휴 감시에서 "다른 기종" 연속 관측 횟수(2회면 발화).
         self._hb_count = 0
         self._shutdown_lock = threading.Lock()
@@ -1025,12 +1033,41 @@ class SenlytDaemon:
             except Exception:  # noqa: BLE001 — 정책 콜백 실패가 감시 루프를 죽이면 안 된다.
                 self._log.warn("기종 변경 정책 콜백 실패 — 감시 지속", stage=STAGE_PI_RECEIVED)
 
+    def _judge_settings_change(self) -> None:
+        """기기 설정 변경(2026-09-29) — 감시자가 사유를 들고 있고 **유휴**면 정책 콜백 1회(우아한 재시작).
+
+        유휴 = 시퀀서가 쉬고(제조·세척·정비 실행 없음) 로컬 대기 큐가 비었다. 바쁘면 다음 하트비트(10s)에 다시 본다 —
+        진행 중 작업을 선점하지 않는다. 1회 잠금(프로세스 생애) — 콜백이 실패해도 재시작 루프가 되지 않는다.
+        """
+        watch = self.deps.settings_watch
+        if watch is None or self.deps.on_settings_changed is None or self._settings_changed_fired:
+            return
+        try:
+            reason = watch.changed_reason()
+        except Exception:  # noqa: BLE001
+            return
+        if not reason:
+            return
+        if self._sequencer.is_busy or self._sequencer.queue_depth > 0:
+            return
+        self._settings_changed_fired = True
+        self._log.warn(
+            f"{reason} — 유휴 확인, 우아하게 재시작해 새 설정으로 조립합니다",
+            stage=STAGE_PI_RECEIVED,
+            device_id=self.deps.device_id,
+        )
+        try:
+            self.deps.on_settings_changed()
+        except Exception:  # noqa: BLE001 — 정책 콜백 실패가 하트비트를 죽이면 안 된다.
+            self._log.warn("설정 변경 재시작 콜백 실패 — 다음 부팅에 반영", stage=STAGE_PI_RECEIVED)
+
     def _emit_heartbeat(self) -> None:
         """heartbeat 전송(queueDepth 파생) + ship_trace 배치 flush + OQ flush — 전부 best-effort."""
         # 주기 HW 감시(idle 한정) — 첫 비트에 즉시 1회(부팅 ~10s 후 admin 에 실측 도달), 이후 N주기.
         self._hb_count += 1
         if self._hb_count % self.HW_HEALTH_EVERY_N_HEARTBEATS == 1:
             self._refresh_hw_health()
+        self._judge_settings_change()
         hb = self._build_heartbeat()
         try:
             self.deps.status_sink.send_heartbeat(hb)
@@ -1071,6 +1108,11 @@ class SenlytDaemon:
             hw_checked_at=self._hw_checked_at,
             pump_fingerprints=pump_fingerprints,
             pump_model_source=self.deps.hardware_source,
+            # 기기 설정 한 벌(2026-09-29) — 부팅 스냅샷의 계약·해시를 되돌려 보낸다(서버 stale 판정) · 프로브한 주소
+            #   (서버 배정 게이트가 "응답 없음"과 "프로브 범위 밖"을 가른다 — 향연 4펌프 배정 순환 해소).
+            applied_contract_id=self.deps.applied_contract_id,
+            settings_hash=self.deps.applied_settings_hash,
+            probe_addrs=sorted(set(self._sequencer.resolver.pump_map) | set(self.deps.hw_watch_addrs or ())),
         )
 
     def _flush_traces(self) -> None:

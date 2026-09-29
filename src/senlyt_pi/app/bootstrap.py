@@ -46,6 +46,7 @@ from ..adapters.settings_source import (
     expected_pump_addrs_with_source,
     fetch_settings_once,
     full_stroke_from_settings,
+    pump_addrs_from_settings,
     pump_tuning_from_settings,
     syringe_capacity_from_settings,
 )
@@ -504,7 +505,14 @@ def build_resolver(
     를 제공하면 그걸 쓰고(sy01b=RS485 상태쿼리), 없으면(Fake 등) 건너뛴다.
     """
     # 서버 settings 프리셋(부팅 스냅샷) → 용량/스트로크 오버라이드(없으면 None → 모드 기본 폴백).
-    capacity_override = syringe_capacity_from_settings(server_settings)
+    snapshot_capacity = syringe_capacity_from_settings(server_settings)
+    # 오프라인 캐시 부팅(2026-09-29) — 스냅샷이 없으면 마지막으로 받은 이 기기 용량(캐시)을 **추정값**으로 쓴다(모드 기본 0.5
+    #   추정보다 낫다 · 기기마다 시린지를 바꿀 수 있다). ⛔ 용량 가드는 라이브 스냅샷일 때만(아래 _mark — R4 P0-1).
+    capacity_override = (
+        snapshot_capacity
+        if snapshot_capacity is not None
+        else (getattr(hardware_profile, "syringe_capacity_ml", None) if hardware_profile is not None else None)
+    )
     stroke_override = full_stroke_from_settings(server_settings)
     # 캐시 폴백(R-P0-4) — 스냅샷이 stroke 를 못 줬을 때 캐시 stroke 로 pump_map 을 맞춘다
     #   (안 맞추면 tecan 캐시 부팅이 어댑터 3000 vs spec 12000 = 영구 -1001). 용량은 비캐시 원칙.
@@ -527,13 +535,29 @@ def build_resolver(
         #   파생하는 유일한 곳)서 함께 돌려준다. senlytd 가 이 값을 그대로 Dispatcher 가드에
         #   넘기므로 술어를 두 번 계산할 일이 없다 — 두 파일이 손으로 같은 불변식을 유지하다
         #   한쪽만 고쳐져 조용히 어긋나는(=P0-1 부활) 구조를 없앤다.
-        r.capacity_from_settings = capacity_override is not None
+        r.capacity_from_settings = snapshot_capacity is not None
         # 포트 상한 각인(2026-09-02) — RR 2차 게이트가 1..N 으로 판정(§C).
         r.valve_port_count = valve_port_count
         return r
 
     raw = environ.get(SENLYT_PUMP_ADDRESSES_ENV)
     if raw and raw.strip():
+        # env 고정 주소 ↔ AI 계약 펌프 키 불일치 경고(2026-09-29) — env 가 이긴다(고정 구성 호환)지만, 계약이 4펌프(향연)인데
+        #   env 가 1,2,3 이면 4번 펌프 향료가 전부 unmapped drop 된다. 조용히 두지 않고 부팅 로그로 알린다.
+        try:
+            env_addrs = sorted(pump_map_from_addresses_env(raw).keys())
+        except Exception:  # noqa: BLE001 — 형식 오류는 아래 조립이 그대로 보고한다.
+            env_addrs = []
+        snap_addrs = pump_addrs_from_settings(server_settings)
+        if snap_addrs and env_addrs and sorted(set(env_addrs)) != sorted(set(snap_addrs)):
+            import logging as _logging
+
+            _logging.getLogger("senlyt_pi.bootstrap").warning(
+                "PUMP_ADDRESSES env %s ≠ AI 계약 펌프 %s — env 가 이긴다(고정 구성). 계약 펌프 중 env 에 없는 주소의 향료는 "
+                "토출되지 않는다 · env 를 지우거나 계약을 확인하세요",
+                env_addrs,
+                snap_addrs,
+            )
         return _mark(
             RecipeResolver(
                 pump_map_from_addresses_env(
@@ -821,6 +845,19 @@ def build_components(
         if hardware_profile is not None
         else None
     )
+    # 오프라인 캐시 부팅(2026-09-29) — 스냅샷 튠이 없으면 마지막으로 받은 이 기기 튠(캐시)을 쓴다. **캐시 기종 = 조립 기종**일
+    #   때만(감지로 기종이 바뀌었으면 다른 기종 값이 새지 않게 제조사 기본값).
+    if (
+        tuned_preset is None
+        and server_settings is None
+        and hardware_profile is not None
+        and getattr(hardware_profile, "pump_tuning", None)
+    ):
+        from ..core.pump_guard import PUMP_PRESETS as _PP
+        from ..core.pump_guard import apply_pump_tuning as _apt
+
+        if hardware_profile.pump_model in _PP:
+            tuned_preset = _apt(_PP[hardware_profile.pump_model], hardware_profile.pump_tuning)
     engine_adapter = build_engine(
         environ,
         engine=engine,

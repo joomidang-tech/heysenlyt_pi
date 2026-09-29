@@ -460,6 +460,9 @@ class Dispatcher:
         hw_checked_at: str | None = None,
         pump_fingerprints: "dict[int, str] | None" = None,
         pump_model_source: "str | None" = None,
+        applied_contract_id: "str | None" = None,
+        settings_hash: "str | None" = None,
+        probe_addrs: "list[int] | None" = None,
     ) -> Heartbeat:
         """하트비트 조립(§9-3·10s 주기) — queueDepth 는 Sequencer 에서 파생(유휴=0).
         전송(PATCH /api/dispenser/heartbeat)은 StatusSinkPort 어댑터 책임.
@@ -477,6 +480,9 @@ class Dispatcher:
             # 펌프 기종 지문 관측(2026-09-11) — 서버 판정 재료(pi 판정 없음).
             pump_fingerprints=pump_fingerprints,
             pump_model_source=pump_model_source,
+            applied_contract_id=applied_contract_id,
+            settings_hash=settings_hash,
+            probe_addrs=probe_addrs,
             # 실행 중 잡 진행 스냅샷(2026-08-06) — admin "현재 포트" 표시 근거(유휴면 None·키 미방출).
             job_progress=self.sequencer.live_progress,
         )
