@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # hey senlyt pi daemon — 라즈베리파이 1줄 설치·구동 (다운로드부터 자동).
 #
-# 사용 (Pi에서 한 줄) — 스크립트는 **항상 main 의 사본**을 받고, 바꾸는 건 서버 URL 하나뿐:
-#   curl -fsSL https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/main/install.sh \
-#     | sudo bash -s -- https://senlyt.com                 # prod  → 소스 main
-#     | sudo bash -s -- https://dev-env.senlyt.com         # dev   → 소스 dev
-#     | sudo bash -s -- https://v1-3-0.env.senlyt.com      # 프리뷰 → 소스 v1.3.0
+# 사용 (Pi에서 한 줄) — **스크립트와 소스를 같은 REF 에서** 받는다(변수 하나):
+#   REF=v1.4.0; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/$REF/install.sh" \
+#     | sudo env SENLYT_INSTALL_REF=$REF bash -s -- https://senlyt.com            # prod
+#     | sudo env SENLYT_INSTALL_REF=$REF bash -s -- https://dev-env.senlyt.com    # dev
+#     | sudo env SENLYT_INSTALL_REF=$REF bash -s -- https://v1-4-0.env.senlyt.com # 프리뷰
 #
-# 손잡이 3개(2026-09-11 설계 — 이 파일은 브랜치와 무관한 한 벌이라 어느 브랜치의 사본이든 같다):
-#   ① 어느 install.sh 를 받나   = curl URL 경로(평소 main)
+# ⚠️ raw URL 경로를 main 으로 고정하지 않는다 — 이 스크립트도 버전마다 바뀐다(v1.4.0 에서 크게 변경).
+#    main 의 스크립트로 새 버전 소스를 깔면 옛 절차로 설치돼 제대로 뜨지 않는다(2026-09-30 실측).
+#
+# 손잡이 3개:
+#   ① 어느 install.sh 를 받나   = curl URL 경로 — **② 와 같은 REF**
 #   ② 어느 소스를 설치하나      = SENLYT_INSTALL_REF (브랜치·태그·**40자리 전체 커밋 SHA**)
 #                                 없으면 서버 URL 에서 유추(senlyt.com→main · dev-env→dev · vX-Y-Z.env→vX.Y.Z)
+#                                 — 버전 전환기엔 유추가 옛 브랜치를 고르므로 명시를 권장
 #                                 (구 이름 SENLYT_INSTALL_BRANCH 도 같은 뜻의 별칭으로 받는다)
 #   ③ 어느 서버를 보나          = 첫 인자, 또는 SENLYT_SERVER_BASE_URL (인자가 우선)
-#   예) curl -fsSL .../main/install.sh | sudo env SENLYT_INSTALL_REF=test bash -s -- https://senlyt.com
 #
 # 사람이 넣는 건 **서버 URL 하나**뿐. 나머지는 켜진 뒤 자동:
 #   - deviceId  = HW 시리얼 자동수집(RPi4=cpuinfo·RPi5=device-tree)
@@ -42,7 +45,7 @@ SERVICE="/etc/systemd/system/senlytd.service"
 # ── 0. 인자·권한 체크 ──────────────────────────────────────────────────────
 if [ -z "$SERVER_URL" ]; then
 	echo "❌ 서버 URL이 필요합니다." >&2
-	echo "   예: curl -fsSL .../main/install.sh | sudo bash -s -- https://senlyt.com" >&2
+	echo "   예: REF=v1.4.0; curl -fsSL .../heysenlyt_pi/\$REF/install.sh | sudo env SENLYT_INSTALL_REF=\$REF bash -s -- https://senlyt.com" >&2
 	exit 1
 fi
 case "$SERVER_URL" in
