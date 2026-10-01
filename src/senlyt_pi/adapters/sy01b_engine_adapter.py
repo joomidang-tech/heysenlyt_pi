@@ -362,6 +362,10 @@ class Sy01bEngineAdapter:
     # 속도 하한 — SY-01B 는 1 까지 관용, XCalibur 는 50 미만이 err3(명령 폐기)라 50 으로 재선언.
     #   `_speed_cmd` 본문은 공유(복붙 금지 — 부모 공식이 바뀌면 파생도 자동 추종).
     MIN_SPEED_HZ = 1
+    # 1 스텝(위치 단위)을 움직이는 데 드는 속도 펄스 수 — 모션 대기 상한 = 스텝 × 이 값 ÷ 속도. SY-01B 는 1:
+    #   N0 에서 위치·속도가 모두 half-step 단위(SY-01B ASCII 매뉴얼 V1.2 · 6000Hz = 12000 ÷ 6000 = 2초/스트로크).
+    #   Tecan 은 위치=증분 · 속도=반 증분/초라 2(서브클래스 재정의 · XCalibur §3.5.3).
+    MOTION_PULSES_PER_STEP = 1
     # err7(미초기화)을 완료 폴에서 만났을 때 — SY-01B 는 "홈 재탐색 중"이라 계속 폴(v1.1.0 parity),
     #   XCalibur 는 "무모션 즉답 거부"(벤치 실측)라 기다릴 대상이 없어 즉시 실패로 재선언(False).
     ERR7_REHOMES = True
@@ -1493,8 +1497,13 @@ class Sy01bEngineAdapter:
                     return EngineResult(raw_error_code=code, detail=f"valve I{in_port}")
                 # ② 절대 누적 흡입 — 이전 흡입 위에 쌓는다(A{누적steps}).
                 running_total_steps += steps
+                # 상한은 이번 구간(steps)의 물리 주행시간에서 파생 — 40초 고정이면 저속 흡입이 정상 주행 중 실패한다
+                #   (단일 흡입과 같은 규칙 · 매뉴얼 대조 검증 2026-10-01). 빠른 모션은 종전 40초 그대로(하방 0).
                 code = self._settle(
-                    addr, f"{speed_in}A{running_total_steps}R", self.motion_timeout_s, poll=True
+                    addr,
+                    f"{speed_in}A{running_total_steps}R",
+                    self._motion_deadline_s(steps, aspirate_speed_hz),
+                    poll=True,
                 )
                 if code != 0:
                     return EngineResult(raw_error_code=code, detail=f"aspirate A{running_total_steps}")
@@ -1597,8 +1606,11 @@ class Sy01bEngineAdapter:
             #   빈/깨진 즉답을 통과시키고 폴이 판정하던 필드 검증 구조의 미러) — 이 기기의 간헐
             #   프레임 파손(즉답 `C`·`\x07`·무응답)이 즉시 permanent 로 오판되던 것을 봉합.
             speed = self._speed_cmd(None, None)  # 정비 이동도 어댑터 preset(튠 없으면 제조사 기본값 · 둘째 판)의 v·V·c·L — 제조와 같이 느려진다(§_speed_cmd 주석).
+            # 상한 = 최악(풀스트로크)을 preset 최고속도로 주행하는 시간에서 파생 — 40초 고정이면 저속 튠(Tecan V≤150)에서
+            #   정상 주행 중 시간초과로 실패한다(매뉴얼 대조 실행 검증 2026-10-01). 빠른 속도는 종전 40초 그대로.
             code = self._settle(
-                addr, f"{speed}A{target}R", self.motion_timeout_s,
+                addr, f"{speed}A{target}R",
+                self._motion_deadline_s(cmd.spec.pump_full_stroke, None),
                 poll=True, ack_tolerant=True,
             )
             return EngineResult(raw_error_code=code, detail=cmd.op)
@@ -1739,7 +1751,8 @@ class Sy01bEngineAdapter:
         (steps/속도)의 1.5배 + 여유 — 빠른 모션엔 기존 상한이 그대로(하방 0)."""
         top = min(int(top_hz), self.preset.pump_max_top_speed_hz) if top_hz else \
             self.preset.pump_max_top_speed_hz
-        return max(self.motion_timeout_s, steps / max(top, 1) * 1.5 + 5.0)
+        pulses = steps * self.MOTION_PULSES_PER_STEP
+        return max(self.motion_timeout_s, pulses / max(top, 1) * 1.5 + 5.0)
 
     def rotate_valve(
         self, addr: int, target: "int | str", *, out: bool = False,

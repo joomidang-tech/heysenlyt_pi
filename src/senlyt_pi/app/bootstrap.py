@@ -480,9 +480,10 @@ def capacity_block_for(model: "str | None", capacity_ml: "float | None", capacit
         return None
     supported = SUPPORTED_SYRINGE_CAPACITIES_ML.get(str(model), ())
     return (
-        f"시린지 용량 미지원 — 기종 {model} 지원 {list(supported)}mL, "
+        # 매뉴얼상 XCalibur 는 50µL~5mL 를 지원한다(§1.2 · 부록 E) — 목록은 펌프 한계가 아니라 운영이 쓰는 용량이다.
+        f"시린지 용량 운영 사용 목록 밖 — 기종 {model} 사용 {list(supported)}mL, "
         f"실제 {'미확인(저장 안 됨)' if unknown else capacity_ml}mL(출처 {capacity_source}). "
-        "admin 설정에서 실제 시린지 용량을 저장하면 재시작 없이 풀립니다"
+        "관제 설정 > 시린지 펌프 > 펌프 설정에서 실제 용량을 고르고 '저장'을 누르면 재시작 없이 풀립니다"
     )
 
 
@@ -529,7 +530,12 @@ def derive_hot_settings(
     table, strict = alcohol_carrier_rule_from_settings(settings)
     preset = None
     if pump_model in _PP:
-        preset = pump_tuning_from_settings(settings, pump_model) or _PP[pump_model]
+        # 튠 없음 = 그 기종 **제조사 기본값**(부팅 조립 `_build_adapter` 와 같은 규칙 · §6-3a 둘째 판). 종전엔 표 상한
+        #   (Tecan v1000·V6000·c2700·L20)으로 떨어져, 같은 상황에서 부팅은 V1400 · 무재시작 적용은 V6000 이 됐다
+        #   (매뉴얼 대조 검증 2026-10-01 — 6000 은 부록 B.1 힘 보증 5600Hz 도 넘는다).
+        preset = pump_tuning_from_settings(settings, pump_model) or apply_pump_tuning(
+            _PP[pump_model], None
+        )
     return HotSettings(
         pump_map=new_map,
         valve_port_count=valve_port_count_from_settings(settings) or 12,

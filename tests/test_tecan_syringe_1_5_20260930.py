@@ -77,7 +77,7 @@ class TestUnsupportedBlocksMotion:
     def test_tecan_05_is_blocked_with_expected_and_actual(self):
         r = self._resolver(0.5)
         assert r.capacity_block is not None
-        assert "지원 [1.0, 5.0]mL" in r.capacity_block and "실제 0.5mL" in r.capacity_block
+        assert "사용 [1.0, 5.0]mL" in r.capacity_block and "실제 0.5mL" in r.capacity_block
         assert r.capacity_source == "snapshot"
 
     @pytest.mark.parametrize("cap", [1.0, 5.0])

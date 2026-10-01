@@ -111,6 +111,10 @@ class TecanXCaliburEngineAdapter(Sy01bEngineAdapter):
     TERMINATE_CMD = "T"
     # 속도 하한 50 — 부모 `_speed_cmd` 공식이 이 값으로 그대로 돈다(본문 재정의 없음 · 검증 P2).
     MIN_SPEED_HZ = TECAN_MIN_SPEED_HZ
+    # 속도 Hz = **반 증분/초**(매뉴얼 §3.5.3 p.3-37 "Hz (half-increments/second)" · 부록 B.2 Case 1 t = 2·A/V
+    #   — 3000 증분 @900Hz = 6.67초 · S 표 1400Hz = 4.30초/스트로크). 종전 steps/Hz 는 실제 주행시간의 절반이라
+    #   150Hz 미만 풀스트로크가 정상 주행 중 시간초과로 실패했다(매뉴얼 대조 검증 2026-10-01).
+    MOTION_PULSES_PER_STEP = 2
     # err7 = 무모션 즉답 거부(벤치 실측 — "홈 재탐색 중"이 아니다) → 폴에서 즉시 실패.
     ERR7_REHOMES = False
 
