@@ -88,6 +88,11 @@ class Dispatcher:
         logger: "StructuredLogger | None" = None,
         now_s: Callable[[], float] | None = None,
         pump_map: "Mapping[int, SyringeSpec] | None" = None,
+        # (2026-09-30) 기종 지원 목록 밖 용량(Tecan 0.5 등)이면 **모든 모션 거부** 사유 — build_resolver 가 각인한 값.
+        capacity_block: "str | None" = None,
+        capacity_source: "str | None" = None,
+        # (2026-09-30 · 04_erd §9-3) 지금 적용한 설정 해시 공급자 — 봉투의 조립 시점 해시와 다르면 모션 0 거부. None = 무검사.
+        applied_settings_hash: "Callable[[], str | None] | None" = None,
     ) -> None:
         self.device_id = device_id
         self.command_source = command_source
@@ -106,6 +111,22 @@ class Dispatcher:
         #   출처). 봉투/명령이 선언한 조립 전제 용량과 대조해 다르면 거부 — 스냅샷 스테일이
         #   "에러 0 인 채 10~50% 과소토출"로 새던 무성 축을 막는다. 미주입(None)=무검사(하위호환).
         self._pump_map: dict[int, SyringeSpec] = dict(pump_map) if pump_map is not None else {}
+        self._capacity_block = capacity_block
+        self._capacity_source = capacity_source
+        # 마지막 거부의 기대값/실제값(로그 필드) — _capacity_mismatch 가 채우고 _reject_capacity 가 싣는다.
+        self._cap_detail: dict[str, object] = {}
+        self._applied_settings_hash = applied_settings_hash
+
+    def update_capacity(
+        self,
+        pump_map: "Mapping[int, SyringeSpec]",
+        capacity_block: "str | None",
+        capacity_source: "str | None",
+    ) -> None:
+        """핫 적용(2026-09-30 · 04_erd §9-3) — 용량 축 가드를 새 스냅샷 값으로 교체(데몬이 유휴일 때 호출 · 참조 교체라 원자적)."""
+        self._pump_map = dict(pump_map)
+        self._capacity_block = capacity_block
+        self._capacity_source = capacity_source
 
     def _capacity_mismatch(self, declared_ml: float | None) -> "str | None":
         """선언 용량(서버 조립 전제) ↔ 스냅샷 용량 대조 — 불일치면 사유 문자열, 정합/판정불가면 None.
@@ -114,16 +135,54 @@ class Dispatcher:
         선언 부재(구서버)·pump_map 부재(미주입)는 검사하지 않는다 — 가드는 정보가 있을 때만.
         수치는 메시지에 인라인(서버 trace allowlist 는 message 만 통과).
         """
+        if self._capacity_block is not None:
+            self._cap_detail = {
+                "reason": "syringe_unsupported",
+                "declaredMl": declared_ml,
+                "capacitySource": self._capacity_source,
+            }
+            return self._capacity_block
         if declared_ml is None or not self._pump_map:
             return None
         for addr, spec in self._pump_map.items():
             if abs(spec.syringe_capacity_ml - declared_ml) > 1e-6:
+                self._cap_detail = {
+                    "reason": "capacity_mismatch",
+                    "expectedMl": declared_ml,
+                    "actualMl": spec.syringe_capacity_ml,
+                    "pumpAddr": addr,
+                    "capacitySource": self._capacity_source,
+                }
                 return (
                     f"용량 축 불일치 — 서버 조립 전제 {declared_ml}mL ≠ 기기 스냅샷 "
                     f"{spec.syringe_capacity_ml}mL(addr {addr}). 볼륨→스텝 환산이 갈려 무성 "
-                    "과소/과다 토출이 되므로 거부. admin 용량 변경 후 senlytd 재시작 필요"
+                    "과소/과다 토출이 되므로 거부(용량 변경은 기기가 유휴일 때 재시작 없이 반영된다 — 반영 후 다시 발행)"
                 )
         return None
+
+    def _settings_mismatch(self, envelope_hash: "str | None") -> "str | None":
+        """봉투 조립 시점 설정 해시 ↔ 지금 적용한 해시 대조(2026-09-30) — 다르면 사유. 어느 한쪽이라도 없으면 검사하지 않는다.
+
+        설정 변경 전에 큐에 들어간 봉투가 새 통 배치·용량으로 실행되는 것을 막는다(예: 포트 액체를 서로 바꾼 뒤 옛 봉투가 엉뚱한
+        향료를 흡입). 거부는 용량 거부와 같은 종단(모션 0 · CMD_VALIDATION_FAILED) — 운영자는 반영 뒤 재발행한다.
+        """
+        if not envelope_hash or self._applied_settings_hash is None:
+            return None
+        try:
+            applied = self._applied_settings_hash()
+        except Exception:  # noqa: BLE001
+            return None
+        if not applied or applied == envelope_hash:
+            return None
+        self._cap_detail = {
+            "reason": "settings_changed_since_dispatch",
+            "expectedHash": envelope_hash,
+            "actualHash": applied,
+        }
+        return (
+            f"[settings_changed_since_dispatch] 봉투 조립 뒤 기기 설정이 바뀌었습니다(조립 {envelope_hash} ≠ 적용 {applied}) — "
+            "옛 설정으로 조립된 봉투라 실행하지 않습니다(반영 후 다시 발행)"
+        )
 
     def _reject_capacity(self, command_id: str, trace_id: str | None, why: str) -> JobReport:
         """용량 불일치 거부 — 물리 실행 0·정직한 실패(CMD_VALIDATION_FAILED)·**관측 가능 종단**.
@@ -133,9 +192,12 @@ class Dispatcher:
         DUPLICATE 로 접힌다(재거부 소음 0). 사유(수치 인라인)는 WARN 으로 남긴다.
         """
         if self._log is not None:
+            # 기대값/실제값을 필드로 싣는다(2026-09-30) — 메시지 인라인 수치와 같은 값, Cloud Logging 필터용.
+            detail = dict(self._cap_detail)
             self._log.warn(
-                why, stage=STAGE_ERROR, trace_id=trace_id, command_id=command_id,
+                why, stage=STAGE_ERROR, trace_id=trace_id, command_id=command_id, **detail,
             )
+        self._cap_detail = {}
         report = self.sequencer.reject_before_motion(
             command_id=command_id,
             trace_id=trace_id or "",
@@ -352,7 +414,9 @@ class Dispatcher:
             # ── 용량 축 fail-closed(2026-09-02) — 선언 용량 ≠ 스냅샷 용량이면 물리 실행 0. ──
             #   제조·정비(세척 포함) 공통: 볼륨(µL)→스텝 환산이 갈린 봉투는 무성 과소/과다라
             #   실행 전에 정직하게 FAILED 로 종단한다(운영자 조치 = 재시작 후 재발행).
-            cap_mismatch = self._capacity_mismatch(cs.syringe_capacity_ml)
+            cap_mismatch = self._capacity_mismatch(cs.syringe_capacity_ml) or self._settings_mismatch(
+                cs.settings_hash
+            )
             if cap_mismatch is not None:
                 report = self._reject_capacity(cs.command_set_id, cs.trace_id, cap_mismatch)
                 # 재전달 중복(이미 거부 종단됨)은 조용히 접는다 — FAILED 재전이는 최초 1회만.
@@ -462,6 +526,7 @@ class Dispatcher:
         pump_model_source: "str | None" = None,
         applied_contract_id: "str | None" = None,
         settings_hash: "str | None" = None,
+        settings_applied: "bool | None" = None,
         probe_addrs: "list[int] | None" = None,
     ) -> Heartbeat:
         """하트비트 조립(§9-3·10s 주기) — queueDepth 는 Sequencer 에서 파생(유휴=0).
@@ -482,6 +547,7 @@ class Dispatcher:
             pump_model_source=pump_model_source,
             applied_contract_id=applied_contract_id,
             settings_hash=settings_hash,
+            settings_applied=settings_applied,
             probe_addrs=probe_addrs,
             # 실행 중 잡 진행 스냅샷(2026-08-06) — admin "현재 포트" 표시 근거(유휴면 None·키 미방출).
             job_progress=self.sequencer.live_progress,

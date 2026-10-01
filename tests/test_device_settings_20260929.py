@@ -1,9 +1,9 @@
 """기기 설정 한 벌(2026-09-29) — pi 측: 상시 설정 구독 · 유휴 재시작 · 하트비트 settingsHash · 캐시 확장 · 서버 parity.
 
 잠그는 것:
-  ① SettingsWatcher — 부팅 해시와 다른 해시 프레임이 오면 사유를 든다 · 같은 해시·해시 없는 프레임(구 서버)은 무시 ·
-     부팅 때 스냅샷이 없었으면 첫 해시 프레임이 곧 변경.
-  ② 데몬 — 사유가 있어도 **바쁘면**(제조·세척 실행 / 대기 큐) 재시작하지 않고, 유휴가 되면 정책 콜백 1회.
+  ① SettingsWatcher — 적용 해시와 다른 해시 프레임이 오면 적용 대기 · 같은 해시·해시 없는 프레임(구 서버)은 무시 ·
+     부팅 때 스냅샷이 없었으면 첫 해시 프레임이 곧 대기. (2026-09-30 재시작 없는 적용 = test_settings_hot_apply_20260930)
+  ② (폐기 2026-09-30) 유휴 재시작 — 설정 변경은 재시작하지 않는다.
   ③ 하트비트 — appliedContractId · settingsHash(되돌려 보냄) · probeAddrs(프로브한 주소) 방출.
   ④ 오프라인 캐시 — 계약 · 용량 · 유효 튠을 저장·복원(손상 = None · 옛 캐시 호환).
   ⑤ 서버↔pi 스냅샷 parity — web `__tests__/lib/server/deviceProfile.test.ts` SNAPSHOT_PARITY_VECTORS 와 리터럴 동일.
@@ -46,24 +46,26 @@ def _frame(h: "str | None", contract: str = "sensorium-fragrance-1.0.0") -> dict
 
 
 class TestSettingsWatcher:
-    def test_same_hash_or_no_hash_is_not_a_change(self):
+    """(2026-09-30 무재시작 단일 규칙) 해시가 적용 값과 다르면 적용 대기 — 재시작 사유는 더 없다(test_settings_hot_apply 참고)."""
+
+    def test_same_hash_or_no_hash_is_not_pending(self):
         w = SettingsWatcher(_cfg(), "t", "fragrance", boot_settings_hash="aaaaaaaa11111111")
         w.observe(_frame("aaaaaaaa11111111"))
         w.observe(_frame(None))  # 구 서버 프레임 — 비교 안 함
-        assert w.changed_reason() is None
+        assert w.pending_settings() is None
 
-    def test_different_hash_sets_reason_once(self):
+    def test_different_hash_is_pending(self):
         w = SettingsWatcher(_cfg(), "t", "fragrance", boot_settings_hash="aaaaaaaa11111111")
-        w.observe(_frame("bbbbbbbb22222222", "sensorium-icad-0.1.0"))
-        r = w.changed_reason()
-        assert r is not None and "bbbbbbbb22222222" in r and "sensorium-icad-0.1.0" in r
-        w.observe(_frame("cccccccc33333333"))
-        assert w.changed_reason() == r  # 첫 사유 유지(재시작은 한 번)
+        f = _frame("bbbbbbbb22222222", "sensorium-icad-0.1.0")
+        w.observe(f)
+        assert w.pending_settings() is f
+        w.mark_applied(f)
+        assert w.pending_settings() is None and w.applied_settings_hash() == "bbbbbbbb22222222"
 
-    def test_boot_without_snapshot_first_hash_is_change(self):
+    def test_boot_without_snapshot_first_hash_is_pending(self):
         w = SettingsWatcher(_cfg(), "t", "fragrance", boot_settings_hash=None)
         w.observe(_frame("aaaaaaaa11111111"))
-        assert w.changed_reason() is not None
+        assert w.pending_settings() is not None
 
     def test_run_once_reads_stream_frames(self):
         class _S:
@@ -77,20 +79,16 @@ class TestSettingsWatcher:
             _cfg(), "t", "fragrance", boot_settings_hash="aaaaaaaa11111111", open_stream=lambda *a, **k: _S()
         )
         assert w.run_once() is True
-        assert w.changed_reason() is not None
+        assert w.pending_settings() is not None
 
     def test_readers(self):
         assert settings_hash_from_settings({"settingsHash": "NOT-HEX"}) is None
         assert contract_id_from_settings({"hardware": {"sensoriumVersion": "x+tecan"}}) == "x+tecan"
 
 
-def _daemon(*, reason: "str | None", busy: bool, fired: list):
+def _daemon():
     from senlyt_pi.app.daemon import DaemonDeps, SenlytDaemon
     from senlyt_pi.persistence.idempotency_ledger import InMemoryIdempotencyLedger
-
-    class _Watch:
-        def changed_reason(self):
-            return reason
 
     class _Sink:
         last = None
@@ -110,37 +108,16 @@ def _daemon(*, reason: "str | None", busy: bool, fired: list):
             ledger=InMemoryIdempotencyLedger(),  # type: ignore[arg-type]
             heartbeat_interval_s=0,
             hw_watch_addrs=(1, 2, 3),
-            settings_watch=_Watch(),
-            on_settings_changed=lambda: fired.append(1),
             applied_contract_id="sensorium-fragrance-1.0.0",
             applied_settings_hash="aaaaaaaa11111111",
         )
     )
-    if busy:
-        d._sequencer._busy = True  # noqa: SLF001 — 제조·세척 실행 중
     return d, _Sink
 
 
-class TestIdleRestart:
-    def test_busy_waits_then_idle_restarts_once(self):
-        fired: list = []
-        d, _ = _daemon(reason="기기 설정 변경", busy=True, fired=fired)
-        d._emit_heartbeat()
-        assert fired == []  # 바쁘면 기다린다
-        d._sequencer._busy = False  # noqa: SLF001
-        d._emit_heartbeat()
-        d._emit_heartbeat()
-        assert fired == [1]  # 유휴 → 1회
-
-    def test_no_reason_no_restart(self):
-        fired: list = []
-        d, _ = _daemon(reason=None, busy=False, fired=fired)
-        d._emit_heartbeat()
-        assert fired == []
-
+class TestHeartbeat:
     def test_heartbeat_carries_contract_hash_probe_addrs(self):
-        fired: list = []
-        d, sink = _daemon(reason=None, busy=False, fired=fired)
+        d, sink = _daemon()
         d._emit_heartbeat()
         j = sink.last.to_json()
         assert j["appliedContractId"] == "sensorium-fragrance-1.0.0"

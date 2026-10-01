@@ -108,6 +108,8 @@ class CommandSet:
     #   dispatcher 가 부팅 스냅샷 pump_map 용량과 대조해 다르면 CMD_VALIDATION_FAILED.
     #   부재=구서버 하위호환(무검사). stroke 축 -1001(_axis_guard)의 짝이 되는 용량 축 가드.
     syringe_capacity_ml: float | None = None
+    # (2026-09-30 · 04_erd §9-3) 봉투 조립 시점의 기기 설정 해시 — 지금 적용한 해시와 다르면 모션 0 거부. 부재 = 구 서버(무검사).
+    settings_hash: "str | None" = None
 
     @staticmethod
     def from_json(j: Mapping[str, Any]) -> "CommandSet":
@@ -157,6 +159,7 @@ class CommandSet:
             error_code=StatusErrorCode.from_wire(j.get("errorCode")),
             updated_at=j.get("updatedAt"),
             syringe_capacity_ml=_optional_float(j.get("syringeCapacityMl")),
+            settings_hash=j.get("settingsHash") if isinstance(j.get("settingsHash"), str) else None,
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -175,6 +178,7 @@ class CommandSet:
         put_if_present(m, "traceId", self.trace_id)
         put_if_present(m, "errorCode", self.error_code.wire if self.error_code else None)
         put_if_present(m, "syringeCapacityMl", self.syringe_capacity_ml)  # 왕복 대칭(R4 P3).
+        put_if_present(m, "settingsHash", self.settings_hash)
         put_if_present(m, "updatedAt", self.updated_at)
         return m
 

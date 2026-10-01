@@ -436,6 +436,9 @@ class Heartbeat:
     #   "프로브 범위 밖"을 가른다. 부재 = 구버전 pi.
     applied_contract_id: "str | None" = None
     settings_hash: "str | None" = None
+    # (2026-09-30) 설정 구독 중인데 아직 적용한 설정이 없으면(부팅 때 스냅샷 없음) False — 서버가 제조를 보류한다(해시 부재와
+    #   구 pi 를 가른다). 적용한 해시가 있으면 키 미방출.
+    settings_applied: "bool | None" = None
     probe_addrs: "list[int] | None" = None
     # (선택·2026-08-06 QA "[admin] 튜브필링 UI" 원안) 실행 중 잡 진행 스냅샷
     #   (commandSetId, stepsDone, stepN) — admin 이 "현재 몇 번째 포트인지"를 표시하는 근거.
@@ -462,6 +465,7 @@ class Heartbeat:
         put_if_present(m, "pumpModelSource", self.pump_model_source)
         put_if_present(m, "appliedContractId", self.applied_contract_id)
         put_if_present(m, "settingsHash", self.settings_hash)
+        put_if_present(m, "settingsApplied", self.settings_applied)
         put_if_present(m, "probeAddrs", self.probe_addrs)
         put_if_present(
             m,

@@ -43,7 +43,7 @@ from typing import Callable, Sequence
 from ..core.order_status import DispensePhase
 from ..core.pump_guard import EngineErrorClass, StatusErrorCode, classify_engine_error_code
 from ..core.wire_messages import RecipeStep
-from ..obs.log import STAGE_STEP_EXEC, StructuredLogger
+from ..obs.log import STAGE_DISPENSE_DONE, STAGE_ERROR, STAGE_STEP_EXEC, StructuredLogger
 from ..persistence.file_idempotency_ledger import FileIdempotencyLedger
 from ..persistence.idempotency_ledger import LedgerVerdict
 from ..ports.engine_port import (
@@ -128,6 +128,49 @@ class _PendingJob:
     report: JobReport | None = field(default=None)
 
 
+def _split_command_id(command_id: str) -> "tuple[str | None, int | None]":
+    """합성키 `{orderId}:{attempt}` → (orderId, attempt). 정비 봉투 등 다른 꼴이면 (None, None)."""
+    head, sep, tail = command_id.rpartition(":")
+    if sep and head and tail.isdigit():
+        return head, int(tail)
+    return None, None
+
+
+def recipe_plan(resolved) -> "list[dict[str, object]]":  # ResolvedRecipe
+    """제조 계획 요약 — 펌프별 [포트 → 향료 id, µL, 스텝] (로그용 · 2026-09-30). 밸브·정비 op 는 제외(별도 개수)."""
+    out: list[dict[str, object]] = []
+    for st in resolved.steps:
+        if isinstance(st, ResolvedBatchStep):
+            for a in st.aspirations:
+                out.append(
+                    {"pump": st.pump_addr, "port": a.in_port, "liquid": a.flavor,
+                     "ul": round(a.volume_ul, 4), "steps": a.steps, "stage": st.stage}
+                )
+        elif isinstance(st, ResolvedStep):
+            out.append(
+                {"pump": st.pump_addr, "port": st.in_port, "liquid": st.flavor,
+                 "ul": round(st.volume_ul, 4), "steps": st.steps, "stage": st.stage}
+            )
+    return out
+
+
+def plan_error_ul(resolved) -> "tuple[float, float]":  # ResolvedRecipe
+    """(계획 µL 합, 명령 스텝 역산 µL 합) — 스텝 해상도로 생기는 총량 오차 관측용."""
+    planned = 0.0
+    commanded = 0.0
+    for st in resolved.steps:
+        if isinstance(st, ResolvedBatchStep):
+            per = 1000.0 / st.spec.steps_per_ml  # µL/step
+            for a in st.aspirations:
+                planned += a.volume_ul
+                commanded += a.steps * per
+        elif isinstance(st, ResolvedStep):
+            per = 1000.0 / st.spec.steps_per_ml
+            planned += st.volume_ul
+            commanded += st.steps * per
+    return round(planned, 4), round(commanded, 4)
+
+
 class PumpSequencer:
     """Pump Sequencer — 동시 1제조 큐잉 오케스트레이터."""
 
@@ -186,6 +229,9 @@ class PumpSequencer:
         self._estop = estop_event if estop_event is not None else threading.Event()
         # estop 해제 레이스 유예(모듈 상수 기본·테스트 오버라이드 가능) — 물리 시작 전 한정.
         self.estop_clear_grace_s = ESTOP_CLEAR_GRACE_S
+        # 제조 요약 로그의 고정 문맥(2026-09-30) — 데몬이 부팅 때 채운다(AI 계약 · 설정 해시 · 용량 · 풀스트로크 · 스텝 모드 ·
+        #   용량 출처). 비면 그 필드를 싣지 않는다.
+        self.log_context: dict[str, object] = {}
 
     @property
     def is_busy(self) -> bool:
@@ -277,6 +323,11 @@ class PumpSequencer:
             self._publish(
                 DispensePhase.FAILED, 0, 0, e.error_code, job.command_id, job.trace_id
             )
+            # 거부 요약(2026-09-30 · WARN = Cloud Logging) — 사유 코드와 어느 펌프·얼마(µL)였나.
+            self._log_job(
+                "warn", "제조 거부 — 레시피 검증 실패(토출 0)", job,
+                reason=e.reason, errorCode=e.error_code.value, pumpAddr=e.pump_addr, volumeUl=e.volume_ul,
+            )
             return JobReport(
                 command_id=job.command_id,
                 outcome=JobOutcome.VALIDATION_FAILED,
@@ -318,8 +369,25 @@ class PumpSequencer:
         # 진행 스냅샷 시작 — 하트비트가 (command_id, 0/N)부터 실어 나른다(2026-08-06).
         self._live_progress = (job.command_id, 0, step_n)
         steps_done = 0
+        # 제조 시작 요약(2026-09-30 · INFO 1줄) — 무엇을 어느 펌프·포트로 얼마(µL·스텝) 내나. 향료 id 는 카탈로그 id(비-PII).
+        plan: "list[dict[str, object]]" = []
+        planned_ul = commanded_ul = 0.0
+        t0 = time.monotonic()
+        report: "JobReport | None" = None
         try:
-            return self._run_stages(job, reporter, resolved, step_n)
+            #   요약 계산도 try 안 — 계산이 던져도 ledger 종결(아래 except)·스냅샷 해제(finally)가 돈다(리뷰 P3).
+            plan = recipe_plan(resolved)
+            planned_ul, commanded_ul = plan_error_ul(resolved)
+            strokes = sum(
+                1 for st in resolved.steps if isinstance(st, (ResolvedBatchStep, ResolvedStep))
+            )
+            self._log_job(
+                "info", "제조 시작 요약", job,
+                stageCount=len(resolved.stages), stepN=step_n, strokes=strokes,
+                plan=plan, plannedUl=planned_ul, commandedUl=commanded_ul,
+            )
+            report = self._run_stages(job, reporter, resolved, step_n)
+            return report
         except Exception:
             # 방어(리뷰 P2): 어떤 예기치 못한 예외에도 ledger 를 반드시 종결(미정착 RUNNING 금지).
             try:
@@ -340,6 +408,28 @@ class PumpSequencer:
         finally:
             # 잡 종결(성공/실패/예외 불문) — 스냅샷 해제(유휴 하트비트에 잔상 금지).
             self._live_progress = None
+            # 제조 종료 요약(2026-09-30 · INFO/WARN 1줄) — 결과·총 소요·계획 µL 대비 명령 스텝 역산 µL(해상도 오차).
+            outcome = report.outcome.value if report is not None else JobOutcome.PARTIAL_FAILED.value
+            ok = report is not None and report.outcome is JobOutcome.COMPLETED
+            self._log_job(
+                "info" if ok else "warn",
+                "제조 종료 요약" if ok else "제조 종료 요약 — 실패",
+                job,
+                outcome=outcome,
+                errorCode=(
+                    report.error_code.value
+                    if report is not None and report.error_code is not None
+                    else (None if ok else StatusErrorCode.PARTIAL_DISPENSE.value)
+                ),
+                stepsDone=report.steps_done if report is not None else None,
+                stepN=step_n,
+                stageCount=len(resolved.stages),
+                totalSteps=sum(int(p["steps"]) for p in plan),
+                totalMs=int((time.monotonic() - t0) * 1000),
+                plannedUl=planned_ul,
+                commandedUl=commanded_ul,
+                errorUl=round(commanded_ul - planned_ul, 4),
+            )
 
     def _run_stages(
         self,
@@ -443,6 +533,32 @@ class PumpSequencer:
             steps_done=steps_done,
             step_n=step_n,
         )
+
+    def _log_job(self, level: str, message: str, job: _PendingJob, **fields: object) -> None:
+        """제조 요약 로그 1줄 — 합성키에서 orderId·attempt 를 풀고 부팅 문맥(log_context)을 붙인다. 로그 실패는 삼킨다."""
+        if self._log is None:
+            return
+        order_id, attempt = _split_command_id(job.command_id)
+        payload: dict[str, object] = {
+            k: v for k, v in self.log_context.items() if v is not None
+        }
+        payload.update({k: v for k, v in fields.items() if v is not None})
+        try:
+            stage = STAGE_DISPENSE_DONE if level == "info" and "outcome" in fields else (
+                STAGE_ERROR if level == "warn" else STAGE_STEP_EXEC
+            )
+            fn = getattr(self._log, level)
+            fn(
+                message,
+                stage=stage,
+                trace_id=job.trace_id or None,
+                order_id=order_id,
+                command_set_id=job.command_id,
+                attempt=attempt,
+                **payload,
+            )
+        except Exception:  # noqa: BLE001 — 관측이 제조를 막지 않는다.
+            pass
 
     def _await_estop_clear(self) -> bool:
         """estop 래치 해제를 짧게 대기(해제 레이스 유예) — True = 해제 확인(정상 진행).

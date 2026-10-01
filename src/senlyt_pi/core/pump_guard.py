@@ -77,6 +77,28 @@ VALID_SYRINGE_CAPACITIES_ML: frozenset[float] = frozenset(
 )
 
 
+# 기종별 **지원** 시린지 용량(mL) — 서버 pumpGuard.ts `SYRINGE_CAPACITY_OPTIONS_BY_MODEL` 과 같은 값(2026-09-30 사용자 확정:
+#   Tecan XCalibur = 1mL·5mL 만 · SY-01B = 종전 9종). 위 합집합(VALID_…)은 값 형식 검증용이고, 모션 허용 여부는 이 표로 본다.
+SUPPORTED_SYRINGE_CAPACITIES_ML: dict[str, tuple[float, ...]] = {
+    "sy01b": (0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 1.25, 2.5, 5.0),
+    "tecan_xcalibur": (1.0, 5.0),
+}
+
+
+# 용량을 **명시 저장해야** 하는 기종 — 모드 기본 추정(0.5)이 그 기종 지원 목록 밖이라 추정으로는 돌 수 없다(web
+#   `requiresExplicitSyringeCapacity` 와 같은 집합). SY-01B 는 추정 0.5 가 지원 목록 안이라 종전대로 돈다.
+REQUIRES_EXPLICIT_SYRINGE_CAPACITY: frozenset[str] = frozenset({"tecan_xcalibur"})
+
+
+def is_supported_syringe_capacity(model: str | None, capacity_ml: float | None) -> bool:
+    """이 기종이 이 용량을 지원하나 — 모르는 기종은 판정하지 않는다(True · 종전 거동). 용량 None = 모름(False)."""
+    if model is None or model not in SUPPORTED_SYRINGE_CAPACITIES_ML:
+        return True
+    if capacity_ml is None:
+        return False
+    return any(abs(capacity_ml - v) < 1e-9 for v in SUPPORTED_SYRINGE_CAPACITIES_ML[model])
+
+
 def _round_half_up(x: float) -> int:
     """round = half-up(.5 올림 · 양수 도메인 JS Math.round 등가) — 부록A P-8. 내장 round() 금지."""
     return math.floor(x + 0.5)

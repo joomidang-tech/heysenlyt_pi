@@ -171,15 +171,11 @@ def _make_pump_model_changed_restart(logger: StructuredLogger, device_id: str) -
 
 
 def _make_settings_changed_restart(logger: StructuredLogger, device_id: str) -> "Callable[[], None]":
-    """기기 설정 변경 정책(2026-09-29) — 유휴 확인된 설정 변경을 재기동으로 반영(부팅 스냅샷 재조립 · 핫스왑 없음)."""
+    """기기 설정 변경 정책(2026-09-30 · 04_erd §9-3) — **펌프 기종·펌프 주소 집합**이 바뀐 설정만 재기동으로 반영한다
+    (어댑터 재조립 = 부팅 조립). 그 밖의 설정은 데몬이 재시작 없이 적용한다. 호출은 데몬이 유휴일 때 1회."""
 
     def _restart() -> None:
-        logger.warn(
-            "기기 설정 변경 — 정상 종료 후 재기동으로 새 설정(AI 계약·용량·튠·펌프 주소)을 조립합니다",
-            stage=STAGE_PI_RECEIVED,
-            device_id=device_id,
-        )
-        os.kill(os.getpid(), signal.SIGTERM)  # 우아한 종료 → systemd Restart=always 재기동.
+        os.kill(os.getpid(), signal.SIGTERM)  # 우아한 종료 → systemd Restart=always 재기동(로그는 데몬이 남긴다).
 
     return _restart
 
@@ -256,7 +252,16 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         # 부팅 감지가 찾은 응답 주소(2026-09-14) — 2차 스캔 생략(감지 기종·pump_map 동일 관측).
         known_pump_addrs=getattr(components, "detected_pump_addrs", None),
     )
-    # ── 기기 설정 상시 구독(2026-09-29 · adapters/settings_watcher) — 부팅 스냅샷과 다른 설정 해시가 오면 유휴일 때 재기동. ──
+    # 용량 판정 결과(2026-09-30) — 기종 지원 목록 밖이면 부팅 때 한 번 WARN(모든 모션 거부 · Cloud Logging 에 뜬다).
+    if getattr(resolver, "capacity_block", None):
+        logger.warn(
+            f"부팅 자가진단 — {resolver.capacity_block}",
+            stage=STAGE_ERROR,
+            reason="syringe_unsupported",
+            capacityMl=getattr(resolver, "capacity_ml", None),
+            capacitySource=getattr(resolver, "capacity_source", None),
+        )
+    # ── 기기 설정 상시 구독(adapters/settings_watcher) — 설정 해시가 바뀌면 유휴일 때 **재시작 없이** 적용 후 새 해시 보고. ──
     from ..adapters.settings_watcher import (
         SettingsWatcher,
         contract_id_from_settings,
@@ -272,9 +277,22 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
             _identity.dispenser_token,
             getattr(components, "mode", None) or "flavor",
             boot_settings_hash=settings_hash_from_settings(_boot_snapshot),
+            boot_settings=_boot_snapshot,
             logger=logger,
         )
         settings_watch.start()
+    # 설정 무재시작 적용 재료(2026-09-30 · 04_erd §9-3) — 기종·주소 변경만 재시작(아래 on_settings_changed).
+    from .bootstrap import SettingsHotApplyEnv
+
+    hot_env = (
+        SettingsHotApplyEnv(
+            environ,
+            mode=getattr(components, "mode", None),
+            server_base_url=components.server_config.base_url,
+        )
+        if settings_watch is not None
+        else None
+    )
     deps = DaemonDeps(
         device_id=components.device_id,
         command_source=components.command_source,
@@ -286,6 +304,9 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         # 용량 축 가드 활성(R4 P0-1·R4.5 P2-A) — 출처 판정은 용량을 파생한 build_resolver 가
         #   각인한 값을 그대로 쓴다(재계산 금지 — 두 곳 계산이 어긋나면 P0-1 이 부활한다).
         capacity_from_settings=resolver.capacity_from_settings,
+        # 기종 지원 목록 밖 용량 거부(2026-09-30) — build_resolver 가 각인한 사유 그대로(None = 통과).
+        capacity_block=getattr(resolver, "capacity_block", None),
+        capacity_source=getattr(resolver, "capacity_source", None),
         commandset_source=components.command_source,  # 동일 SSE 어댑터가 두 축 제공.
         # 주기 HW 감시 기대 주소(실시간 판단·2026-07-19) — 부팅 인식이 비어도 이 주소들을 계속
         #   프로브해 pumpHealth 로 보고(어댑터 미장착 = silent 빨강, USB 꽂히면 ok 초록 자동 전환).
@@ -317,6 +338,7 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         on_pump_model_changed=_make_pump_model_changed_restart(logger, components.device_id),
         hardware_source=getattr(components, "hardware_source", None),
         settings_watch=settings_watch,
+        settings_hot_apply=hot_env,
         on_settings_changed=(
             _make_settings_changed_restart(logger, components.device_id)
             if settings_watch is not None
@@ -339,6 +361,7 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
             fetch_settings_once,
             hardware_profile_from_snapshot,
             pump_model_from_settings,
+            snapshot_settings_confirmed,
         )
         from ..persistence.hardware_profile_cache import save_profile
         from .bootstrap import SENLYT_STATE_DIR_ENV
@@ -381,7 +404,8 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
                     snap = None
                 model = pump_model_from_settings(snap)
                 if model is not None:
-                    if state_dir:  # 명시 상태 경로에서만 캐시(무설정 = cwd 오염 방지·bootstrap 동일).
+                    # 명시 상태 경로에서만 캐시(무설정 = cwd 오염 방지·bootstrap 동일) · 확정 설정만(2026-09-30 · bootstrap 동일).
+                    if state_dir and snapshot_settings_confirmed(snap):
                         # 조립 규칙은 헬퍼가 SoT(R6.5 M3) — bootstrap 스냅샷 경로와 바이트 동일 프로파일.
                         save_profile(
                             state_dir,

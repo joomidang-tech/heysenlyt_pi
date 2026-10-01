@@ -976,6 +976,14 @@ class Sy01bEngineAdapter:
             self._initialized.add(addr)
         return code
 
+    def reinitialize(self, addr: int, spec: SyringeSpec) -> int:
+        """한 펌프를 새 시린지 스펙으로 즉시 재초기화(2026-09-30 핫 적용) — 셋업 캐시를 비우고 `_ensure_ready`(TR→셋업→Z)를 돈다.
+
+        시린지 용량이 바뀌면 초기화 힘(매뉴얼 표 3-6)이 달라진다. 설정 핫 적용이 유휴일 때 부른다 — 반환 = error_code(0 = 성공).
+        """
+        self._initialized.discard(addr)
+        return self._ensure_ready(addr, spec)
+
     def initialize(self) -> EngineResult:
         """셋업 캐시 무효화 — 다음 토출 때 그 펌프에 다시 `TR`+`U200`+`Z` 를 건다.
 

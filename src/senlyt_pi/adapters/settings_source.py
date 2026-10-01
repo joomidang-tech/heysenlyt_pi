@@ -6,11 +6,9 @@
 (정본 = 서버·단방향). 방어적 이중 clamp: 수신 프리셋도 `core.pump_guard.clamp_pump_preset`
 로 한 번 더 통과시킨다(서버↔pi 바이트-parity 이므로 정상 입력에선 no-op — §11 O-17 결).
 
-(2026-09-29) 부팅 뒤 변경은 `settings_watcher.SettingsWatcher` 가 상시 구독으로 감지해(서버 `settingsHash` 대조) **유휴일 때
-   우아한 재시작**으로 반영한다 — 여전히 핫스왑은 없다(재조립은 재시작 = 이 스냅샷 경로).
-⚠️ **실시간 스왑 아님 — 부팅 스냅샷 1회**(감사 P2 최소 봉합·2026-07-18). 가동 중 운영자의 admin
-   설정(syringeCapacityMl 등) 변경은 **재기동 시** pi 에 반영된다. 상시 SSE settings 구독(진행 중
-   제조와 무경합 스왑)은 별도 웨이브(밸브 flowRate SoT 승격과 함께). 부팅 fetch 실패는
+(2026-09-30) 부팅 뒤 변경은 `settings_watcher.SettingsWatcher` 가 상시 구독으로 감지해(서버 `settingsHash` 대조) 데몬이 유휴일 때
+   **재시작 없이** 적용하고 새 해시를 보고한다(04_erd §9-3 단일 규칙 · 펌프 기종·주소 변경만 유휴 재시작으로 반영).
+   이 모듈은 스냅샷 → 값 변환만 한다(부팅·적용 공용). 부팅 fetch 실패는
    **best-effort** — 서버 미제공/네트워크 오류 시 모드 기본 용량(0.5mL)/sy01b 스트로크로 폴백한다.
 
 계약(heysenlyt-web `lib/server/settingsClamp.ts` MachineSettings — 읽기만·나머지 키 무시):
@@ -169,6 +167,19 @@ def pump_tuning_from_settings(settings: Any, model: str) -> PumpPreset | None:
     return apply_pump_tuning(PUMP_PRESETS[model], raw)
 
 
+def snapshot_settings_confirmed(settings: Any) -> bool:
+    """스냅샷이 **확정된** 기기 설정인가(`hardware.settingsStatus == "confirmed"`) — 캐시 기록 판정(2026-09-30).
+
+    부재(구 서버 · hardware 절 없음)는 True — 종전대로 캐시한다. 테스트 시드·모의 기기(test-device·no-device)는 물리 대상이
+    아니지만 선언 기본값이 곧 그 기기 설정이라 True 로 둔다. 초안 상태(missing·stale·lookup-failed·contract-unknown)만 False.
+    """
+    hw = settings.get("hardware") if isinstance(settings, Mapping) else None
+    status = hw.get("settingsStatus") if isinstance(hw, Mapping) else None
+    if not isinstance(status, str):
+        return True
+    return status not in ("missing", "stale", "lookup-failed", "contract-unknown")
+
+
 def hardware_profile_from_snapshot(model: str, settings: Any) -> "HardwareProfile":
     """선언 스냅샷 → 캐시용 HardwareProfile — **이 함수가 유일한 조립 지점**이다.
 
@@ -266,6 +277,53 @@ def pump_addrs_from_settings(settings: Any) -> list[int]:
         if a >= 1:  # addr 0 = RS485 브로드캐스트 — 실 주소 아님(배제).
             addrs.append(a)
     return sorted(set(addrs))
+
+
+# ── 알코올 캐리어 포트 규칙(2026-09-30 · 사용자 결정 "향연은 펌프마다 알코올 통") ─────────────────────────
+#   서버(web)가 봉투 조립 전에 막지만(`alcohol_missing`), pi 도 **빈 구멍에서 알코올을 빠는** 스텝을 스스로 거부한다(이중 방어).
+#   헤이센릿(향장향 `sensorium-fragrance*` · 식향 `sensorium-expo*`)은 옛 관례(P1 = 알코올, 명시 매핑 없는 옛 배치)를 존중해
+#   "다른 액체가 꽂힌 구멍"만 거부하고, 그 밖의 계약(향연 등)은 **명시된 알코올 구멍**에서만 빨게 한다.
+HEYSENLYT_CONTRACT_PREFIXES = ("sensorium-fragrance", "sensorium-expo")
+
+
+def alcohol_carrier_rule_from_settings(
+    settings: Any,
+) -> "tuple[dict[int, dict[int, str | None]] | None, bool]":
+    """스냅샷 → (펌프별 {포트: 액체(소문자) | None(비었거나 비활성)}, 엄격 여부). 스냅샷에 pumpPorts 가 없으면 (None, False)."""
+    if not isinstance(settings, Mapping):
+        return None, False
+    ports = settings.get("pumpPorts")
+    if not isinstance(ports, Mapping) or not ports:
+        return None, False
+    table: dict[int, dict[int, "str | None"]] = {}
+    for pk, layout in ports.items():
+        try:
+            addr = int(pk)
+        except (TypeError, ValueError):
+            continue
+        if addr < 1 or not isinstance(layout, Mapping):
+            continue
+        row: dict[int, "str | None"] = {}
+        for portk, cfg in layout.items():
+            try:
+                port = int(portk)
+            except (TypeError, ValueError):
+                continue
+            liquid = cfg.get("liquid") if isinstance(cfg, Mapping) else None
+            enabled = not (isinstance(cfg, Mapping) and cfg.get("enabled") is False)
+            row[port] = (
+                liquid.strip().lower()
+                if enabled and isinstance(liquid, str) and liquid.strip()
+                else None
+            )
+        table[addr] = row
+    hw = settings.get("hardware")
+    contract = None
+    if isinstance(hw, Mapping):
+        c = hw.get("contractId") or hw.get("sensoriumVersion")
+        contract = c if isinstance(c, str) and c else None
+    strict = contract is not None and not contract.startswith(HEYSENLYT_CONTRACT_PREFIXES)
+    return table, strict
 
 
 def pump_map_from_settings(

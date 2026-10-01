@@ -57,6 +57,9 @@ from ..core.pump_guard import (
     PumpPreset,
     SyringeSpec,
     apply_pump_tuning,
+    SUPPORTED_SYRINGE_CAPACITIES_ML,
+    REQUIRES_EXPLICIT_SYRINGE_CAPACITY,
+    is_supported_syringe_capacity,
     resolve_syringe_capacity_ml,
 )
 from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
@@ -466,6 +469,117 @@ def pump_map_from_addresses_env(
     return pump_map
 
 
+def capacity_block_for(model: "str | None", capacity_ml: "float | None", capacity_source: str) -> "str | None":
+    """기종 지원 용량 판정(2026-09-30 · Tecan = 1·5mL) — 목록 밖이면 **모든 모션 거부** 사유, 통과면 None.
+
+    부팅 조립(build_resolver)과 핫 적용(derive_hot_settings)이 같은 판정을 쓴다(한 곳). 모드 기본 추정(default)은 **명시 저장이
+    필요한 기종(Tecan)** 에서만 "모름"으로 막는다 — SY-01B 는 추정 0.5 가 지원 목록 안이라 종전대로 돈다.
+    """
+    unknown = capacity_source == "default" and str(model) in REQUIRES_EXPLICIT_SYRINGE_CAPACITY
+    if is_supported_syringe_capacity(model, None if unknown else capacity_ml):
+        return None
+    supported = SUPPORTED_SYRINGE_CAPACITIES_ML.get(str(model), ())
+    return (
+        f"시린지 용량 미지원 — 기종 {model} 지원 {list(supported)}mL, "
+        f"실제 {'미확인(저장 안 됨)' if unknown else capacity_ml}mL(출처 {capacity_source}). "
+        "admin 설정에서 실제 시린지 용량을 저장하면 재시작 없이 풀립니다"
+    )
+
+
+@dataclass(frozen=True)
+class HotSettings:
+    """재시작 없이 적용할 설정 한 벌(2026-09-30 · 04_erd §9-3) — 스냅샷 1장에서 파생한 값. 데몬이 유휴일 때 원자 교체한다."""
+
+    pump_map: "dict[int, SyringeSpec]"
+    valve_port_count: int
+    port_liquids: "dict[int, dict[int, str | None]] | None"
+    alcohol_strict: bool
+    capacity_ml: float
+    capacity_block: "str | None"
+    engine_preset: "Any"
+    contract_id: "str | None"
+    capacity_changed: bool
+
+
+def derive_hot_settings(
+    settings: Any,
+    *,
+    pump_map: "Mapping[int, SyringeSpec]",
+    pump_model: "str | None",
+    mode: "str | None",
+) -> HotSettings:
+    """스냅샷 → 재시작 없이 적용할 값(순수). `pump_map` 의 주소·스트로크를 그대로 쓰고 용량만 스냅샷 값으로 바꾼다
+    (기종·주소가 바뀐 경우 호출자가 새 어댑터의 주소·스트로크로 만든 `pump_map` 을 넘긴다)."""
+    from ..adapters.settings_source import alcohol_carrier_rule_from_settings, valve_port_count_from_settings
+    from ..adapters.settings_watcher import contract_id_from_settings
+    from ..core.pump_guard import PUMP_PRESETS as _PP
+
+    snap_cap = syringe_capacity_from_settings(settings)
+    source = "snapshot" if snap_cap is not None else "default"
+    cap = (
+        snap_cap
+        if snap_cap is not None
+        else resolve_syringe_capacity_ml(None, is_flavor=(str(mode or "").lower() == "flavor"))
+    )
+    new_map = {
+        addr: SyringeSpec(pump_full_stroke=spec.pump_full_stroke, syringe_capacity_ml=cap)
+        for addr, spec in pump_map.items()
+    }
+    changed = any(abs(spec.syringe_capacity_ml - cap) > 1e-9 for spec in pump_map.values())
+    table, strict = alcohol_carrier_rule_from_settings(settings)
+    preset = None
+    if pump_model in _PP:
+        preset = pump_tuning_from_settings(settings, pump_model) or _PP[pump_model]
+    return HotSettings(
+        pump_map=new_map,
+        valve_port_count=valve_port_count_from_settings(settings) or 12,
+        port_liquids=table,
+        alcohol_strict=strict,
+        capacity_ml=cap,
+        capacity_block=capacity_block_for(pump_model, cap, source),
+        engine_preset=preset,
+        contract_id=contract_id_from_settings(settings),
+        capacity_changed=changed,
+    )
+
+
+class SettingsHotApplyEnv:
+    """설정 무재시작 적용 재료(2026-09-30 · 04_erd §9-3) — 데몬이 유휴일 때 부른다.
+
+    부팅 조립과 **같은 함수**(선언 기종·주소 파생 · 캐시 규칙)를 쓴다 — 적용 경로가 따로 놀지 않게. 어댑터 재조립은 여기서 하지 않는다
+    (펌프 기종·주소 변경 = 재시작한 부팅이 조립).
+    """
+
+    def __init__(
+        self,
+        environ: Mapping[str, str],
+        *,
+        mode: "str | None",
+        server_base_url: str,
+    ) -> None:
+        self.environ = environ
+        self.mode = mode
+        self.server_base_url = server_base_url
+        self.state_dir = environ.get(SENLYT_STATE_DIR_ENV, "").strip() or environ.get("LOG_DIR", "").strip()
+
+    def target_model(self, settings: Any) -> "str | None":
+        from ..adapters.settings_source import pump_model_from_settings
+
+        return pump_model_from_settings(settings)
+
+    def target_addrs(self, settings: Any) -> list[int]:
+        return pump_addrs_from_settings(settings)
+
+    def persist(self, settings: Any, model: "str | None") -> None:
+        """확정된 설정만 오프라인 캐시에 기록(부팅과 같은 규칙)."""
+        from ..adapters.settings_source import hardware_profile_from_snapshot, snapshot_settings_confirmed
+        from ..persistence.hardware_profile_cache import save_profile
+
+        if not self.state_dir or not model or not snapshot_settings_confirmed(settings):
+            return
+        save_profile(self.state_dir, hardware_profile_from_snapshot(model, settings), self.server_base_url)
+
+
 def build_resolver(
     environ: Mapping[str, str],
     *,
@@ -508,11 +622,16 @@ def build_resolver(
     snapshot_capacity = syringe_capacity_from_settings(server_settings)
     # 오프라인 캐시 부팅(2026-09-29) — 스냅샷이 없으면 마지막으로 받은 이 기기 용량(캐시)을 **추정값**으로 쓴다(모드 기본 0.5
     #   추정보다 낫다 · 기기마다 시린지를 바꿀 수 있다). ⛔ 용량 가드는 라이브 스냅샷일 때만(아래 _mark — R4 P0-1).
-    capacity_override = (
-        snapshot_capacity
-        if snapshot_capacity is not None
-        else (getattr(hardware_profile, "syringe_capacity_ml", None) if hardware_profile is not None else None)
+    cache_capacity = (
+        getattr(hardware_profile, "syringe_capacity_ml", None) if hardware_profile is not None else None
     )
+    capacity_override = snapshot_capacity if snapshot_capacity is not None else cache_capacity
+    # 용량 출처(2026-09-30 로그·가드) — snapshot(라이브 서버) | cache(마지막으로 받은 이 기기 설정) | default(모드 기본 추정).
+    capacity_source = (
+        "snapshot" if snapshot_capacity is not None else "cache" if cache_capacity is not None else "default"
+    )
+    # 이 기기 기종 — 감지(실물) > 선언(스냅샷·캐시). 없으면 판정하지 않는다(Undeclared 엔진이 어차피 모션을 거부한다).
+    _model_for_capacity = hardware_profile.pump_model if hardware_profile is not None else None
     stroke_override = full_stroke_from_settings(server_settings)
     # 캐시 폴백(R-P0-4) — 스냅샷이 stroke 를 못 줬을 때 캐시 stroke 로 pump_map 을 맞춘다
     #   (안 맞추면 tecan 캐시 부팅이 어댑터 3000 vs spec 12000 = 영구 -1001). 용량은 비캐시 원칙.
@@ -535,9 +654,28 @@ def build_resolver(
         #   파생하는 유일한 곳)서 함께 돌려준다. senlytd 가 이 값을 그대로 Dispatcher 가드에
         #   넘기므로 술어를 두 번 계산할 일이 없다 — 두 파일이 손으로 같은 불변식을 유지하다
         #   한쪽만 고쳐져 조용히 어긋나는(=P0-1 부활) 구조를 없앤다.
-        r.capacity_from_settings = snapshot_capacity is not None
+        # (2026-09-30) 캐시 용량으로 부팅해도 가드를 켠다 — 캐시 = "마지막으로 서버가 말한 이 기기 용량"(추측값 아님)이고,
+        #   온라인이 되면 설정 감시자가 서버 해시와 다름을 보고 유휴일 때 재시작 없이 라이브 스냅샷을 적용한다. 가드를 끄면 오프라인 부팅 뒤
+        #   재시작 전 창에 들어온 봉투가 틀린 용량으로 조용히 2배/절반 토출된다(검증 P1). 모드 기본(0.5 추정)만 가드 OFF 로 남긴다.
+        r.capacity_from_settings = capacity_source in ("snapshot", "cache")
+        r.capacity_source = capacity_source
         # 포트 상한 각인(2026-09-02) — RR 2차 게이트가 1..N 으로 판정(§C).
         r.valve_port_count = valve_port_count
+        # 알코올 캐리어 포트 규칙(2026-09-30) — 스냅샷 통 배치로 "빈 구멍 알코올 흡입"을 거부한다(스냅샷 없으면 검사 안 함).
+        from ..adapters.settings_source import alcohol_carrier_rule_from_settings as _alc
+
+        r.port_liquids, r.alcohol_strict = _alc(server_settings)
+        # 기종별 지원 용량(2026-09-30 · Tecan = 1·5mL) — 목록 밖이면 **모든 모션 거부**(fail-closed). 서버도 같은 판정으로
+        #   제조를 막지만(syringe_unsupported), 옛 서버·스테일 캐시·모드 기본 추정(Tecan 0.5)으로 부팅한 경우를 pi 가 스스로 막는다.
+        _cap_eff = (
+            capacity_override
+            if capacity_override is not None
+            else resolve_syringe_capacity_ml(None, is_flavor=(str(mode or "").lower() == "flavor"))
+        )
+        r.capacity_ml = _cap_eff
+        # 모드 기본 추정(default)은 **명시 저장이 필요한 기종(Tecan)** 에서만 "모름"으로 막는다 — SY-01B 는 추정 0.5 가
+        #   지원 목록 안이라 종전대로 돈다(web requiresExplicitSyringeCapacity 와 일치 · 리뷰 P1 2026-09-30).
+        r.capacity_block = capacity_block_for(_model_for_capacity, _cap_eff, capacity_source)
         return r
 
     raw = environ.get(SENLYT_PUMP_ADDRESSES_ENV)
@@ -722,6 +860,7 @@ def build_components(
     from ..adapters.settings_source import (
         hardware_profile_from_snapshot,
         pump_model_from_settings,
+        snapshot_settings_confirmed,
     )
     from ..persistence.hardware_profile_cache import load_profile, save_profile
 
@@ -739,7 +878,10 @@ def build_components(
         #   _undeclared_refetch 와 손 동기화하다 한쪽만 어긋나는 것 방지(R6.5 M3).
         hardware_profile = hardware_profile_from_snapshot(_snap_model, server_settings)
         hardware_source = "snapshot"
-        if _hw_state_dir:
+        # (2026-09-30) 확정된 설정만 캐시한다 — 미확정(신규 기기·계약 구성 변경·조회 실패) 프레임의 용량·배치는 **계약 기본값 초안**
+        #   이라 "마지막으로 받은 이 기기 설정"이 아니다. 그걸 캐시하면 다음 오프라인 부팅이 초안 용량으로 가드를 켠다.
+        #   settingsStatus 부재(구 서버)는 종전대로 저장한다.
+        if _hw_state_dir and snapshot_settings_confirmed(server_settings):
             save_profile(_hw_state_dir, hardware_profile, server_config.base_url)
     else:
         cached = load_profile(_hw_state_dir, server_config.base_url) if _hw_state_dir else None
@@ -822,6 +964,21 @@ def build_components(
                         ),
                         pump_addrs=(hardware_profile.pump_addrs if hardware_profile is not None else ()),
                         source="detected",
+                        # (2026-09-30 검증 P1) 선언(스냅샷·캐시)의 보조축을 이어받는다 — 빠뜨리면 오프라인 부팅이 캐시 용량을 버리고
+                        #   모드 기본 0.5 로 조립된다(용량 가드도 꺼져 조용히 2배/절반 토출). 튠은 **기종이 같을 때만**(다른 기종 값이
+                        #   이 펌프로 새지 않게) · 계약은 그대로. 용량도 **기종이 같을 때만**(리뷰 P2-2 — 기종이 바뀐 건 랙 교체라
+                        #   다른 기종의 시린지 용량을 얹으면 오프라인 창에 틀린 양이 나간다 → default 로 두고 가드가 판정).
+                        contract_id=(hardware_profile.contract_id if hardware_profile is not None else None),
+                        syringe_capacity_ml=(
+                            hardware_profile.syringe_capacity_ml
+                            if hardware_profile is not None and hardware_profile.pump_model == _det.model
+                            else None
+                        ),
+                        pump_tuning=(
+                            hardware_profile.pump_tuning
+                            if hardware_profile is not None and hardware_profile.pump_model == _det.model
+                            else None
+                        ),
                     )
                     hardware_source = "detected"
                 else:
@@ -889,6 +1046,14 @@ def build_components(
             else PUMP_PRESETS["sy01b"].pump_full_stroke
         )
     )
+    # (2026-09-30 로그 보강) 이 부팅이 실제로 쓰는 용량·출처·스텝 모드·계약·설정 해시 — Cloud Logging 에서 한 줄로 대조한다.
+    from ..adapters.settings_watcher import contract_id_from_settings as _cid
+    from ..adapters.settings_watcher import settings_hash_from_settings as _shash
+
+    _snap_cap = syringe_capacity_from_settings(server_settings)
+    _cache_cap = hardware_profile.syringe_capacity_ml if hardware_profile is not None else None
+    _boot_cap_source = "snapshot" if _snap_cap is not None else "cache" if _cache_cap is not None else "default"
+    _boot_model = hardware_profile.pump_model if hardware_profile is not None else None
     log.event(
         "하드웨어 자가진단 — 엔진·밸브 자동감지 결과",
         stage=STAGE_PI_RECEIVED,
@@ -896,8 +1061,19 @@ def build_components(
         engine=type(engine_adapter).__name__,
         valve=type(valve_adapter).__name__ if valve_adapter is not None else "off",
         mode=mode,
-        # 서버 settings 시린지 용량 반영 여부(None=서버 미제공→모드 기본 0.5mL 폴백·안전 급소 관측).
-        syringeCapacityMl=syringe_capacity_from_settings(server_settings),
+        # 이 부팅의 유효 시린지 용량(mL) — 스냅샷 > 캐시(마지막으로 받은 이 기기 설정) > 부재(None = 모드 기본 추정).
+        syringeCapacityMl=_snap_cap if _snap_cap is not None else _cache_cap,
+        capacitySource=_boot_cap_source,
+        # 풀스트로크 스텝·스텝 모드 — Tecan 은 N0(표준 3000 · 어댑터가 N0R 명시), SY-01B 는 자체 해상도(12000).
+        fullStroke=effective_stroke,
+        stepMode=(
+            "N0" if _boot_model == "tecan_xcalibur" else "sy01b" if _boot_model == "sy01b" else None
+        ),
+        contractId=(
+            _cid(server_settings)
+            or (hardware_profile.contract_id if hardware_profile is not None else None)
+        ),
+        settingsHash=_shash(server_settings),
         settingsSnapshot="present" if server_settings is not None else "absent",
         # ⚠️ 키 구분(R3 P3-4): 여기는 스냅샷 원본 축(부재=None), 아래 WARN 의 settingsStroke 는
         #   폴백 적용 후 유효축 — 같은 키로 두 뜻을 찍으면 로그 대조가 어긋난다.
