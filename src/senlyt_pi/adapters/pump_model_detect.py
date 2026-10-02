@@ -53,6 +53,31 @@ class DetectResult:
 Detector = Callable[[str, Sequence[int]], DetectResult]
 
 
+def detect_on_candidates(
+    candidates: Sequence[str],
+    addresses: Sequence[int],
+    detector: Detector,
+) -> "tuple[str | None, DetectResult | None]":
+    """후보 포트마다 감지를 돌려 **펌프가 실제로 응답한 첫 포트**와 그 결과를 돌려준다(2026-10-02).
+
+    종전엔 후보 목록의 첫 포트를 확인 없이 골랐다 — 펌프가 그 포트에 있다는 근거가 "목록 순서"뿐이었다.
+    감지 자체가 read-only `?`·`&` 라 Runze·Tecan 어느 쪽에도 안전하고, 응답 포트의 결과를 그대로 재사용하므로
+    정상 구성(후보 1개)에선 종전과 같은 1회 감지다. 아무 포트도 응답하지 않으면 첫 후보와 그 결과(응답 0)를
+    돌려준다(펌프 전원이 늦게 켜지는 흔한 경우 — 종전 경로와 동일). 후보 없음 = (None, None).
+    """
+    first: "tuple[str | None, DetectResult | None]" = (None, None)
+    for port in candidates:
+        try:
+            det = detector(port, addresses)
+        except Exception:  # noqa: BLE001 — 한 포트의 감지 실패가 다른 포트 탐색을 막지 않는다.
+            det = None
+        if first[0] is None:
+            first = (port, det)
+        if det is not None and det.responding:
+            return port, det
+    return first
+
+
 def detect_pump_model(
     port: str,
     addresses: Sequence[int],

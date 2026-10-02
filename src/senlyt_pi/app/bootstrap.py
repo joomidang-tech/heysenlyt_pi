@@ -195,6 +195,8 @@ def build_engine(
     # 운영자 속도 튠이 얹힌 어댑터 preset(§6-3a · 2026-09-22) — pump_tuning_from_settings 가 **실물 기종과
     #   같은 기종**으로 만든 값만 온다. None = 그 기종 제조사 기본값으로 조립(둘째 판). 스트로크·U 는 표 값 그대로다.
     pump_preset: "PumpPreset | None" = None,
+    # 부팅 감지가 펌프 응답으로 고른 포트(2026-10-02). None = 종전대로 후보 첫 포트.
+    serial_port: "str | None" = None,
 ) -> EnginePort:
     """엔진 조립 — 주입 우선. 호스트와 무관하게 **서버 선언(pump_model)** 대로 실물 어댑터를 조립한다.
 
@@ -238,7 +240,7 @@ def build_engine(
                 TecanXCaliburEngineAdapter as _RealAdapter,
             )
 
-        port = discover_serial_port(environ, port_lister=port_lister)
+        port = serial_port or discover_serial_port(environ, port_lister=port_lister)
         # ⚠️ estop_event 주입 = 데몬·시퀀서와 **같은 공유 래치**(§9-4). 이게 있어야 어댑터의 in-flight
         #   모션 폴이 데몬이 세운 래치를 직접 보고 즉시 bail 한다(설계 '단일 공유 _estop').
         #   port=None(미탐지) 이면 어댑터 기본값(/dev/ttyUSB0) 유지 — None 을 넘기지 않는다.
@@ -907,12 +909,15 @@ def build_components(
     #    엔진 주입(테스트)·fake 스위치·후보 포트 없음이면 건너뛴다(감지 없음 = 종전 경로 그대로).
     detected_pump_addrs: "tuple[int, ...] | None" = None
     undeclared_detail: "str | None" = None
+    # 펌프가 응답한 포트(2026-10-02) — 엔진도 이 포트로 조립한다(None = 감지 안 함 → 종전 첫 후보).
+    picked_port: "str | None" = None
     _detect = fetch_settings if detect_hardware is None else detect_hardware
     if _detect and engine is None and not _is_truthy(environ.get(SENLYT_FAKE_ENGINE_ENV)):
-        from ..adapters.serial_port_discovery import discover_serial_port as _dsp
+        from ..adapters.serial_port_discovery import list_candidate_ports as _lcp
 
-        _port = _dsp(environ, port_lister=port_lister)
-        if _port:
+        _cands = _lcp(environ, port_lister=port_lister)
+        if _cands:
+            from ..adapters.pump_model_detect import detect_on_candidates
             from ..adapters.pump_model_detect import detect_pump_model as _default_detector
 
             # 향연 4대(2026-09-29) — 모드 기본 ∪ (스냅샷 펌프 키 > 캐시 pumpAddrs). 오프라인 캐시 부팅도 addr 4 를 프로브한다.
@@ -921,11 +926,10 @@ def build_components(
             _detector = pump_detector if pump_detector is not None else (
                 lambda p, addrs: _default_detector(p, addrs, logger=log)
             )
-            try:
-                _det = _detector(_port, _expected)
-            except Exception as e:  # noqa: BLE001 — 감지 실패 = 응답 0 취급(종전 경로).
-                log.warn("펌프 기종 자동 인식 실패 — 선언 경로로 조립", stage=STAGE_ERROR, error=str(e))
-                _det = None
+            # 포트도 펌프 응답으로 고른다(2026-10-02) — 목록 첫 포트를 확인 없이 쥐면 펌프 없는 포트에 갇힌다.
+            picked_port, _det = detect_on_candidates(_cands, _expected, _detector)
+            if _det is None:  # 감지 실패 = 응답 0 취급(종전 경로).
+                log.warn("펌프 기종 자동 인식 실패 — 선언 경로로 조립", stage=STAGE_ERROR, port=picked_port)
             if _det is not None:
                 # 응답 0 도 "스캔 결과" 다 — 2차 스캔(discover_pumps)을 또 돌지 않는다(검증 P2-2). 늦게 켜진 펌프는
                 #   종전대로 재발견 재기동(on_pumps_seen_unmapped)이 다시 부팅 감지로 데려온다.
@@ -1030,6 +1034,7 @@ def build_components(
         undeclared_detail=undeclared_detail,
         port_lister=port_lister,
         pump_preset=tuned_preset,
+        serial_port=picked_port,
     )
     valve_adapter = build_valve(environ)
     # 축(stroke) 자가진단 — 단일 키 설계(2026-09-02)에선 어댑터가 설정에서 조립되므로 "설정 vs

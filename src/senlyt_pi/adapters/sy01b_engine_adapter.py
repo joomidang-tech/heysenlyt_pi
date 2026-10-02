@@ -566,6 +566,32 @@ class Sy01bEngineAdapter:
             )
         return False
 
+    def find_answering_port(self, addrs: "Iterable[int]") -> "str | None":
+        """지금 포트 말고 **펌프가 실제로 응답하는 후보 포트**를 찾는다(2026-10-02) — 찾기만 하고 연결은 건드리지 않는다.
+
+        `_reconnect_serial` 은 OSError 가 나야만 돈다. 그런데 펌프 없는 포트(다른 USB 시리얼 장치 등)는 열리고
+        무응답만 줘서 오류가 안 나므로, 한번 잡히면 진짜 펌프 포트가 생겨도 옮기지 못했다. 그래서 근거를 "열린다"가
+        아니라 "`?` 에 펌프가 답한다"로 둔다. 옮기는 건 호출측 정책(재기동 → 부팅 감지가 이 포트를 고른다)이다 —
+        가동 중 연결을 바꿔 끼우면 진행 중 트랜잭션과 경합하므로 여기선 하지 않는다.
+        정찰은 기본 클래스 임시 인스턴스의 `health_probe`(`?` 만 · read-only) — Runze·Tecan 어느 쪽에도 안전하고,
+        Tecan 의 `Q`(에러 래치 소진)는 나가지 않는다. 다른 후보가 없으면(정상 단일 어댑터) 아무 포트도 열지 않는다.
+        """
+        if self._port_resolver is None:
+            return None
+        try:
+            cands = [c for c in self._port_resolver() if isinstance(c, str) and c and c != self.port]
+        except Exception:  # noqa: BLE001 — 재열거 실패 = 이번 주기 포기.
+            return None
+        targets = list(addrs)
+        for cand in cands:
+            scout = Sy01bEngineAdapter(port=cand, baudrate=self.baudrate, serial_factory=self._factory)
+            try:
+                if any(scout.health_probe(a) == "ok" for a in targets):
+                    return cand
+            finally:
+                scout.close()
+        return None
+
     # ── 트랜잭션 (버스 락은 여기서만·짧게) ──────────────────────────────────
     def _txn(self, addr: int, command: str, *, read_timeout_s: float | None = None) -> str:
         """`/{addr}{command}[CR]` 송신 → ETX 까지 수신. **락은 이 함수 안에서만** 잡힌다.

@@ -187,6 +187,9 @@ class DaemonDeps:
     #   **2회 연속** 보면 1회 호출(정책 = senlytd 가 우아한 재기동 주입 → 부팅 감지가 새 기종으로 재조립).
     #   1회 잠금(프로세스 생애) — 관측이 흔들려도 재기동 루프가 되지 않는다. None = 비활성.
     on_pump_model_changed: Callable[[], None] | None = None
+    # 펌프 포트 이동(2026-10-02) — 전 펌프 무응답인데 다른 후보 포트에서 펌프가 응답하면 1회 호출(정책 = senlytd 가
+    #   우아한 재기동 주입 → 부팅 감지가 응답 포트로 재조립). None = 비활성.
+    on_pump_port_moved: Callable[[], None] | None = None
     # 하드웨어 출처 관측(2026-09-14) — bootstrap.hardware_source 그대로("detected"·"snapshot"·"cache"·
     #   "undeclared"·"undetected"·"mixed"). 하트비트 `pumpModelSource` 로 서버·admin 에 "자동 인식" 여부를 알린다.
     hardware_source: str | None = None
@@ -265,6 +268,7 @@ class SenlytDaemon:
         # R8 P1-1 — 재발견 정책 콜백의 1회 발화 래치(30s 주기 감시가 재기동을 연타하지 않게).
         self._pumps_seen_unmapped_fired = False
         self._pump_model_changed_fired = False
+        self._pump_port_moved_fired = False
         # 설정 무재시작 적용(2026-09-30) — 적용한 계약·프로브 주소(하트비트) · 실패 재시도 간격 · 같은 실패 로그 1회.
         self._applied_contract_id = deps.applied_contract_id
         self._hot_retry_at = 0.0
@@ -990,6 +994,7 @@ class SenlytDaemon:
                         forget(addr)
                     except Exception:  # noqa: BLE001
                         pass
+        self._check_pump_port_moved(health)
         self._pump_health = health
         self._hw_checked_at = self._now_iso()
         self._note_hot_fail_pump_recovery(health)
@@ -1074,6 +1079,46 @@ class SenlytDaemon:
                 self.deps.on_pump_model_changed()
             except Exception:  # noqa: BLE001 — 정책 콜백 실패가 감시 루프를 죽이면 안 된다.
                 self._log.warn("기종 변경 정책 콜백 실패 — 감시 지속", stage=STAGE_PI_RECEIVED)
+
+    def _check_pump_port_moved(self, health: "dict[int, str]") -> None:
+        """전 펌프 무응답 = 펌프 없는 포트를 쥐었을 수 있다(2026-10-02 · Pi 내장 UART 갇힘 사고).
+
+        펌프가 응답하는 다른 포트를 찾으면 1회 재기동 정책을 부른다 → 부팅 감지가 그 포트를 골라 재조립한다.
+        가동 중 연결을 바꿔 끼우지 않는 이유: 진행 중 트랜잭션·핫 적용과 경합해 거짓 성공·엉뚱한 펌프 프레임이 날 수 있다.
+        """
+        find = getattr(self.deps.engine, "find_answering_port", None)
+        # 정찰 주소 = 부팅 감지와 **같은 기대 주소**(senlytd 가 같은 expected_pump_addrs 로 주입). 다른 집합(예: env 고정
+        #   주소)으로 찾으면 부팅 감지가 그 포트를 못 골라 재기동이 프로세스마다 반복된다(검증 2026-10-02 재현).
+        addrs = sorted(self.deps.hw_watch_addrs or ())
+        if (
+            not addrs
+            or not callable(find)
+            or self.deps.on_pump_port_moved is None
+            or self._pump_port_moved_fired
+            or not all(h == "silent" for h in health.values())
+            or self._sequencer.is_busy
+            or self._stop.is_set()
+            or self._hot_applying
+        ):
+            return
+        try:
+            port = find(addrs)
+        except Exception:  # noqa: BLE001 — 포트 정찰은 best-effort(감시를 막지 않는다).
+            return
+        if port is None or self._sequencer.is_busy:  # 정찰 사이 제조가 시작됐으면 선점하지 않는다(기존 재기동 콜백과 같은 규칙).
+            return
+        self._pump_port_moved_fired = True
+        self._log.warn(
+            "전 펌프 무응답 포트 — 펌프가 응답하는 다른 포트 발견, 정상 종료 후 재기동으로 그 포트에 재조립합니다",
+            stage=STAGE_PI_RECEIVED,
+            device_id=self.deps.device_id,
+            port=port,
+            previousPort=getattr(self.deps.engine, "port", None),
+        )
+        try:
+            self.deps.on_pump_port_moved()
+        except Exception:  # noqa: BLE001 — 정책 콜백 실패가 감시 루프를 죽이면 안 된다.
+            self._log.warn("포트 이동 정책 콜백 실패 — 감시 지속", stage=STAGE_PI_RECEIVED)
 
     def _applied_settings_hash(self) -> "str | None":
         watch = self.deps.settings_watch

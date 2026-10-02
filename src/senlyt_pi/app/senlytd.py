@@ -336,6 +336,8 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         # 실물 기종 변경 정책(2026-09-14) — 유휴 감시가 2회 연속 다른 기종을 보면 우아한 재기동 → 부팅 감지가
         #   새 기종으로 재조립(핫스왑 없음 · 재발견 재기동과 같은 계약).
         on_pump_model_changed=_make_pump_model_changed_restart(logger, components.device_id),
+        # 펌프 포트 이동 정책(2026-10-02) — 재기동하면 부팅 감지가 펌프 응답 포트를 고른다(로그는 데몬이 남긴다).
+        on_pump_port_moved=_make_settings_changed_restart(logger, components.device_id),
         hardware_source=getattr(components, "hardware_source", None),
         settings_watch=settings_watch,
         settings_hot_apply=hot_env,
@@ -371,25 +373,28 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
             state_dir = environ.get(SENLYT_STATE_DIR_ENV, "").strip() or environ.get(
                 "LOG_DIR", ""
             ).strip()
-            from ..adapters.pump_model_detect import detect_pump_model
-            from ..adapters.serial_port_discovery import discover_serial_port
+            from ..adapters.pump_model_detect import detect_on_candidates, detect_pump_model
+            from ..adapters.serial_port_discovery import list_candidate_ports
 
             while True:
                 time.sleep(delay)
                 # ① 실물 재감지(2026-09-14) — 엔진이 Undeclared 라 포트를 쥔 주체가 없어 안전. 균일 기종이 잡히면
                 #   재기동(부팅 감지가 같은 결과로 조립). 혼합/판독 불가는 계속 대기.
+                #   포트도 펌프 응답으로 고른다(2026-10-02 — 부팅 감지와 같은 규칙).
                 try:
-                    _port = discover_serial_port(environ)
-                    if _port:
-                        _expected = list(watch_addrs)  # 향연 4대(2026-09-29) — 부팅 감시와 같은 주소
-                        _det = detect_pump_model(_port, _expected, logger=logger)
-                        if _det.model is not None:
-                            logger.warn(
-                                f"실물 기종 감지(model={_det.model}) — 정상 종료 후 재기동으로 재조립합니다",
-                                stage=STAGE_PI_RECEIVED,
-                            )
-                            os.kill(os.getpid(), signal.SIGTERM)
-                            return
+                    _expected = list(watch_addrs)  # 향연 4대(2026-09-29) — 부팅 감시와 같은 주소
+                    _port, _det = detect_on_candidates(
+                        list_candidate_ports(environ),
+                        _expected,
+                        lambda p, a: detect_pump_model(p, a, logger=logger),
+                    )
+                    if _det is not None and _det.model is not None:
+                        logger.warn(
+                            f"실물 기종 감지(model={_det.model}) — 정상 종료 후 재기동으로 재조립합니다",
+                            stage=STAGE_PI_RECEIVED,
+                        )
+                        os.kill(os.getpid(), signal.SIGTERM)
+                        return
                 except Exception:  # noqa: BLE001 — 재감지 실패 = 다음 주기.
                     pass
                 if _hw_src != "undeclared":

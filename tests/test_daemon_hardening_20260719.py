@@ -215,6 +215,44 @@ class TestSerialHotplugReconnect:
         assert ad.port == "/dev/ttyUSB1"  # 포트 자가 전환.
         assert made == ["/dev/ttyUSB0", "/dev/ttyUSB1"]
 
+    def test_unplug_does_not_trap_on_onboard_uart_and_replug_recovers(self) -> None:
+        """2026-10-02 실기기 사고 — USB 가 빠진 동안 재연결이 Pi 내장 UART(ttyAMA10)를 잡으면
+        그 포트는 항상 열리고 무응답만 줘 OSError 가 안 난다 → 다시 꽂아도 영구 무응답.
+        후보에서 내장 UART 를 빼면 USB 부재 동안 재연결이 실패·재시도하다 다시 꽂히는 순간 USB 로 돌아온다."""
+        from senlyt_pi.adapters.serial_port_discovery import SerialPortInfo, list_candidate_ports
+
+        usb_present = {"v": True}
+        dead = _VanishingSerial(die_after=0)  # 뽑힌 순간의 옛 핸들.
+        made: list[str] = []
+
+        def lister():
+            ports = [SerialPortInfo("/dev/ttyAMA10")]  # Pi 5 내장 디버그 UART — 항상 존재.
+            if usb_present["v"]:
+                ports.append(SerialPortInfo("/dev/ttyUSB0", 0x1A86, 0x7523))
+            return ports
+
+        def factory(port, baud, timeout):
+            made.append(port)
+            if port == "/dev/ttyAMA10":
+                return FakeSerial(default=b"")  # 열리지만 무응답(사고 당시 거동).
+            if not usb_present["v"]:
+                raise OSError(2, "No such file or directory")
+            return FakeSerial(responses=[status_frame(0, ready=True)] * 4)
+
+        ad = Sy01bEngineAdapter(
+            port="/dev/ttyUSB0",
+            serial_factory=factory,
+            port_resolver=lambda: list_candidate_ports({}, port_lister=lister),
+        )
+        ad._serial = dead  # 부팅 때 정상으로 열려 있던 USB 핸들.
+        usb_present["v"] = False  # 뽑힘.
+        assert ad.health_probe(1) == "silent"
+        assert ad.health_probe(1) == "silent"
+        assert "/dev/ttyAMA10" not in made  # 내장 UART 로 새지 않는다.
+        usb_present["v"] = True  # 다시 꽂힘.
+        assert ad.health_probe(1) == "ok"
+        assert ad.port == "/dev/ttyUSB0"
+
     def test_reconnect_failure_propagates_original_error(self) -> None:
         dead = _VanishingSerial(die_after=0)
         ad = Sy01bEngineAdapter(

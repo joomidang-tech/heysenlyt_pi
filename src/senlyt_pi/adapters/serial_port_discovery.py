@@ -3,7 +3,7 @@
 ⚠️ '박아둔 VID/PID 로 매칭'이 아니라, **실제로 펌프가 응답하는 포트를 프로브로 찾는다**(자동 감지).
 새 하드웨어·다양한 어댑터에서 VID/PID 를 못 박을 수 있으므로, 이 모듈은 **후보 포트 목록**만
 만들고(알려진 어댑터 VID/PID 는 *우선순위 힌트*일 뿐 — 하드필터 아님), 어느 포트에 펌프가
-붙었는지는 `pipeline.pump_health.autodetect_bus` 가 **버스 프로브**로 확정한다.
+붙었는지는 `adapters.pump_model_detect.detect_on_candidates` 가 **버스 프로브**로 확정한다.
 
 정본 참고: v1.1.0 `find_pump_port.py`(pyserial comports). 그때는 CH340 VID/PID 로 좁혔지만,
 지금은 펌프/어댑터가 늘어(한 버스 최대 10 펌프) VID/PID 미상일 수 있어 **전체 포트를 후보로**
@@ -34,6 +34,12 @@ KNOWN_ADAPTER_VID_PID: dict[tuple[int, int], str] = {
 
 # 블루투스/디버그 등 명백한 비-펌프 포트 제외(v1.1.0 findDevicePort 스킵 패턴).
 _EXCLUDE_HINTS: tuple[str, ...] = ("bluetooth", "debug-console", "wlan")
+
+# 보드 내장 UART(Pi `ttyAMA*` · `ttyS*`) 제외(2026-10-02 실기기 사고) — 펌프는 USB-RS485 로만 붙는다.
+#   내장 UART 는 항상 열리고 무응답만 줘서 오류가 안 난다 → USB 가 빠진 순간 핫플러그 재연결이 이걸 잡으면
+#   다시 꽂아도 재탐색 계기(OSError)가 없어 영구 무응답에 갇혔다(Pi 5 `ttyAMA10` · dmesg 로 확정).
+#   빼 두면 USB 부재 동안 재연결이 계속 실패·재시도하다 다시 꽂히는 순간 USB 를 잡는다.
+_ONBOARD_UART_PREFIXES: tuple[str, ...] = ("ttyAMA", "ttyS")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +72,9 @@ def _pyserial_lister() -> list[SerialPortInfo]:
 
 def _is_excluded(device: str) -> bool:
     d = device.lower()
-    return any(h in d for h in _EXCLUDE_HINTS)
+    if any(h in d for h in _EXCLUDE_HINTS):
+        return True
+    return device.rsplit("/", 1)[-1].startswith(_ONBOARD_UART_PREFIXES)
 
 
 def _is_known_adapter(p: SerialPortInfo) -> bool:
@@ -108,6 +116,6 @@ def discover_serial_port(
     *,
     port_lister: PortLister | None = None,
 ) -> str | None:
-    """후보 중 첫 포트(간이 사용·프로브 없이). 정밀 자동감지는 pump_health.autodetect_bus."""
+    """후보 중 첫 포트(간이 사용·프로브 없이). 펌프 응답으로 고르는 건 pump_model_detect.detect_on_candidates."""
     cands = list_candidate_ports(env, port_lister=port_lister)
     return cands[0] if cands else None
