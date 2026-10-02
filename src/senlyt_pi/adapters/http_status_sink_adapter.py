@@ -183,6 +183,10 @@ class HttpStatusSinkAdapter:
             "requestId": report.request_id,
             "traceId": report.trace_id,
         }
+        # 실패 사유 코드(2026-10-02) — 서버 위생 하드락은 "토출 0" 코드(CMD_VALIDATION_FAILED 등)면 잠그지 않는데,
+        #   코드를 안 실으면 "모름 = 나갔을 수 있다"로 보고 잠근다(조립 거부·검증 실패 주문마다 불필요한 세척 강제).
+        if report.error_code is not None:
+            body["errorCode"] = report.error_code.wire
         url = self._config().order_url(order_id, self.mode)
         headers = bearer_headers(self.bearer_token, {"x-trace-id": report.trace_id})
         try:
