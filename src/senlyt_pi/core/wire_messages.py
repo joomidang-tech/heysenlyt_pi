@@ -99,6 +99,10 @@ class RecipeStep:
     aspirate_speed_hz: int | None = None
     dispense_speed_hz: int | None = None
     slope: int | None = None
+    # 튠 상한 무시(2026-10-07 · 세척 느린·빠른 에어퍼지 전용) — True 면 이 스텝 속도를 프리셋(튠) V 가 아니라 **기종 매뉴얼 최대**로만
+    #   자른다. 튠 V 는 정비 이동(끝까지·홈·초기화) 속도이기도 해서, 퍼지만 빠르게 돌리려고 V 를 올리면 정비 이동까지 빨라진다.
+    #   False(기본·구계약) = 종전 그대로 프리셋 V 로 클램프.
+    bypass_tune_cap: bool = False
     # batchSyringe 전용(§9-1 v3) — 한 주사기에 순서대로 누적 흡입할 액체들(1개 이상). None = 비-배치.
     #   배출 구멍은 out_port(공유)·배출 속도는 dispense_speed_hz(min)·경사는 slope 필드를 재사용한다.
     aspirations: "tuple[BatchAspiration, ...] | None" = None
@@ -220,6 +224,7 @@ class RecipeStep:
             aspirate_speed_hz=_opt_int("aspirateSpeedHz"),
             dispense_speed_hz=_opt_int("dispenseSpeedHz"),
             slope=_opt_int("slope"),
+            bypass_tune_cap=j.get("bypassTuneCap") is True,
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -301,6 +306,8 @@ class RecipeStep:
         ):
             if val is not None:
                 m[key] = val
+        if self.bypass_tune_cap:
+            m["bypassTuneCap"] = True
         return m
 
 

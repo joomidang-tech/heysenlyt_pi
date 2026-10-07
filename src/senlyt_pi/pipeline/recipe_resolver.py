@@ -73,6 +73,8 @@ class ResolvedStep:
     aspirate_speed_hz: int | None = None
     dispense_speed_hz: int | None = None
     slope: int | None = None
+    # 튠 상한 무시(2026-10-07 · 세척 에어퍼지) — wire RecipeStep.bypass_tune_cap 그대로.
+    bypass_tune_cap: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -564,6 +566,7 @@ class RecipeResolver:
                     aspirate_speed_hz=s.aspirate_speed_hz,
                     dispense_speed_hz=s.dispense_speed_hz,
                     slope=s.slope,
+                    bypass_tune_cap=s.bypass_tune_cap,
                 )
             )
 

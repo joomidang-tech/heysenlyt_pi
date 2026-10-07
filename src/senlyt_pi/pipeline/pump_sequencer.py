@@ -824,6 +824,7 @@ class PumpSequencer:
                 aspirate_speed_hz=step.aspirate_speed_hz,
                 dispense_speed_hz=step.dispense_speed_hz,
                 slope=step.slope,
+                bypass_tune_cap=step.bypass_tune_cap,
             )
             res = self._executor.run_step(cmd)
             return (res.is_success, res.error_code)

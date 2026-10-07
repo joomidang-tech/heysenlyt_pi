@@ -315,3 +315,68 @@ class TestBuildComponentsNoTuning:
         preset = getattr(comp.engine, "preset", None)
         assert preset is not None and preset.pump_max_top_speed_hz == 4000
         assert preset.pump_full_stroke == 12000
+
+
+class TestBypassTuneCap20261007:
+    """세척 에어퍼지 전용 — 스텝이 bypassTuneCap 이면 튠 V 대신 기종 매뉴얼 최대로만 자른다(정비 이동 V 불변)."""
+
+    def test_bypass_lifts_cap_to_manual_max_only_for_that_call(self):
+        from senlyt_pi.core.pump_guard import PumpPreset as _P
+
+        eng = TecanXCaliburEngineAdapter(preset=_P("tecan_xcalibur", 3000, 900, 1400, 900, 7, 0))
+        assert eng._speed_cmd(6000, 7) == "v900V1400c900L7"  # 표시 없음 = 종전(튠 V 로 클램프)
+        assert eng._speed_cmd(6000, 7, bypass_tune_cap=True) == "v900V6000c900L7"
+        assert eng._speed_cmd(9999, 7, bypass_tune_cap=True) == "v900V6000c900L7"  # 매뉴얼 최대는 유지
+        assert eng._speed_cmd(140, 7, bypass_tune_cap=True) == "v140V140c140L7"  # 느린 쪽은 v·c 동반 하강
+        assert eng._speed_cmd(None, None, bypass_tune_cap=True) == eng._speed_cmd(None, None)  # 정비 이동 불변
+
+    def test_wire_roundtrip(self):
+        from senlyt_pi.core.wire_messages import RecipeStep
+
+        j = {"idx": 0, "stage": 0, "kind": "syringe", "pumpAddr": 1, "flavor": "air", "volume": 1000,
+             "inPort": 11, "outPort": 12, "dispenseSpeedHz": 6000, "bypassTuneCap": True}
+        s = RecipeStep.from_json(j)
+        assert s.bypass_tune_cap is True
+        assert s.to_json()["bypassTuneCap"] is True
+        j2 = {k: v for k, v in j.items() if k != "bypassTuneCap"}
+        s2 = RecipeStep.from_json(j2)
+        assert s2.bypass_tune_cap is False and "bypassTuneCap" not in s2.to_json()
+
+
+def test_bypass_flag_reaches_engine_through_resolver_and_sequencer(tmp_path):
+    """wire RecipeStep(bypassTuneCap) → RecipeResolver → PumpSequencer → 엔진 명령까지 플래그가 끊기지 않는다(검증 r4 P3)."""
+    from senlyt_pi.adapters.fake_engine_adapter import FakeEngineOutcome, FakeEnginePort
+    from senlyt_pi.core.pump_guard import SyringeSpec
+    from senlyt_pi.core.wire_messages import RecipeStep
+    from senlyt_pi.persistence.file_idempotency_ledger import FileIdempotencyLedger
+    from senlyt_pi.pipeline.pump_sequencer import JobOutcome, PumpSequencer
+    from senlyt_pi.pipeline.recipe_resolver import RecipeResolver
+
+    seen: list[bool] = []
+
+    class Capturing(FakeEnginePort):
+        def dispense(self, cmd):  # type: ignore[override]
+            seen.append(cmd.bypass_tune_cap)
+            return super().dispense(cmd)
+
+    eng = Capturing()
+    eng.script_all(FakeEngineOutcome.ACK)
+    spec = SyringeSpec(pump_full_stroke=3000, syringe_capacity_ml=1.0)
+    ledger = FileIdempotencyLedger.open(tmp_path / "l.log")
+    n = iter(range(100))
+    seq = PumpSequencer(
+        ledger=ledger,
+        engine=eng,
+        resolver=RecipeResolver({1: spec}),
+        request_id_gen=lambda: f"r-{next(n)}",
+        now_iso=lambda: "2026-10-07T00:00:00.000Z",
+    )
+    base = {"pumpAddr": 1, "flavor": "air", "volume": 1000, "kind": "syringe", "inPort": 11, "outPort": 12}
+    steps = [
+        RecipeStep.from_json({**base, "idx": 0, "stage": 0, "dispenseSpeedHz": 6000, "bypassTuneCap": True}),
+        RecipeStep.from_json({**base, "idx": 1, "stage": 1, "dispenseSpeedHz": 1400}),
+    ]
+    r = seq.submit(command_id="mnt:1", trace_id="t", steps=steps)
+    assert r.outcome is JobOutcome.COMPLETED
+    assert seen == [True, False]
+    ledger.close()

@@ -65,6 +65,7 @@ from typing import Callable, Iterable, Protocol, Sequence
 from ..core.pump_guard import (
     MODEL_MISMATCH_RAW_CODE,
     AXIS_MISMATCH_RAW_CODE,
+    PUMP_MANUAL_RANGES,
     PumpPreset,
     SyringeSpec,
     clamp_pump_preset,
@@ -779,7 +780,9 @@ class Sy01bEngineAdapter:
         return _NO_RESPONSE  # 폴링 상한 초과 = ENGINE_TIMEOUT
 
     # ── 속도 프로파일 ───────────────────────────────────────────────────────
-    def _speed_cmd(self, top_hz: int | None, slope: int | None) -> str:
+    def _speed_cmd(
+        self, top_hz: int | None, slope: int | None, *, bypass_tune_cap: bool = False
+    ) -> str:
         """`v{시작}V{최고}c{컷오프}L{경사}` — 프리셋 상한으로 **클램프**만 한다.
 
         서버가 정책(전역 × 포트 오버라이드)을 이미 확정해 보냈다. pi 는 그 값이 이 펌프의 물리
@@ -792,7 +795,14 @@ class Sy01bEngineAdapter:
         c900·L7)을 preset 으로 꽂으므로 튠 없는 기기는 그만큼 느려진다 — 토출 시간 재확인 대상.
         """
         p = self.preset
-        top = min(int(top_hz), p.pump_max_top_speed_hz) if top_hz else p.pump_max_top_speed_hz
+        # bypass_tune_cap(2026-10-07 · 세척 에어퍼지) — 명시 속도를 튠 V 대신 **기종 매뉴얼 최대**로만 자른다(하드웨어 보호는 유지).
+        #   튠 V 는 정비 이동 속도라 그대로 두고 이 스텝만 빠르게 돈다. 시작·컷오프는 프리셋 그대로(≤ top).
+        cap = (
+            PUMP_MANUAL_RANGES.get(self.MODEL_ID, {}).get("pumpMaxTopSpeedHz", (0, p.pump_max_top_speed_hz))[1]
+            if bypass_tune_cap and top_hz
+            else p.pump_max_top_speed_hz
+        )
+        top = min(int(top_hz), cap) if top_hz else p.pump_max_top_speed_hz
         top = max(self.MIN_SPEED_HZ, top)
         # 시작·컷오프는 top 을 넘지 못한다(단조성) + 각자의 프리셋 상한 안 + 기종 하한(MIN_SPEED_HZ) 위.
         #   하한 바닥은 방어 한 겹(2026-09-22 검증 P0-1) — 프리셋이 튠으로 낮아져도 v·c 가 XCalibur err3 영역
@@ -1438,7 +1448,9 @@ class Sy01bEngineAdapter:
             if code != 0:
                 return EngineResult(raw_error_code=code, detail="setup failed")
 
-            speed_in = self._speed_cmd(cmd.aspirate_speed_hz, cmd.slope)
+            speed_in = self._speed_cmd(
+                cmd.aspirate_speed_hz, cmd.slope, bypass_tune_cap=cmd.bypass_tune_cap
+            )
             # ① 흡입 구멍으로 밸브 회전 — 포트가 없으면(구계약) 회전을 건너뛴다(현 위치 유지).
             if cmd.in_port is not None:
                 code = self._settle(addr, f"I{cmd.in_port}R", self.read_timeout_s, poll=True)
@@ -1458,7 +1470,9 @@ class Sy01bEngineAdapter:
             if aspirate_only:
                 return EngineResult(raw_error_code=0)
 
-            speed_out = self._speed_cmd(cmd.dispense_speed_hz, cmd.slope)
+            speed_out = self._speed_cmd(
+                cmd.dispense_speed_hz, cmd.slope, bypass_tune_cap=cmd.bypass_tune_cap
+            )
             # ③ 배출 구멍으로 밸브 회전.
             if cmd.out_port is not None:
                 code = self._settle(addr, f"O{cmd.out_port}R", self.read_timeout_s, poll=True)

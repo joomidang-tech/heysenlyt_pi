@@ -192,14 +192,14 @@ SNAPSHOT_PARITY_VECTORS = [
     {
         "frame": {
             "pumpPreset": {"pumpPresetId": "tecan_xcalibur", "pumpFullStroke": 3000, "syringeCapacityMl": 0.25,
-                           "pumpMaxStartSpeedHz": 900, "pumpMaxTopSpeedHz": 1200, "pumpMaxCutoffSpeedHz": 900,
-                           "pumpMaxSlope": 5, "pumpSyringeTypeCode": 0},
+                           "pumpMaxStartSpeedHz": 900, "pumpMaxTopSpeedHz": 1400, "pumpMaxCutoffSpeedHz": 900,
+                           "pumpMaxSlope": 7, "pumpSyringeTypeCode": 0},
             "hardware": {"pumpModel": "tecan_xcalibur", "contractId": "sensorium-icad-0.1.0+tecan",
                          "valvePortCount": 12},
             "pumpPorts": {"1": {}, "2": {}, "3": {}, "4": {}},
         },
         "mode": "fragrance",
-        "expect": {"model": "tecan_xcalibur", "capacity": 0.25, "v": 900, "V": 1200, "c": 900, "L": 5,
+        "expect": {"model": "tecan_xcalibur", "capacity": 0.25, "v": 900, "V": 1400, "c": 900, "L": 7,
                    "addrs": [1, 2, 3, 4]},
     },
     {

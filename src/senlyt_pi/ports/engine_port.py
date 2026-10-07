@@ -41,6 +41,8 @@ class EngineDispenseCommand:
     aspirate_speed_hz: int | None = None
     dispense_speed_hz: int | None = None
     slope: int | None = None
+    # 튠 상한 무시(2026-10-07 · 세척 에어퍼지) — True 면 이 명령의 속도를 기종 매뉴얼 최대로만 자른다(정비 이동 V 불변).
+    bypass_tune_cap: bool = False
 
 
 @dataclass(frozen=True, slots=True)
