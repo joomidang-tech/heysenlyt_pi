@@ -7,8 +7,15 @@ hey_senlyt **v1.4.0** 디스펜서 데몬(`senlytd`). 라즈베리파이에서 �
 ## 1. 설치 (라즈베리파이에서 한 줄)
 
 ```bash
-REF=v1.4.0; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/$REF/install.sh" \
+# prod — 사람이 PR 로 승격한 main
+REF=main; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/$REF/install.sh" \
   | sudo env SENLYT_INSTALL_REF=$REF bash -s -- https://senlyt.com
+# dev
+REF=dev; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/$REF/install.sh" \
+  | sudo env SENLYT_INSTALL_REF=$REF bash -s -- https://dev-env.senlyt.com
+# 프리뷰 — 버전 브랜치
+REF=v1.4.0; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/$REF/install.sh" \
+  | sudo env SENLYT_INSTALL_REF=$REF bash -s -- https://v1-4-0.env.senlyt.com
 ```
 
 정하는 것은 두 가지뿐입니다.
@@ -19,6 +26,7 @@ REF=v1.4.0; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenl
 | 붙을 서버 | 맨 끝 URL | prod `https://senlyt.com` · dev `https://dev-env.senlyt.com` · 프리뷰 `https://v1-4-0.env.senlyt.com` |
 
 > ⚠️ `REF` 는 **URL 경로와 `SENLYT_INSTALL_REF` 두 곳에 같은 값**이 들어가야 합니다(그래서 변수 하나로 씁니다). 설치 스크립트도 버전마다 바뀌어, `main` 의 스크립트로 새 버전을 깔면 제대로 뜨지 않습니다.
+> ⚠️ **서버와 REF 를 짝지어 씁니다** — prod 기기에 버전 브랜치(`v1.4.0`)를 깔면 사람 승격(PR)을 거치지 않은 코드가 매장에 나갑니다.
 
 설치가 끝나면:
 1. 관리 화면(`<서버URL>/admin`)에 기기가 **"승인 대기"** 로 뜹니다.

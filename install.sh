@@ -2,10 +2,11 @@
 # hey senlyt pi daemon — 라즈베리파이 1줄 설치·구동 (다운로드부터 자동).
 #
 # 사용 (Pi에서 한 줄) — **스크립트와 소스를 같은 REF 에서** 받는다(변수 하나):
-#   REF=v1.4.0; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/$REF/install.sh" \
-#     | sudo env SENLYT_INSTALL_REF=$REF bash -s -- https://senlyt.com            # prod
-#     | sudo env SENLYT_INSTALL_REF=$REF bash -s -- https://dev-env.senlyt.com    # dev
-#     | sudo env SENLYT_INSTALL_REF=$REF bash -s -- https://v1-4-0.env.senlyt.com # 프리뷰
+#   REF=<아래 짝>; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/$REF/install.sh" \
+#     | sudo env SENLYT_INSTALL_REF=$REF bash -s -- <서버URL>
+#   prod   REF=main   https://senlyt.com
+#   dev    REF=dev    https://dev-env.senlyt.com
+#   프리뷰 REF=v1.4.0 https://v1-4-0.env.senlyt.com   (버전 브랜치는 프리뷰에만 — prod 에 깔면 승격 PR 우회)
 #
 # ⚠️ raw URL 경로를 main 으로 고정하지 않는다 — 이 스크립트도 버전마다 바뀐다(v1.4.0 에서 크게 변경).
 #    main 의 스크립트로 새 버전 소스를 깔면 옛 절차로 설치돼 제대로 뜨지 않는다(2026-09-30 실측).
@@ -45,7 +46,7 @@ SERVICE="/etc/systemd/system/senlytd.service"
 # ── 0. 인자·권한 체크 ──────────────────────────────────────────────────────
 if [ -z "$SERVER_URL" ]; then
 	echo "❌ 서버 URL이 필요합니다." >&2
-	echo "   예: REF=v1.4.0; curl -fsSL .../heysenlyt_pi/\$REF/install.sh | sudo env SENLYT_INSTALL_REF=\$REF bash -s -- https://senlyt.com" >&2
+	echo "   예: REF=main; curl -fsSL .../heysenlyt_pi/\$REF/install.sh | sudo env SENLYT_INSTALL_REF=\$REF bash -s -- https://senlyt.com" >&2
 	exit 1
 fi
 case "$SERVER_URL" in

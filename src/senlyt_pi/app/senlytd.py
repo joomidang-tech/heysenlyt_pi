@@ -20,7 +20,10 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Callable, Mapping
+from typing import TYPE_CHECKING, Callable, Mapping
+
+if TYPE_CHECKING:  # 타입 전용.
+    from ..adapters.pump_model_detect import DetectResult
 
 from ..adapters.settings_source import expected_pump_addrs
 from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
@@ -373,24 +376,18 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
             state_dir = environ.get(SENLYT_STATE_DIR_ENV, "").strip() or environ.get(
                 "LOG_DIR", ""
             ).strip()
-            from ..adapters.pump_model_detect import detect_on_candidates, detect_pump_model
-            from ..adapters.serial_port_discovery import list_candidate_ports
-
             while True:
                 time.sleep(delay)
                 # ① 실물 재감지(2026-09-14) — 엔진이 Undeclared 라 포트를 쥔 주체가 없어 안전. 균일 기종이 잡히면
                 #   재기동(부팅 감지가 같은 결과로 조립). 혼합/판독 불가는 계속 대기.
                 #   포트도 펌프 응답으로 고른다(2026-10-02 — 부팅 감지와 같은 규칙).
                 try:
-                    _expected = list(watch_addrs)  # 향연 4대(2026-09-29) — 부팅 감시와 같은 주소
-                    _port, _det = detect_on_candidates(
-                        list_candidate_ports(environ),
-                        _expected,
-                        lambda p, a: detect_pump_model(p, a, logger=logger),
+                    _model = redetected_model_to_adopt(
+                        environ, list(watch_addrs), components.declared_pump_model, logger
                     )
-                    if _det is not None and _det.model is not None:
+                    if _model is not None:
                         logger.warn(
-                            f"실물 기종 감지(model={_det.model}) — 정상 종료 후 재기동으로 재조립합니다",
+                            f"실물 기종 감지(model={_model}) — 정상 종료 후 재기동으로 재조립합니다",
                             stage=STAGE_PI_RECEIVED,
                         )
                         os.kill(os.getpid(), signal.SIGTERM)
@@ -444,6 +441,37 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
     )
     daemon.boot()  # stop 까지 블록 — 종료 시 shutdown(우아한 종료) 수행.
     return 0
+
+
+def redetected_model_to_adopt(
+    environ: Mapping[str, str],
+    expected_addrs: "list[int]",
+    declared: "str | None",
+    logger: StructuredLogger,
+    *,
+    scan: "Callable[[], tuple[str | None, DetectResult | None]] | None" = None,
+) -> "str | None":
+    """Undeclared 재감지 1회 — 재기동할 기종(없으면 None). 부팅과 같은 채택 규칙(AUTODET-17).
+
+    부팅이 거부할 지문으로 재기동하면 같은 판정으로 다시 Undeclared → 60초 재시작 무한 반복.
+    """
+    from .bootstrap import adoptable_detected_model
+
+    if scan is None:
+        from ..adapters.pump_model_detect import detect_on_candidates, detect_pump_model
+        from ..adapters.serial_port_discovery import list_candidate_ports
+
+        def scan() -> "tuple[str | None, DetectResult | None]":
+            return detect_on_candidates(
+                list_candidate_ports(environ),
+                expected_addrs,
+                lambda p, a: detect_pump_model(p, a, logger=logger),
+            )
+
+    _port, det = scan()
+    if det is None:
+        return None
+    return adoptable_detected_model(det, declared)
 
 
 # ── 호스트 열/전압/스로틀 프로브(2026-07-25) — 실기기 과열→통신끊김 진단의 관측 씨앗 ───────────

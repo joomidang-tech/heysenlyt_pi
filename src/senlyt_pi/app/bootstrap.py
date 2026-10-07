@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # 타입 전용.
-    from ..adapters.pump_model_detect import Detector
+    from ..adapters.pump_model_detect import DetectResult, Detector
 
 import threading
 import time
@@ -153,6 +153,20 @@ class DaemonComponents:
     # 부팅 감지에서 `?` 에 응답한 주소(2026-09-14) — build_resolver 가 2차 스캔 없이 그대로 pump_map 으로 쓴다
     #   ("감지 기종과 pump_map 이 같은 관측에서 나온다" + 부재 주소 프로브 상한 낭비 0). None = 감지 안 함.
     detected_pump_addrs: "tuple[int, ...] | None" = None
+    # 부팅 감지 직전의 선언 기종(스냅샷 > 캐시) — Undeclared 재감지가 부팅과 같은 채택 규칙을 쓰게 넘긴다(AUTODET-17).
+    declared_pump_model: "str | None" = None
+
+
+def adoptable_detected_model(det: "DetectResult", declared: "str | None") -> "str | None":
+    """감지 결과 중 조립에 채택할 기종 — 부팅·Undeclared 재감지가 같이 쓴다(AUTODET-13·17).
+
+    형식 규칙만으로 sy01b 로 분류됐는데 선언이 sy01b 가 아니면 채택하지 않는다(근거 강도 비대칭 · 검증 P0-1).
+    """
+    if det.model is None:
+        return None
+    if det.model == "sy01b" and not det.strong and declared != "sy01b":
+        return None
+    return det.model
 
 
 def _resolve_mode(environ: Mapping[str, str]) -> str:
@@ -909,6 +923,7 @@ def build_components(
     #    엔진 주입(테스트)·fake 스위치·후보 포트 없음이면 건너뛴다(감지 없음 = 종전 경로 그대로).
     detected_pump_addrs: "tuple[int, ...] | None" = None
     undeclared_detail: "str | None" = None
+    declared_pump_model: "str | None" = hardware_profile.pump_model if hardware_profile is not None else None
     # 펌프가 응답한 포트(2026-10-02) — 엔진도 이 포트로 조립한다(None = 감지 안 함 → 종전 첫 후보).
     picked_port: "str | None" = None
     _detect = fetch_settings if detect_hardware is None else detect_hardware
@@ -943,7 +958,7 @@ def build_components(
                 #   ⚠️ 비대칭의 이유: Tecan 정규식(`^30\d{6}\s+[A-Z]`)은 좁아 Runze 가 만들 수 없는 꼴이라 형식만으로도
                 #   채택한다(sy01b 선언을 뒤집어 Tecan 어댑터로 — 그 반대인 sy01b 조립이 곧 U-NVM 위험). Runze 형식만은 안 된다.
                 _weak_conflict = (
-                    _det.model == "sy01b" and not _det.strong and _declared != "sy01b"
+                    _det.model is not None and adoptable_detected_model(_det, _declared) is None
                 )
                 if _weak_conflict:
                     log.warn(
@@ -1148,6 +1163,7 @@ def build_components(
         hardware_source=hardware_source,
         server_settings=server_settings,
         detected_pump_addrs=detected_pump_addrs,
+        declared_pump_model=declared_pump_model,
     )
 
 
