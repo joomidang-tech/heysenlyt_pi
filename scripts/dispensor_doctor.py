@@ -46,7 +46,7 @@ class Api:
     def __init__(self, base: str, operator: str):
         self.base = base
         oid, pw = operator.split(":", 1)
-        self.token = self._post("/api/admin/login", {"operatorId": oid, "password": pw})["token"]
+        self.token = self._post("/api/operator/login", {"operatorId": oid, "password": pw})["token"]
 
     def _req(self, method: str, path: str, body: dict | None = None) -> dict:
         req = urllib.request.Request(
@@ -72,7 +72,7 @@ class Api:
 
     # ── 도메인 호출 ──
     def pick_device(self, want: str | None) -> dict:
-        ds = self.get("/api/admin/dispensers/health").get("dispensers", [])
+        ds = self.get("/api/operator/dispensers/health").get("dispensers", [])
         if want:
             d = next((x for x in ds if x["deviceId"] == want), None)
             if not d:
@@ -84,17 +84,17 @@ class Api:
         sys.exit(f"✗ 기기 자동선택 불가 — --device 로 지정. 목록: {[x['deviceId'] for x in ds]}")
 
     def estop(self, device_id: str, active: bool) -> dict:
-        return self._post(f"/api/admin/dispensers/{device_id}/estop", {"active": active})
+        return self._post(f"/api/operator/dispensers/{device_id}/estop", {"active": active})
 
     def issue(self, device_id: str, steps: list[dict], note: str) -> str:
         r = self._post(
-            f"/api/admin/dispensers/{device_id}/commands",
+            f"/api/operator/dispensers/{device_id}/commands",
             {"kind": "maintenance", "steps": steps, "note": note},
         )
         return r["commandSetId"]
 
     def status(self, device_id: str, cs_id: str) -> dict:
-        return self.get(f"/api/admin/dispensers/{device_id}/commands/{cs_id}")
+        return self.get(f"/api/operator/dispensers/{device_id}/commands/{cs_id}")
 
 
 def engine_op(pump: int, op: str, idx: int = 0, stage: int = 0) -> dict:

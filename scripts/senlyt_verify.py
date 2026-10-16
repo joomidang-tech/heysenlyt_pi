@@ -249,7 +249,7 @@ def check_health_e2e(base: str, operator: str) -> None:
     try:
         oid, pw = operator.split(":", 1)
         req = urllib.request.Request(
-            f"{base}/api/admin/login",
+            f"{base}/api/operator/login",
             data=json.dumps({"operatorId": oid, "password": pw}).encode(),
             headers={"Content-Type": "application/json"},
         )
@@ -257,7 +257,7 @@ def check_health_e2e(base: str, operator: str) -> None:
         h = json.load(
             urllib.request.urlopen(
                 urllib.request.Request(
-                    f"{base}/api/admin/dispensers/health",
+                    f"{base}/api/operator/dispensers/health",
                     headers={"Authorization": f"Bearer {tok}"},
                 ),
                 timeout=10,
