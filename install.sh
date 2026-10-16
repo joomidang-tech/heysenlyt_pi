@@ -18,6 +18,9 @@
 #                                 — 버전 전환기엔 유추가 옛 브랜치를 고르므로 명시를 권장
 #                                 (구 이름 SENLYT_INSTALL_BRANCH 도 같은 뜻의 별칭으로 받는다)
 #   ③ 어느 서버를 보나          = 첫 인자, 또는 SENLYT_SERVER_BASE_URL (인자가 우선)
+#   ④ 어느 지점에 등록하나      = SENLYT_BRANCH_ID (**필수** · v2.0.0 · 2026-10-15) — 운영자 웹 「기기 등록」 창의
+#                                 설치 명령이 넣어 준다. 없으면 설치를 멈춘다(서버도 지점 없는 등록을 400 으로 거절).
+#                                 ⚠️ 여기서 「지점」= 매장(성수 등)이다. git 브랜치(SENLYT_INSTALL_REF)와 무관.
 #
 # 사람이 넣는 건 **서버 URL 하나**뿐. 나머지는 켜진 뒤 자동:
 #   - deviceId  = HW 시리얼 자동수집(RPi4=cpuinfo·RPi5=device-tree)
@@ -53,6 +56,16 @@ case "$SERVER_URL" in
 	http://*|https://*) : ;;
 	*) echo "❌ 서버 URL은 http(s):// 로 시작해야 합니다 (받은 값: $SERVER_URL)" >&2; exit 1 ;;
 esac
+# 지점(매장) — 등록 본문 branchId 로 보낸다(서버 05 §6.9 머리 · 지점 없는 등록은 없다)
+BRANCH_ID="${SENLYT_BRANCH_ID:-}"
+if [ -z "$BRANCH_ID" ]; then
+	echo "❌ 등록할 지점(SENLYT_BRANCH_ID)이 없습니다." >&2
+	echo "   운영자 웹 → 기기 홈 → 「기기 등록」 창에서 새 설치 명령을 복사해 다시 실행하세요." >&2
+	exit 1
+fi
+case "$BRANCH_ID" in
+	*[!a-z0-9-]*|-*) echo "❌ 지점 id 형식이 아닙니다 (받은 값: $BRANCH_ID)" >&2; exit 1 ;;
+esac
 if [ "$(id -u)" -ne 0 ]; then
 	echo "❌ root 권한이 필요합니다(systemd·GPIO·시리얼). sudo 로 실행하세요." >&2
 	exit 1
@@ -68,7 +81,7 @@ if [ -z "$REF" ]; then
 	esac
 fi
 
-echo "▶ hey senlyt pi 설치 — server=$SERVER_URL  (ref=$REF)"
+echo "▶ hey senlyt pi 설치 — server=$SERVER_URL  (ref=$REF · 지점=$BRANCH_ID)"
 
 # ── 1. 시스템 의존성 (Raspberry Pi OS Bookworm 기준 · Python 3.11+) ─────────
 #   하드웨어 라이브러리는 **apt 프리빌트**로 설치한다(pip 소스컴파일 = swig/컴파일러 필요 → 실패).
@@ -136,7 +149,7 @@ umask 077
 #   매끄럽다(배정 전 부팅은 UndeclaredEngineAdapter = 전 모션 거부라 **안전**하지만, 선언 수신
 #   → 자동 재기동 1사이클을 더 돈다). 종전 "배정 전 부팅 = sy01b 조립 → NVM 기록 위험" 서술은
 #   수정 전 거동이다 — 미선언 폴백 sy01b 는 코드에서 금지됐다(bootstrap 조립 테스트가 강제).
-_MANAGED_KEYS="SENLYT_SERVER_BASE_URL SENLYT_INSTALL_REF SENLYT_INSTALL_COMMIT SENLYT_RUN LOG_DIR SENLYT_LEDGER_PATH SENLYT_STATE_DIR PUMP_ADDRESSES SENLYT_ENGINE"
+_MANAGED_KEYS="SENLYT_SERVER_BASE_URL SENLYT_INSTALL_REF SENLYT_INSTALL_COMMIT SENLYT_BRANCH_ID SENLYT_RUN LOG_DIR SENLYT_LEDGER_PATH SENLYT_STATE_DIR PUMP_ADDRESSES SENLYT_ENGINE"
 _PRESERVED=""
 if [ -f "$ENV_FILE" ]; then
   # `|| [ -n "$line" ]` — 끝 개행 없는 파일의 마지막 줄 보존(검증 P2-E: read 가 EOF 에서 false 를
@@ -169,6 +182,8 @@ cat > "$ENV_FILE" <<EOF
 SENLYT_SERVER_BASE_URL=$SERVER_URL
 SENLYT_INSTALL_REF=$REF
 SENLYT_INSTALL_COMMIT=$INSTALLED_SHA
+# 등록할 지점(매장 · git 브랜치 아님) — 데몬이 등록 본문 branchId 로 보낸다(2026-10-15)
+SENLYT_BRANCH_ID=$BRANCH_ID
 EOF
 if [ -n "$_PRESERVED" ]; then
   {

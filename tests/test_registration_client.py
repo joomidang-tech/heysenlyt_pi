@@ -56,6 +56,22 @@ class TestRegisterRequestWire:
         assert build_register_request("serial-1", "이름") == {"deviceId": "serial-1", "name": "이름"}
         assert build_register_request("serial-1") == {"deviceId": "serial-1"}
 
+    def test_regbr07_branch_id_in_body(self) -> None:
+        """REGBR-07(2026-10-15) — 설치 명령의 지점이 등록 본문 branchId 로 · 없으면 키 자체가 없다(서버가 400)."""
+        assert build_register_request("serial-1", None, "seongsu") == {
+            "deviceId": "serial-1",
+            "branchId": "seongsu",
+        }
+        assert "branchId" not in build_register_request("serial-1", None, None)
+        sent: list[dict] = []
+
+        def transport(body: dict):
+            sent.append(body)
+            return 202, {"deviceId": "serial-1", "status": "pending"}
+
+        RegistrationClient(transport, device_id="serial-1", branch_id="hq-demo").register()
+        assert sent[0]["branchId"] == "hq-demo"
+
     def test_empty_device_id_rejected(self):
         with pytest.raises(ValueError):
             build_register_request("")

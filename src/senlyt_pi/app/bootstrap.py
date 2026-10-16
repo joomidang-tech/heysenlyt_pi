@@ -89,6 +89,8 @@ SENLYT_MODE_ENV = "SENLYT_MODE"
 SENLYT_IDENTITY_PATH_ENV = "SENLYT_IDENTITY_PATH"
 # 매장 표시 이름(선택) — register name.
 SENLYT_DEVICE_NAME_ENV = "SENLYT_DEVICE_NAME"
+# 등록할 지점(매장 · git 브랜치 아님) — install.sh 가 device.env 에 각인(2026-10-15 · 서버 05 §6.9 머리)
+SENLYT_BRANCH_ID_ENV = "SENLYT_BRANCH_ID"
 # 멱등 ledger 파일 경로 override(기본 = LOG_DIR 또는 작업 디렉터리).
 SENLYT_LEDGER_PATH_ENV = "SENLYT_LEDGER_PATH"
 # 관측 로그 디스크 스풀 파일 경로 override(기본 = LOG_DIR 또는 작업 디렉터리).
@@ -808,16 +810,24 @@ def build_components(
             transport,
             device_id=device_id,
             name=environ.get(SENLYT_DEVICE_NAME_ENV) or None,
+            branch_id=environ.get(SENLYT_BRANCH_ID_ENV) or None,
         )
         try:
             # server_base_url 전달 = 서버 바인딩(2026-07-23) — 저장된 정체성이 다른 서버 것이면(=URL 만
             #   바꿔 재설치) 그 서버에 재등록해 admin 후보로 뜨게 한다(옛 서버 정체성 재사용 → 페어링 실패 방지).
             identity = ensure_registered(store, client, server_base_url=server_config.base_url)
         except Exception as e:  # RegistrationError 포함 — fail-fast 표면화.
+            code = getattr(e, "code", None)
             log.error(
                 "디바이스 등록 실패 — 부팅 중단",
                 stage=STAGE_ERROR,
                 error=str(e),
+                # 지점 없는 옛 설치(05 §6.9 머리) — 할 일을 로그에 바로 남긴다(r35 V35-9 · 06 REGBR-10)
+                **(
+                    {"hint": "운영자 웹에서 새 설치 명령을 받아 다시 설치하세요"}
+                    if code == "branch_required"
+                    else {}
+                ),
             )
             raise BootstrapError(f"등록 실패: {e}") from e
     else:

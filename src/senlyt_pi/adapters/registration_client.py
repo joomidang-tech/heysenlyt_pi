@@ -61,12 +61,27 @@ class RegistrationError(Exception):
         super().__init__(f"RegistrationError({code} retryable={retryable} http={http_status})")
 
 
-def build_register_request(device_id: str, name: str | None = None) -> dict[str, Any]:
-    """RegisterRequest 와이어 조립 — deviceId(=수집 시리얼·D-A) 제시. name 은 includeIfNull:false."""
+def _error_code(body: Any) -> str | None:
+    """오류 응답 본문의 `code`(05 §6.9) — 없거나 모양이 다르면 None."""
+    if isinstance(body, Mapping):
+        code = body.get("code")
+        if isinstance(code, str) and code:
+            return code
+    return None
+
+
+def build_register_request(
+    device_id: str, name: str | None = None, branch_id: str | None = None
+) -> dict[str, Any]:
+    """RegisterRequest 와이어 조립 — deviceId(=수집 시리얼·D-A) 제시. name·branchId 는 includeIfNull:false.
+
+    branchId = 설치 명령이 정한 지점(매장 · 2026-10-15 서버 05 §6.9 머리) — 없으면 서버가 400 branch_required.
+    """
     if not isinstance(device_id, str) or device_id == "":
         raise ValueError("deviceId(시리얼)는 비어있지 않은 문자열(계약 minLength 1)")
     m: dict[str, Any] = {"deviceId": device_id}
     put_if_present(m, "name", name)
+    put_if_present(m, "branchId", branch_id)
     return m
 
 
@@ -102,6 +117,7 @@ class RegistrationClient:
         *,
         device_id: str,
         name: str | None = None,
+        branch_id: str | None = None,
         max_retries: int = DEFAULT_REGISTER_MAX_RETRIES,
         retry_delays_seconds: tuple[float, ...] = DEFAULT_RETRY_DELAYS_SECONDS,
         sleep: Callable[[float], None] | None = None,
@@ -109,6 +125,7 @@ class RegistrationClient:
         self.transport = transport
         self.device_id = device_id  # = 수집 HW 시리얼(D-A). 등록 요청에 제시·정체성 권위값.
         self.name = name
+        self.branch_id = branch_id  # 설치 명령의 지점(SENLYT_BRANCH_ID) — 등록 본문 branchId
         self.max_retries = max_retries
         self.retry_delays_seconds = retry_delays_seconds
         self._sleep = sleep if sleep is not None else time.sleep
@@ -123,7 +140,7 @@ class RegistrationClient:
           - RegistrationError(retryable=False): 4xx invalid_request(구성 오류·재시도 무의미).
           - RegistrationError(retryable=True): 전송/5xx/계약위반 재시도 소진.
         """
-        request = build_register_request(self.device_id, self.name)
+        request = build_register_request(self.device_id, self.name, self.branch_id)
         last_error: RegistrationError | None = None
 
         for attempt in range(self.max_retries + 1):
@@ -153,8 +170,14 @@ class RegistrationClient:
                     continue
 
             if 400 <= status < 500:
-                # 400 invalid_request — 재시도 무의미(구성 오류). (공유키 제거로 401 경로 없음·TOFU.)
-                raise RegistrationError("invalid_request", retryable=False, http_status=status)
+                # 서버 코드를 그대로 보존(r35 V35-9 — 「branch_required = 새 설치 명령으로 재설치」 안내가 기기 로그에 남게).
+                #   지점 비활성(409 branch_not_active)만 재시도 — 운영자가 지점을 다시 켜면 스스로 회복한다.
+                #   그 밖 4xx = 재시도 무의미(구성 오류) · 본문에 코드가 없으면 종전대로 invalid_request.
+                code = _error_code(body) or "invalid_request"
+                if code == "branch_not_active":
+                    last_error = RegistrationError(code, retryable=True, http_status=status)
+                    continue
+                raise RegistrationError(code, retryable=False, http_status=status)
 
             # 5xx — 500 register_failed 등 → 재시도.
             code = "register_failed"
