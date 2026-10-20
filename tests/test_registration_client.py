@@ -396,3 +396,38 @@ class TestHardwareIdSeam:
             env={}, cpuinfo_path=tmp_path / "none", machine_id_path=tmp_path / "none"
         )
         assert got is None
+
+
+class TestCutoverIdentityGeneration:
+    """PIID-02(2026-10-21 · v2.0.0 06) — 컷오버 재설치가 옛 GCP 신원을 재사용하지 않는다."""
+
+    def test_old_generation_file_is_ignored_and_kept(self, tmp_path: Path):
+        from senlyt_pi.app.bootstrap import _identity_path
+
+        url = "https://senlyt.com"
+        env = {"SENLYT_STATE_DIR": str(tmp_path)}
+        old = tmp_path / "identities" / "senlyt.com.json"
+        DeviceIdentityStore(old).save(
+            DeviceIdentity(
+                device_id=SERIAL, dispenser_token="tok-gcp", exp=5_000, server_base_url=url
+            )
+        )
+        old_bytes = old.read_bytes()
+
+        store = DeviceIdentityStore(_identity_path(env, url))
+        t = ScriptedTransport(
+            [(202, {"deviceId": SERIAL, "status": "pending"}), (200, OK_BODY)]
+        )
+        got = ensure_registered(
+            store,
+            client(t, branch_id="hq-demo"),
+            now_seconds=1_000,
+            server_base_url=url,
+            sleep=lambda _s: None,
+        )
+        assert len(t.calls) == 2  # 등록 요청 → 승인 대기 → 승인 뒤 새 토큰.
+        assert t.calls[0]["branchId"] == "hq-demo"
+        assert got.dispenser_token == "tok-1"
+        assert _identity_path(env, url) == tmp_path / "identities" / "v2" / "senlyt.com.json"
+        assert store.load() == got
+        assert old.read_bytes() == old_bytes  # 롤백 때 v1.4.0 pi 가 그대로 쓴다.

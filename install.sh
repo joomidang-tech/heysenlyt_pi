@@ -202,7 +202,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 # 서비스 배선 값(설정 아님 — env 다이어트 2026-09-02). 소비루프 스위치 + 설치 표준 경로.
-#   정체성은 서버(환경)별 분리 저장(\$SENLYT_STATE_DIR/identities/{서버host}.json — 데몬이 서버
+#   정체성은 서버(환경)별 분리 저장(\$SENLYT_STATE_DIR/identities/v2/{서버host}.json — v2.0.0 세대 폴더 · 데몬이 서버
 #   URL 로 파일명 파생·2026-07-23): 서버를 바꿔 재설치해도 각 서버의 등록·승인이 보존된다.
 # EnvironmentFile 은 **선언 위치와 무관하게** Environment= 를 덮는다(systemd.exec(5):
 #   "Settings from these files override settings made with Environment=" — 순서 규칙은

@@ -276,9 +276,9 @@ class TestPerEnvIdentityPath:
         dev = _identity_path(env, "https://dev-env.senlyt.com")
         v120 = _identity_path(env, "https://v1-2-0.env.senlyt.com")
         prod = _identity_path(env, "https://senlyt.com")
-        assert str(dev) == "/var/lib/senlyt/identities/dev-env.senlyt.com.json"
-        assert str(v120) == "/var/lib/senlyt/identities/v1-2-0.env.senlyt.com.json"
-        assert str(prod) == "/var/lib/senlyt/identities/senlyt.com.json"
+        assert str(dev) == "/var/lib/senlyt/identities/v2/dev-env.senlyt.com.json"
+        assert str(v120) == "/var/lib/senlyt/identities/v2/v1-2-0.env.senlyt.com.json"
+        assert str(prod) == "/var/lib/senlyt/identities/v2/senlyt.com.json"
         assert dev != v120 != prod  # 서버별 분리 = 전환해도 서로 안 덮음.
 
     def test_explicit_path_overrides(self) -> None:
@@ -295,9 +295,9 @@ class TestPerEnvIdentityPath:
         """base = SENLYT_STATE_DIR > LOG_DIR > cwd."""
         env = {"SENLYT_STATE_DIR": "/var/lib/senlyt", "LOG_DIR": "/var/log/senlyt"}
         assert _identity_path(env, "https://senlyt.com").parent == Path(
-            "/var/lib/senlyt/identities"
+            "/var/lib/senlyt/identities/v2"
         )
         env2 = {"LOG_DIR": "/var/log/senlyt"}  # state 없으면 log_dir
         assert _identity_path(env2, "https://senlyt.com").parent == Path(
-            "/var/log/senlyt/identities"
+            "/var/log/senlyt/identities/v2"
         )

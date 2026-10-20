@@ -115,6 +115,10 @@ DEFAULT_IDENTITY_FILENAME = "device-identity.json"
 # 환경별 정체성 파일 하위 디렉터리 — 서버(환경)마다 자기 신분증을 따로 둔다(2026-07-23).
 #   서버를 바꿔 재설치해도 각 서버의 등록·승인이 보존돼, 돌아오면 재승인·왕복 없이 즉시 재사용.
 IDENTITIES_SUBDIR = "identities"
+# v2.0.0 세대 하위 폴더 — 컷오버는 같은 주소(senlyt.com)가 GCP→AWS 로 넘어가 옛 신원(GCP 토큰)을 그대로
+#   재사용하게 된다. 새 세대 폴더를 쓰면 재설치 첫 부팅이 등록 요청을 보내고, 옛 파일은 롤백용으로 남는다.
+#   v2.0.0 06 PIID-01·02 · 체크리스트 2-0 R-3(2026-10-21).
+IDENTITY_GENERATION = "v2"
 DEFAULT_LEDGER_FILENAME = "idempotency-ledger.log"
 DEFAULT_TRACE_SPILL_FILENAME = "trace-spill.jsonl"
 
@@ -401,7 +405,7 @@ def _server_slug(server_base_url: str) -> str:
 def _identity_path(environ: Mapping[str, str], server_base_url: str | None = None) -> Path:
     """정체성 파일 경로. 우선순위:
     1) SENLYT_IDENTITY_PATH 명시 → 그대로(단일 파일 override·하위호환).
-    2) server_base_url 있으면 → {state}/identities/{slug}.json (**환경별 분리** — 서버마다 신분증 따로).
+    2) server_base_url 있으면 → {state}/identities/v2/{slug}.json (**환경별 분리** — 서버마다 신분증 따로 · v2 = PIID-01).
     3) 서버 미상 → {state}/device-identity.json (구 단일 파일 폴백).
     state = SENLYT_STATE_DIR > LOG_DIR > cwd.
     """
@@ -412,7 +416,7 @@ def _identity_path(environ: Mapping[str, str], server_base_url: str | None = Non
     log_dir = environ.get("LOG_DIR", "").strip()
     base = Path(state_dir) if state_dir else (Path(log_dir) if log_dir else Path.cwd())
     if server_base_url:
-        return base / IDENTITIES_SUBDIR / f"{_server_slug(server_base_url)}.json"
+        return base / IDENTITIES_SUBDIR / IDENTITY_GENERATION / f"{_server_slug(server_base_url)}.json"
     return base / DEFAULT_IDENTITY_FILENAME
 
 
