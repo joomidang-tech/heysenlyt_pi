@@ -56,6 +56,17 @@ def test_bluetooth_debug_excluded():
     assert cands == ["/dev/ttyUSB0"]
 
 
+def test_onboard_uart_excluded():
+    """Pi 내장 UART(ttyAMA*·ttyS*)는 펌프 후보가 아니다(2026-10-02 ttyAMA10 갇힘 사고)."""
+    cands = list_candidate_ports(
+        {},
+        port_lister=lambda: [_p("/dev/ttyS0"), _p("/dev/ttyAMA10"), _p("/dev/ttyUSB0", 0x1A86, 0x7523)],
+    )
+    assert cands == ["/dev/ttyUSB0"]
+    # USB 부재면 후보 0 — 재연결이 내장 UART 로 새지 않는다.
+    assert list_candidate_ports({}, port_lister=lambda: [_p("/dev/ttyAMA10")]) == []
+
+
 def test_discover_serial_port_first_candidate():
     assert discover_serial_port({}, port_lister=lambda: [_p("/dev/ttyUSB0", None, None)]) == "/dev/ttyUSB0"
     assert discover_serial_port({}, port_lister=lambda: []) is None

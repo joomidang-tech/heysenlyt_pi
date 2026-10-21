@@ -46,7 +46,7 @@ class Api:
     def __init__(self, base: str, operator: str):
         self.base = base
         oid, pw = operator.split(":", 1)
-        self.token = self._post("/api/admin/login", {"operatorId": oid, "password": pw})["token"]
+        self.token = self._post("/api/operator/login", {"operatorId": oid, "password": pw})["token"]
 
     def _req(self, method: str, path: str, body: dict | None = None) -> dict:
         req = urllib.request.Request(
@@ -72,7 +72,7 @@ class Api:
 
     # ── 도메인 호출 ──
     def pick_device(self, want: str | None) -> dict:
-        ds = self.get("/api/admin/dispensers/health").get("dispensers", [])
+        ds = self.get("/api/operator/dispensers/health").get("dispensers", [])
         if want:
             d = next((x for x in ds if x["deviceId"] == want), None)
             if not d:
@@ -84,17 +84,17 @@ class Api:
         sys.exit(f"✗ 기기 자동선택 불가 — --device 로 지정. 목록: {[x['deviceId'] for x in ds]}")
 
     def estop(self, device_id: str, active: bool) -> dict:
-        return self._post(f"/api/admin/dispensers/{device_id}/estop", {"active": active})
+        return self._post(f"/api/operator/dispensers/{device_id}/estop", {"active": active})
 
     def issue(self, device_id: str, steps: list[dict], note: str) -> str:
         r = self._post(
-            f"/api/admin/dispensers/{device_id}/commands",
+            f"/api/operator/dispensers/{device_id}/commands",
             {"kind": "maintenance", "steps": steps, "note": note},
         )
         return r["commandSetId"]
 
     def status(self, device_id: str, cs_id: str) -> dict:
-        return self.get(f"/api/admin/dispensers/{device_id}/commands/{cs_id}")
+        return self.get(f"/api/operator/dispensers/{device_id}/commands/{cs_id}")
 
 
 def engine_op(pump: int, op: str, idx: int = 0, stage: int = 0) -> dict:
@@ -102,7 +102,7 @@ def engine_op(pump: int, op: str, idx: int = 0, stage: int = 0) -> dict:
 
 
 def init_steps(pumps: list[int]) -> list[dict]:
-    # 약한 초기화 = 전 펌프 같은 stage(0) → pi 브로드캐스트 동시 홈 (admin forceInitAll 동형).
+    # 초기화 = 전 펌프 같은 stage(0) → pi 브로드캐스트 동시 홈 (admin forceInitAll 동형).
     return [engine_op(p, "initialize", idx=i, stage=0) for i, p in enumerate(pumps)]
 
 
@@ -172,7 +172,7 @@ class Runner:
 
     def s_init(self):
         self.api.estop(self.device_id, False)  # admin forceInitAll 동형: estop 해제 후 발사.
-        return self.scenario("약한 초기화(전 펌프)", init_steps([1, 2]), "약한 초기화(CLI 테스트)")
+        return self.scenario("초기화(전 펌프)", init_steps([1, 2]), "초기화(CLI 테스트)")
 
     def s_pump(self, pump: int, op: str):
         label = f"{pump}펌프 {'전량 흡입' if op=='plungerFull' else '전량 배출'}"
@@ -282,7 +282,7 @@ def main() -> None:
         return
 
     MENU = """
-  1) 약한 초기화(전 펌프)      2) 1펌프 흡입   3) 1펌프 배출
+  1) 초기화(전 펌프)      2) 1펌프 흡입   3) 1펌프 배출
   4) 2펌프 흡입               5) 2펌프 배출
   6) [에러경로] Busy 연타 검증(초기화 직후 흡입 — 신코드면 성공해야 함)
   7) [에러경로] estop 큐 정리 검증(ESTOP_CANCELED 기대)

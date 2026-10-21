@@ -6,9 +6,9 @@
 (정본 = 서버·단방향). 방어적 이중 clamp: 수신 프리셋도 `core.pump_guard.clamp_pump_preset`
 로 한 번 더 통과시킨다(서버↔pi 바이트-parity 이므로 정상 입력에선 no-op — §11 O-17 결).
 
-⚠️ **실시간 스왑 아님 — 부팅 스냅샷 1회**(감사 P2 최소 봉합·2026-07-18). 가동 중 운영자의 admin
-   설정(syringeCapacityMl 등) 변경은 **재기동 시** pi 에 반영된다. 상시 SSE settings 구독(진행 중
-   제조와 무경합 스왑)은 별도 웨이브(밸브 flowRate SoT 승격과 함께). 부팅 fetch 실패는
+(2026-09-30) 부팅 뒤 변경은 `settings_watcher.SettingsWatcher` 가 상시 구독으로 감지해(서버 `settingsHash` 대조) 데몬이 유휴일 때
+   **재시작 없이** 적용하고 새 해시를 보고한다(04_erd §9-3 단일 규칙 · 펌프 기종·주소 변경만 유휴 재시작으로 반영).
+   이 모듈은 스냅샷 → 값 변환만 한다(부팅·적용 공용). 부팅 fetch 실패는
    **best-effort** — 서버 미제공/네트워크 오류 시 모드 기본 용량(0.5mL)/sy01b 스트로크로 폴백한다.
 
 계약(heysenlyt-web `lib/server/settingsClamp.ts` MachineSettings — 읽기만·나머지 키 무시):
@@ -27,7 +27,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.parse import urlencode
 
 from ..config.server_target import ServerConfig
@@ -35,10 +35,14 @@ from ..core.pump_guard import (
     PUMP_PRESETS,
     PumpPreset,
     SyringeSpec,
+    apply_pump_tuning,
     clamp_pump_preset,
     resolve_syringe_capacity_ml,
 )
 from .http_client import SseStream, bearer_headers, open_sse
+
+if TYPE_CHECKING:
+    from ..persistence.hardware_profile_cache import HardwareProfile
 
 # 부팅 1회 settings SSE 타임아웃 — 서버는 subscribe 즉시 `event:settings` 를 push 하므로 짧게.
 #   connect 는 느린 링크를 빨리 포기(best-effort), read 는 첫 프레임 도착 여유.
@@ -79,10 +83,177 @@ def syringe_capacity_from_settings(settings: Any) -> float | None:
     return resolve_syringe_capacity_ml(cap, is_flavor=True)
 
 
+def pump_model_from_settings(settings: Any) -> "str | None":
+    """settings.**hardware.pumpModel** → 펌프 모델 **엄격 판독**(2026-09-02 단일 키 설계).
+
+    ⛔ 판독 채널은 `hardware`(기기 토큰 바인딩 SSE 에서만 서버가 주입하는 선언 블록) **단일**이다
+    — `pumpPreset.pumpPresetId` 를 읽으면 안 된다(R6 P0-1). 그 필드는 함대 settings 문서의
+    산술 축이라 **병합이 스킵돼도 항상 "sy01b" 가 채워져 있어**, "선언 없음"과 "sy01b 선언"을
+    구분할 수 없다 → 병합 스킵(레지스트리 순단·레거시 토큰·기기문서 부재) 부팅이 Tecan 실물에
+    sy01b 조립(U…R = XCalibur NVM 기록)으로 새고, 캐시까지 sy01b 로 오염된다. hardware 블록은
+    선언이 실제로 병합됐을 때만 존재하므로 부재 = 정직한 "미확정"(→ 캐시 폴백 → Undeclared).
+
+    ⛔ **clamp_pump_preset 미사용** — clamp 는 미지값을 sy01b 로 정규화하는데, 엔진 선택에서 그
+    관대함은 같은 U-NVM 급소로 샌다. 정확 등가만 인정, 그 외/부재 = None. 신모델의 카탈로그
+    등재는 그 모델을 지원하는 pi 릴리스와 동시에만 한다는 릴리스 규칙이 이 엄격성의 짝이다.
+
+    하위호환: 구 서버(hardware 미주입)와의 조합은 None → 캐시 → Undeclared 로 착지한다 —
+    롤아웃 규칙(web 선행 발행)이 이 조합을 봉쇄하고, 어겨도 무동작(복구 가능)이지 오조립이 아니다.
+    """
+    if not isinstance(settings, Mapping):
+        return None
+    hw = settings.get("hardware")
+    if not isinstance(hw, Mapping):
+        return None
+    model = hw.get("pumpModel")
+    if model in ("sy01b", "tecan_xcalibur"):
+        return model
+    return None
+
+
+# 형식 sanity 상한 — 제품 후보가 아니라 '깨진 값' 차단선(밸브 헤드가 이 근처일 리 없다). 선언 SoT 는 서버.
+_PORT_COUNT_SANITY_MAX = 64
+
+
+def valve_port_count_from_settings(settings: Any) -> "int | None":
+    """settings.hardware.valvePortCount(센소리움 파생·서버 주입 필드) → 선언된 포트 수. 부재/불량 = None(→12).
+
+    ⚠️ 후보를 열거하지 않는다(2026-09-04 — 종전엔 허용값을 열거했다): 포트 수는 센소리움 선언이 정하는
+    값이지 pi 가 미리 아는 목록이 아니다. 여기선 형식 sanity(양의 정수·물리적으로 말이 되는 범위)만.
+
+    hardware 블록은 **settings 객체 내부**의 서버 주입 필드다(clamp allowlist 밖 — 기기 토큰
+    바인딩 SSE 에서만 병합됨). 구 서버 스냅샷엔 없다 = None = 기존 12 거동(하위호환).
+    """
+    if not isinstance(settings, Mapping):
+        return None
+    hw = settings.get("hardware")
+    if not isinstance(hw, Mapping):
+        return None
+    n = hw.get("valvePortCount")
+    if isinstance(n, bool) or not isinstance(n, int):
+        return None
+    return n if 1 <= n <= _PORT_COUNT_SANITY_MAX else None
+
+
 def full_stroke_from_settings(settings: Any) -> int | None:
     """MachineSettings.pumpPreset → clamp된 pumpFullStroke. 부재 → None(sy01b 12000 폴백 유도)."""
     preset = _preset_of(settings)
     return preset.pump_full_stroke if preset is not None else None
+
+
+def pump_tuning_from_settings(settings: Any, model: str) -> PumpPreset | None:
+    """스냅샷 pumpPreset 의 속도 축(v·V·c·L)을 **실물 기종 `model`** 의 표 위에 얹은 어댑터 preset (§6-3a · 2026-09-22).
+
+    서버가 settings SSE 병합에서 `pumpPreset` 에 (선언 기종 표 + 운영자 튠)을 실어 보낸다. pi 는 그 수치를
+    **`pumpPresetId == model` 일 때만** 소비한다 — 선언≠실물(2026-09-14 자동 인식이 선언을 뒤집은 부팅)이면
+    다른 기종의 값이 이 펌프로 새지 않게 None 으로 착지한다. 수치는 기종 매뉴얼 범위로 한 번 더 잘리고
+    단조성(v ≤ c ≤ V)을 맞춘다 — 서버와 byte-parity 라 정상 입력에선 no-op 이다. 스냅샷에 없는 축은 그 기종
+    **제조사 기본값**(PUMP_TUNING_DEFAULTS)이다.
+
+    반환 None 의 뜻은 "튠 정보 없음/해당 없음" 이지 오류가 아니다 — 호출측(bootstrap)은 None 이면 그 기종
+    제조사 기본값으로 조립한다(§6-3a 둘째 판 2026-09-22).
+    """
+    if model not in PUMP_PRESETS or not isinstance(settings, Mapping):
+        return None
+    # 게이트는 **hardware 블록의 선언 기종**(pump_model_from_settings · R6 P0-1 의 유일 판독 채널)이다 —
+    #   `pumpPreset.pumpPresetId` 는 병합이 스킵된 프레임에도 늘 "sy01b" 로 채워져 있어 "튠이 얹힌 프레임"과
+    #   "함대 원본 프레임"을 구분하지 못한다(검증 P2-4). 병합이 실제로 일어난 프레임(hardware 있음)에서만,
+    #   그 선언이 실물 기종과 같을 때만 수치를 소비한다.
+    if pump_model_from_settings(settings) != model:
+        return None
+    raw = settings.get("pumpPreset")
+    if not isinstance(raw, Mapping) or raw.get("pumpPresetId") != model:
+        return None
+    return apply_pump_tuning(PUMP_PRESETS[model], raw)
+
+
+def snapshot_settings_confirmed(settings: Any) -> bool:
+    """스냅샷이 **확정된** 기기 설정인가(`hardware.settingsStatus == "confirmed"`) — 캐시 기록 판정(2026-09-30).
+
+    부재(구 서버 · hardware 절 없음)는 True — 종전대로 캐시한다. 테스트 시드·모의 기기(test-device·no-device)는 물리 대상이
+    아니지만 선언 기본값이 곧 그 기기 설정이라 True 로 둔다. 초안 상태(missing·stale·lookup-failed·contract-unknown)만 False.
+    """
+    hw = settings.get("hardware") if isinstance(settings, Mapping) else None
+    status = hw.get("settingsStatus") if isinstance(hw, Mapping) else None
+    if not isinstance(status, str):
+        return True
+    return status not in ("missing", "stale", "lookup-failed", "contract-unknown")
+
+
+def hardware_profile_from_snapshot(model: str, settings: Any) -> "HardwareProfile":
+    """선언 스냅샷 → 캐시용 HardwareProfile — **이 함수가 유일한 조립 지점**이다.
+
+    stroke 폴백은 **선언된 모델의** 프리셋 기본(R6.5 P2) — sy01b 고정이면 "tecan 선언 +
+    pumpPreset 부재" 프레임이 {tecan, 12000} 프로파일을 캐시에 남겨, 다음 오프라인 부팅이
+    어댑터 3000 vs spec 12000 = 영구 -1001 로 죽는다. 이 규칙을 bootstrap 과 senlytd
+    (_undeclared_refetch)가 각자 손으로 유지하다 한쪽만 어긋나는 걸 막기 위해 여기로 모았다.
+
+    `model` 은 pump_model_from_settings 가 좁힌 값("sy01b"|"tecan_xcalibur")만 온다 —
+    PUMP_PRESETS 미등재 키가 오면 KeyError 로 시끄럽게 죽는 게 맞다(추측 조립 금지).
+    """
+    from ..persistence.hardware_profile_cache import HardwareProfile
+
+    hw = settings.get("hardware") if isinstance(settings, Mapping) else None
+    sv = hw.get("sensoriumVersion") if isinstance(hw, Mapping) else None
+    cid = hw.get("contractId") if isinstance(hw, Mapping) else None
+    tuned = pump_tuning_from_settings(settings, model)
+    return HardwareProfile(
+        pump_model=model,
+        pump_full_stroke=full_stroke_from_settings(settings)
+        or PUMP_PRESETS[model].pump_full_stroke,
+        valve_port_count=valve_port_count_from_settings(settings) or 12,
+        sensorium_version=str(sv) if sv is not None else None,
+        # (2026-09-29) 설정상 펌프 주소 — 오프라인 부팅 프로브 대상(향연 4대). 판정축 아님.
+        pump_addrs=tuple(pump_addrs_from_settings(settings)),
+        # (2026-09-29 기기 설정 한 벌) 오프라인 추정 보조축 — 계약 · 용량 · 유효 튠(판정축 아님 · 용량 가드는 켜지 않는다).
+        contract_id=str(cid if cid is not None else sv) if (cid or sv) else None,
+        syringe_capacity_ml=syringe_capacity_from_settings(settings),
+        pump_tuning=(
+            {
+                "pumpMaxStartSpeedHz": tuned.pump_max_start_speed_hz,
+                "pumpMaxTopSpeedHz": tuned.pump_max_top_speed_hz,
+                "pumpMaxCutoffSpeedHz": tuned.pump_max_cutoff_speed_hz,
+                "pumpMaxSlope": tuned.pump_max_slope,
+            }
+            if tuned is not None
+            else None
+        ),
+    )
+
+
+def default_pump_addrs(mode: str | None) -> list[int]:
+    """모드 기본 펌프 주소 — 식향 2대(1,2) / 그 외(향장향) 3대(1,2,3). 헤이센릿 함대 구성(2026-07-17 확정)."""
+    return [1, 2] if (mode or "").strip().lower() == "flavor" else [1, 2, 3]
+
+
+def expected_pump_addrs(
+    mode: str | None, settings: Any = None, hardware_profile: Any = None
+) -> list[int]:
+    """부팅 인식·주기 감시가 **프로브할** 펌프 주소 — `expected_pump_addrs_with_source` 의 주소만."""
+    return expected_pump_addrs_with_source(mode, settings, hardware_profile)[0]
+
+
+def expected_pump_addrs_with_source(
+    mode: str | None, settings: Any = None, hardware_profile: Any = None
+) -> "tuple[list[int], str]":
+    """프로브 대상 = 모드 기본 ∪ (서버 스냅샷 `pumpPorts` 키 **또는** 캐시 `pump_addrs`) — (주소, 출처).
+
+    2026-09-29 — 향연(ICAD)은 Tecan 12채널 **4대**다. 모드 파생([1,2,3])만 프로브하면 addr 4 가 영영 pump_map 에
+      안 올라가 그 펌프에 꽂힌 향료가 전부 unmapped drop 된다. 서버는 기기 세대의 통 배치(역할 포트 포함 · 펌프 대수만큼)를
+      설정 스냅샷 `pumpPorts` 로 내려 주므로, 그 키를 합친다. 헤이센릿 기기는 스냅샷 키 = 모드 기본이라 바이트 불변.
+    우선순위: **온라인 스냅샷 > 로컬 캐시(hardware-profile.json `pumpAddrs`) > 모드 기본.** 스냅샷이 있으면 캐시는
+      보지 않는다(옛 캐시가 이미 뺀 펌프를 되살리지 않게). 캐시 부재·손상 = 빈 튜플 = 모드 기본(fail-safe).
+    ⚠️ 이건 **프로브 대상**일 뿐 — 물리 존재는 여전히 프로브 응답이 SoT(없는 주소는 응답 없음 = 매핑 안 됨).
+    출처: "snapshot" | "cache" | "mode-default"
+    """
+    base = set(default_pump_addrs(mode))
+    snap = pump_addrs_from_settings(settings)
+    if snap:
+        return sorted(base | set(snap)), "snapshot"
+    cached = tuple(getattr(hardware_profile, "pump_addrs", ()) or ())
+    if cached:
+        return sorted(base | set(int(a) for a in cached)), "cache"
+    return sorted(base), "mode-default"
 
 
 def pump_addrs_from_settings(settings: Any) -> list[int]:
@@ -106,6 +277,53 @@ def pump_addrs_from_settings(settings: Any) -> list[int]:
         if a >= 1:  # addr 0 = RS485 브로드캐스트 — 실 주소 아님(배제).
             addrs.append(a)
     return sorted(set(addrs))
+
+
+# ── 알코올 캐리어 포트 규칙(2026-09-30 · 사용자 결정 "향연은 펌프마다 알코올 통") ─────────────────────────
+#   서버(web)가 봉투 조립 전에 막지만(`alcohol_missing`), pi 도 **빈 구멍에서 알코올을 빠는** 스텝을 스스로 거부한다(이중 방어).
+#   헤이센릿(향장향 `sensorium-fragrance*` · 식향 `sensorium-expo*`)은 옛 관례(P1 = 알코올, 명시 매핑 없는 옛 배치)를 존중해
+#   "다른 액체가 꽂힌 구멍"만 거부하고, 그 밖의 계약(향연 등)은 **명시된 알코올 구멍**에서만 빨게 한다.
+HEYSENLYT_CONTRACT_PREFIXES = ("sensorium-fragrance", "sensorium-expo")
+
+
+def alcohol_carrier_rule_from_settings(
+    settings: Any,
+) -> "tuple[dict[int, dict[int, str | None]] | None, bool]":
+    """스냅샷 → (펌프별 {포트: 액체(소문자) | None(비었거나 비활성)}, 엄격 여부). 스냅샷에 pumpPorts 가 없으면 (None, False)."""
+    if not isinstance(settings, Mapping):
+        return None, False
+    ports = settings.get("pumpPorts")
+    if not isinstance(ports, Mapping) or not ports:
+        return None, False
+    table: dict[int, dict[int, "str | None"]] = {}
+    for pk, layout in ports.items():
+        try:
+            addr = int(pk)
+        except (TypeError, ValueError):
+            continue
+        if addr < 1 or not isinstance(layout, Mapping):
+            continue
+        row: dict[int, "str | None"] = {}
+        for portk, cfg in layout.items():
+            try:
+                port = int(portk)
+            except (TypeError, ValueError):
+                continue
+            liquid = cfg.get("liquid") if isinstance(cfg, Mapping) else None
+            enabled = not (isinstance(cfg, Mapping) and cfg.get("enabled") is False)
+            row[port] = (
+                liquid.strip().lower()
+                if enabled and isinstance(liquid, str) and liquid.strip()
+                else None
+            )
+        table[addr] = row
+    hw = settings.get("hardware")
+    contract = None
+    if isinstance(hw, Mapping):
+        c = hw.get("contractId") or hw.get("sensoriumVersion")
+        contract = c if isinstance(c, str) and c else None
+    strict = contract is not None and not contract.startswith(HEYSENLYT_CONTRACT_PREFIXES)
+    return table, strict
 
 
 def pump_map_from_settings(

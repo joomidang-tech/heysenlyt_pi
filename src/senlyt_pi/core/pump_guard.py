@@ -38,8 +38,12 @@ class PumpPreset:
 
 # 빌트인 프리셋 정식 수치표 — SoT §6-2 (입력 무시·강제 · 바이트 동일 SoT = pumpGuard.ts).
 #
-# 현재 빌트인 = SY-01B 1종. 사용자 지정(custom)·Tecan(Cavro)은 제거됨(2026-07-18 · 서버 pumpGuard.ts
-# 와 동일) — clamp 는 어떤 입력이든 SY-01B 로 정규화한다. 도입 시 이 표에 1항목만 되살리면 된다.
+# 현재 빌트인 = SY-01B(기본) + Tecan XCalibur(2026-09-01 실물 도입 대비 재도입). 사용자 지정
+# (custom)은 제거 유지(2026-07-18). `clamp_pump_preset` 은 **명시 id "tecan_xcalibur" 만 존중**,
+# 그 외 전부(오타·미지·custom 포함) SY-01B 폴백이다 — 서버 pumpGuard.ts `clampPumpPreset` 과
+# byte-parity(2026-09-01 축 계약: 서버가 tecan 을 배웠다. ⛔ "무조건 sy01b" 로 원복 금지 —
+# 원복하면 설정축이 죽어 tecan 기기가 4배 토출한다). 어댑터 조립(`SENLYT_ENGINE=tecan`)은
+# 이와 별개로 자기 프리셋을 명시적으로 집어 쓴다(이중 키의 env 쪽).
 PUMP_PRESETS: dict[str, PumpPreset] = {
     "sy01b": PumpPreset(
         pump_preset_id="sy01b",
@@ -50,6 +54,21 @@ PUMP_PRESETS: dict[str, PumpPreset] = {
         pump_max_slope=20,
         pump_syringe_type_code=200,
     ),
+    # Tecan Cavro XCalibur — 수치 정본: 00_research "Manual Operating Cavro XCalibur
+    # 20733085-C.txt" (§3.3.2 N0 표준 3000 증분/풀스트로크 · §3.5.3 v 50..1000/V 5..6000/
+    # c 50..2700/L 1..20). 표준 모드(N0) 고정 — 미세모드(N1·24000)는 속도 단위가 바뀌므로
+    # (increments/sec) 실기기 프로브로 확정 전 도입하지 않는다.
+    # pump_syringe_type_code=0: XCalibur 에는 스톨전류 명령(U<code>,<n>)이 없다 — U 는
+    # NVM 설정 기록(§3.3.2 Table 3-5)이라 절대 오용 금지. 어댑터가 이 필드를 쓰지 않는다.
+    "tecan_xcalibur": PumpPreset(
+        pump_preset_id="tecan_xcalibur",
+        pump_full_stroke=3000,
+        pump_max_start_speed_hz=1000,
+        pump_max_top_speed_hz=6000,
+        pump_max_cutoff_speed_hz=2700,
+        pump_max_slope=20,
+        pump_syringe_type_code=0,
+    ),
 }
 
 # 유효 syringe 용량 이산값(mL) — v1.1.0 allowlist **9종**(서버 pumpGuard.ts VALID_SYRINGE_ML 정본).
@@ -58,19 +77,186 @@ VALID_SYRINGE_CAPACITIES_ML: frozenset[float] = frozenset(
 )
 
 
+# 기종별 **지원** 시린지 용량(mL) — 서버 pumpGuard.ts `SYRINGE_CAPACITY_OPTIONS_BY_MODEL` 과 같은 값(2026-09-30 사용자 확정:
+#   Tecan XCalibur = 1mL·5mL 만 · SY-01B = 종전 9종). 위 합집합(VALID_…)은 값 형식 검증용이고, 모션 허용 여부는 이 표로 본다.
+SUPPORTED_SYRINGE_CAPACITIES_ML: dict[str, tuple[float, ...]] = {
+    "sy01b": (0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 1.25, 2.5, 5.0),
+    "tecan_xcalibur": (1.0, 5.0),
+}
+
+
+# 용량을 **명시 저장해야** 하는 기종 — 모드 기본 추정(0.5)이 그 기종 지원 목록 밖이라 추정으로는 돌 수 없다(web
+#   `requiresExplicitSyringeCapacity` 와 같은 집합). SY-01B 는 추정 0.5 가 지원 목록 안이라 종전대로 돈다.
+REQUIRES_EXPLICIT_SYRINGE_CAPACITY: frozenset[str] = frozenset({"tecan_xcalibur"})
+
+
+def is_supported_syringe_capacity(model: str | None, capacity_ml: float | None) -> bool:
+    """이 기종이 이 용량을 지원하나 — 모르는 기종은 판정하지 않는다(True · 종전 거동). 용량 None = 모름(False)."""
+    if model is None or model not in SUPPORTED_SYRINGE_CAPACITIES_ML:
+        return True
+    if capacity_ml is None:
+        return False
+    return any(abs(capacity_ml - v) < 1e-9 for v in SUPPORTED_SYRINGE_CAPACITIES_ML[model])
+
+
 def _round_half_up(x: float) -> int:
     """round = half-up(.5 올림 · 양수 도메인 JS Math.round 등가) — 부록A P-8. 내장 round() 금지."""
     return math.floor(x + 0.5)
 
 
 def clamp_pump_preset(cfg: Mapping[str, Any] | None) -> PumpPreset:
-    """clampPumpPreset(cfg) — SoT §6-3 (서버 ↔ pi 동일 알고리즘).
+    """clampPumpPreset(cfg) — SoT §6-3 (서버 pumpGuard.ts 와 byte-parity·동일 알고리즘).
 
-    **항상 SY-01B 로 정규화**한다(사용자 지정 제거·2026-07-18). 입력 pumpPresetId·수치
-    (custom·unknown·레거시 포함)는 전부 무시하고 SY-01B 정식 수치를 강제 → 손 튜닝값이
-    물리로 가는 경로 차단(과다흡입 안전). syringeCapacityMl 은 호출 측이 별도 주입한다.
+    판정식(2026-09-01 테칸 재도입 — 서버 TS 와 동일하게 개정):
+      - `pumpPresetId == "tecan_xcalibur"` **명시 입력일 때만** 그 빌트인을 존중한다.
+      - 그 외 전부(부재·sy01b·custom·unknown·레거시 cavro_*) = SY-01B — 기존과 동일 바이트.
+      - 수치는 어느 쪽이든 **표 강제**(입력 수치 무시) — 손 튜닝값이 물리로 가는 경로 차단
+        (과다흡입 안전 불변식 유지). syringeCapacityMl 은 호출 측이 별도 주입한다.
+
+    ⚠️ 어댑터 생성자에 이 반환값을 주입하지 말 것 — 어댑터 preset 은 어댑터 클래스가
+    소유한다(검증 P1-6: settings 프리셋을 Sy01b 어댑터에 꽂으면 `U0,…`=XCalibur NVM
+    "밸브 없음" 기록 같은 조합이 문법적으로 가능해진다). 이 함수의 소비처는 스텝 축
+    (SyringeSpec.pump_full_stroke) 파생뿐이다.
     """
-    return PUMP_PRESETS["sy01b"]
+    raw_id = cfg.get("pumpPresetId") if isinstance(cfg, Mapping) else None
+    honored = "tecan_xcalibur" if raw_id == "tecan_xcalibur" else "sy01b"
+    return PUMP_PRESETS[honored]
+
+
+# ── §6-3a PumpTuning — 제조사 기본값 = 초깃값 · 표 = 상한, 운영자 "적용" 속도 축(v·V·c·L)만 매뉴얼 범위 안에서 인정 (2026-09-22 둘째 판) ──
+#
+# 서버 `pumpGuard.ts` §6-3a 와 **바이트 동일**(PUMP_TUNING_BOUNDS·clamp_pump_tuning·apply_pump_tuning).
+#   열리는 축 = v·V·c·L 4개(하드웨어 테스트 툴 PumpGuard 가 편집을 허용하던 축).
+#   잠긴 축  = pump_full_stroke(스텝 환산 — Code 11 원인 축)·pump_syringe_type_code(스톨 U — XCalibur 엔
+#             NVM 기록이라 오용 금지). 어떤 입력이 와도 표 값이다.
+#   튠이 없으면 apply_pump_tuning 은 그 기종 **제조사 기본값**(PUMP_TUNING_DEFAULTS)을 얹는다 — 표 상한이 아니다.
+# ⚠️ clamp_pump_preset 의 "어댑터 생성자에 주입 금지(P1-6)" 경고는 **기종 교차** 위험(sy01b 표를 Tecan 에)
+#   이었다. 튠 경로는 `pump_tuning_from_settings`(settings_source) 가 **스냅샷 pumpPresetId == 실물 기종**
+#   일 때만 만들고, 그 기종의 표 위에 그 기종 범위로 잘린 값만 얹으므로 교차가 성립하지 않는다 — 그래서
+#   이 반환값은 어댑터 `preset=` 에 주입해도 된다(Tecan 어댑터 생성자 가드도 같은 범위라 통과).
+
+TUNING_KEYS: tuple[str, ...] = (
+    "pumpMaxStartSpeedHz",
+    "pumpMaxTopSpeedHz",
+    "pumpMaxCutoffSpeedHz",
+    "pumpMaxSlope",
+)
+
+# 기종별 **매뉴얼 허용 범위** {(min, max)} — 서버 PUMP_MANUAL_RANGES 와 바이트 동일(§6-3a 둘째 판 2026-09-22).
+#   출처: SY-01B ASCII 매뉴얼 V1.2 §4.5.3(v 1..1000 · V 1..6000 · c 1..5400 · L 1..20)
+#        XCalibur 매뉴얼 20733085-C §3.5.3·G.5(v 50..1000 · V 5..6000 · c 50..2700 · L 1..20).
+#   V 의 실제 하한은 max(V.min, v.min, c.min) 로 올린다(_bounds_of) — 단조성 보정이 v·c 를 V 까지 끌어내리므로
+#   V 가 v·c 하한 아래면 v·c 가 XCalibur err3 영역(50 미만)으로 떨어진 프레임이 나간다(검증 P0-1).
+PUMP_MANUAL_RANGES: dict[str, dict[str, tuple[int, int]]] = {
+    "sy01b": {
+        "pumpMaxStartSpeedHz": (1, 1000),
+        "pumpMaxTopSpeedHz": (1, 6000),
+        "pumpMaxCutoffSpeedHz": (1, 5400),
+        "pumpMaxSlope": (1, 20),
+    },
+    "tecan_xcalibur": {
+        "pumpMaxStartSpeedHz": (50, 1000),
+        "pumpMaxTopSpeedHz": (5, 6000),
+        "pumpMaxCutoffSpeedHz": (50, 2700),
+        "pumpMaxSlope": (1, 20),
+    },
+}
+
+# 기종별 **제조사 기본값** — 운영자가 한 번도 적용하지 않은 기종의 실물 초기값(2026-09-22 사용자 확정:
+#   "설정한 적 없으면 기본값, 있으면 이전값"). 서버 PUMP_TUNING_DEFAULTS 와 바이트 동일.
+#   종전(첫 판)엔 표 상한(v1000·V6000·c5400/2700·L20)이 초기값이었고 v1.2.0 이후 그 값으로 필드 검증돼 있었다 —
+#   이 릴리스부터 튠 없는 기기는 느려진다(토출 시간 재확인 대상 · sy01b_engine_adapter._speed_cmd 주석 참조).
+#   출처: SY-01B §4.5.3(v900 · V4000 · c900 · L14) · XCalibur G.5(v900 · V1400 · c900 · L7).
+PUMP_TUNING_DEFAULTS: dict[str, dict[str, int]] = {
+    "sy01b": {
+        "pumpMaxStartSpeedHz": 900,
+        "pumpMaxTopSpeedHz": 4000,
+        "pumpMaxCutoffSpeedHz": 900,
+        "pumpMaxSlope": 14,
+    },
+    "tecan_xcalibur": {
+        "pumpMaxStartSpeedHz": 900,
+        "pumpMaxTopSpeedHz": 1400,
+        "pumpMaxCutoffSpeedHz": 900,
+        "pumpMaxSlope": 7,
+    },
+}
+
+
+def _bounds_of(model: str) -> dict[str, tuple[int, int]]:
+    """매뉴얼 범위 ∩ 기종 표 — **max 는 표 값을 넘지 못한다**(서버 boundsOf 와 동일 · 튠은 표에서 내리기만) · V.min 은 v·c 하한 이상."""
+    t = PUMP_PRESETS[model]
+    m = PUMP_MANUAL_RANGES[model]
+    speed_floor = max(m["pumpMaxTopSpeedHz"][0], m["pumpMaxStartSpeedHz"][0], m["pumpMaxCutoffSpeedHz"][0])
+    return {
+        "pumpMaxStartSpeedHz": (m["pumpMaxStartSpeedHz"][0], min(m["pumpMaxStartSpeedHz"][1], t.pump_max_start_speed_hz)),
+        "pumpMaxTopSpeedHz": (speed_floor, min(m["pumpMaxTopSpeedHz"][1], t.pump_max_top_speed_hz)),
+        "pumpMaxCutoffSpeedHz": (m["pumpMaxCutoffSpeedHz"][0], min(m["pumpMaxCutoffSpeedHz"][1], t.pump_max_cutoff_speed_hz)),
+        "pumpMaxSlope": (m["pumpMaxSlope"][0], min(m["pumpMaxSlope"][1], t.pump_max_slope)),
+    }
+
+
+# 기종별 절대 범위 {(min, max)} — 서버 PUMP_TUNING_BOUNDS 와 동일(max = min(매뉴얼, 표) · min = 매뉴얼 · V.min 올림).
+#   sy01b: v 1~1000 / V 1~6000 / c 1~5400 / L 1~20 · tecan_xcalibur: v 50~1000 / V 50~6000 / c 50~2700 / L 1~20.
+PUMP_TUNING_BOUNDS: dict[str, dict[str, tuple[int, int]]] = {
+    "sy01b": _bounds_of("sy01b"),
+    "tecan_xcalibur": _bounds_of("tecan_xcalibur"),
+}
+
+
+def _clamp_tune_int(v: Any, bound: tuple[int, int]) -> int | None:
+    """정수 clamp(half-up round 후 [min,max]). 숫자 아님/bool/NaN → None(= 그 키는 튠 없음). TS clampTuneInt 등가."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    if math.isnan(v) or math.isinf(v):
+        return None
+    lo, hi = bound
+    return min(hi, max(lo, _round_half_up(float(v))))
+
+
+def clamp_pump_tuning(model: str, raw: Any) -> dict[str, int] | None:
+    """기종 하나의 튠 입력 정규화 — 허용 4키만·기종 범위 clamp·비수치 키 버림. 비면 None. TS clampPumpTuning 등가.
+
+    단조성은 여기서 강제하지 않는다(부분 튠은 표 값과 합쳐진 뒤에야 순서를 판정) — apply_pump_tuning 담당.
+    """
+    if model not in PUMP_TUNING_BOUNDS or not isinstance(raw, Mapping):
+        return None
+    bounds = PUMP_TUNING_BOUNDS[model]
+    out: dict[str, int] = {}
+    for k in TUNING_KEYS:
+        n = _clamp_tune_int(raw.get(k), bounds[k])
+        if n is not None:
+            out[k] = n
+    return out or None
+
+
+def apply_pump_tuning(preset: PumpPreset, tuning: Mapping[str, Any] | None) -> PumpPreset:
+    """기종 preset 위에 **제조사 기본값 → 그 기종 튠** 순으로 속도 축을 얹는다. TS applyPumpTuning 등가(§6-3a 둘째 판).
+
+    - 빌트인 기종: 튠 없음 = v·V·c·L 이 PUMP_TUNING_DEFAULTS[기종](제조사 기본값). 튠이 있으면 그 키만 덮는다.
+      ⇒ 표(PUMP_PRESETS)의 속도 축은 **상한**으로만 쓰이고 실물 초기값이 아니다.
+    - 미지 기종(custom·레거시): 입력 그대로(같은 객체).
+    단조성 2줄 순서 고정(서버·테스트 툴 `c = clamp(clamp(c), v, V)` 규약):
+      1) v = min(v, V)          2) c = max(min(c, V), v)
+    스트로크·U 는 건드리지 않는다.
+    """
+    base = PUMP_TUNING_DEFAULTS.get(preset.pump_preset_id)
+    if base is None:
+        return preset
+    safe = clamp_pump_tuning(preset.pump_preset_id, tuning) or {}
+    top = safe.get("pumpMaxTopSpeedHz", base["pumpMaxTopSpeedHz"])
+    start = min(safe.get("pumpMaxStartSpeedHz", base["pumpMaxStartSpeedHz"]), top)
+    cutoff = max(min(safe.get("pumpMaxCutoffSpeedHz", base["pumpMaxCutoffSpeedHz"]), top), start)
+    slope = safe.get("pumpMaxSlope", base["pumpMaxSlope"])
+    return PumpPreset(
+        pump_preset_id=preset.pump_preset_id,
+        pump_full_stroke=preset.pump_full_stroke,
+        pump_max_start_speed_hz=start,
+        pump_max_top_speed_hz=top,
+        pump_max_cutoff_speed_hz=cutoff,
+        pump_max_slope=slope,
+        pump_syringe_type_code=preset.pump_syringe_type_code,
+    )
 
 
 def resolve_syringe_capacity_ml(raw: Any, *, is_flavor: bool) -> float:
@@ -190,6 +376,24 @@ def is_volume_within_gate(volume_ul: float, spec: SyringeSpec) -> bool:
     return 0 < volume_ul <= spec.max_volume_ul
 
 
+# 축(stroke) 불일치 fail-closed 코드(2026-09-01 검증 C) — 어댑터 축 가드가 시리얼 송신 없이
+#   반환한다. 하드웨어 에러코드(0~15)·통신 sentinel(-1000·-2000)과 겹치지 않는 전용 음수.
+#   의미: "명령 spec 의 풀스트로크 ≠ 어댑터 프리셋 풀스트로크" — admin 설정(pumpPresetId)과
+#   기기 SENLYT_ENGINE 이 어긋난 상태. 무성 1/4·4배 토출을 막기 위해 모션 자체를 거부한다.
+# 축 불일치(2026-09-02 재해석) — 단일 키 설계에선 "스텝 조립 전제 축 vs 부팅 시 조립된 어댑터
+#   축"의 드리프트(캐시 부팅 중 서버 선언 변경·스테일 봉투 창)를 뜻한다. 구 의미("설정 vs
+#   SENLYT_ENGINE env 불일치")의 env 키는 은퇴됐다 — sy01b_engine_adapter._axis_guard 헤더 참조.
+AXIS_MISMATCH_RAW_CODE = -1001
+# 하드웨어 선언 미확정(2026-09-02 단일 키) — 스냅샷·캐시 모두 없거나 pumpModel 미지값. 어떤
+#   모션도 조립 불가(추측 금지) → permanent(미분류 코드의 보수 분기와 같은 등급). 복구 = 서버
+#   재접속(재fetch 성공 시 재기동) 또는 senlytd 재시작.
+UNDECLARED_HW_RAW_CODE = -1002
+# 모델 지문 불일치(2026-09-03) — sy01b 어댑터가 실물에서 **Tecan 지문**(& 파트넘버)을 읽음.
+#   기종 전용 프레임(U=XCalibur NVM 기록)을 쏘기 전에 정직하게 거부한다. 복구 = 올바른
+#   센소리움(+tecan 변형) 선택 후 재연결.
+MODEL_MISMATCH_RAW_CODE = -1003
+
+
 class EngineErrorClass(enum.Enum):
     """EnginePort 에러코드 분류 — SoT §6-7."""
 
@@ -201,9 +405,16 @@ class EngineErrorClass(enum.Enum):
 def classify_engine_error_code(code: int) -> EngineErrorClass:
     """엔진 raw errorCode(정수) → 분류 — SoT §6-7.
     0 = 정상 / 1·7·11·15·timeout = transient(R=3 재시도) / 2·3·9·10 = permanent(즉시중단 FAILED).
+    축 불일치(-1001)는 설정을 고치기 전엔 재시도가 무의미 — permanent 명시 분기.
     """
     if code == 0:
         return EngineErrorClass.NORMAL
+    if code == AXIS_MISMATCH_RAW_CODE:
+        return EngineErrorClass.PERMANENT
+    if code in (UNDECLARED_HW_RAW_CODE, MODEL_MISMATCH_RAW_CODE):
+        # 선언/모델을 고치기 전엔 재시도 무의미 — permanent 명시 분기(R9 P3: 기본 폴백에
+        #   얹지 않고 명시해 "복구 = 센소리움 정정 + 재연결" 지시가 라벨로 전달되게 한다).
+        return EngineErrorClass.PERMANENT
     if code in (1, 7, 11, 15):
         return EngineErrorClass.TRANSIENT
     if code in (2, 3, 9, 10):

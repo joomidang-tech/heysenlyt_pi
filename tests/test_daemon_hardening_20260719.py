@@ -144,7 +144,6 @@ def _mk_dispatcher(source):
 
 class TestPollStreamIsolation:
     def test_item_exception_does_not_kill_stream(self, monkeypatch) -> None:
-        from senlyt_pi.core.command_set import command_sets_from_snapshot
         from senlyt_pi.core.wire_messages import Command
 
         good = Command.from_json(_cmd("good", MINE))
@@ -215,6 +214,44 @@ class TestSerialHotplugReconnect:
         assert (code, ready) == (0, True)  # 재연결 후 재시도로 정상 응답.
         assert ad.port == "/dev/ttyUSB1"  # 포트 자가 전환.
         assert made == ["/dev/ttyUSB0", "/dev/ttyUSB1"]
+
+    def test_unplug_does_not_trap_on_onboard_uart_and_replug_recovers(self) -> None:
+        """2026-10-02 실기기 사고 — USB 가 빠진 동안 재연결이 Pi 내장 UART(ttyAMA10)를 잡으면
+        그 포트는 항상 열리고 무응답만 줘 OSError 가 안 난다 → 다시 꽂아도 영구 무응답.
+        후보에서 내장 UART 를 빼면 USB 부재 동안 재연결이 실패·재시도하다 다시 꽂히는 순간 USB 로 돌아온다."""
+        from senlyt_pi.adapters.serial_port_discovery import SerialPortInfo, list_candidate_ports
+
+        usb_present = {"v": True}
+        dead = _VanishingSerial(die_after=0)  # 뽑힌 순간의 옛 핸들.
+        made: list[str] = []
+
+        def lister():
+            ports = [SerialPortInfo("/dev/ttyAMA10")]  # Pi 5 내장 디버그 UART — 항상 존재.
+            if usb_present["v"]:
+                ports.append(SerialPortInfo("/dev/ttyUSB0", 0x1A86, 0x7523))
+            return ports
+
+        def factory(port, baud, timeout):
+            made.append(port)
+            if port == "/dev/ttyAMA10":
+                return FakeSerial(default=b"")  # 열리지만 무응답(사고 당시 거동).
+            if not usb_present["v"]:
+                raise OSError(2, "No such file or directory")
+            return FakeSerial(responses=[status_frame(0, ready=True)] * 4)
+
+        ad = Sy01bEngineAdapter(
+            port="/dev/ttyUSB0",
+            serial_factory=factory,
+            port_resolver=lambda: list_candidate_ports({}, port_lister=lister),
+        )
+        ad._serial = dead  # 부팅 때 정상으로 열려 있던 USB 핸들.
+        usb_present["v"] = False  # 뽑힘.
+        assert ad.health_probe(1) == "silent"
+        assert ad.health_probe(1) == "silent"
+        assert "/dev/ttyAMA10" not in made  # 내장 UART 로 새지 않는다.
+        usb_present["v"] = True  # 다시 꽂힘.
+        assert ad.health_probe(1) == "ok"
+        assert ad.port == "/dev/ttyUSB0"
 
     def test_reconnect_failure_propagates_original_error(self) -> None:
         dead = _VanishingSerial(die_after=0)
@@ -309,6 +346,108 @@ class TestHwWatchRealtime:
         assert engine.asked == [1, 2]  # 기대 주소를 실측했다(실시간 판단)
         assert d._pump_health == {1: "silent", 2: "silent"}
         assert d._hw_checked_at is not None
+
+    @staticmethod
+    def _daemon(*, probe_result: str, on_seen, resolver=None, watch=(1, 2)):
+        from senlyt_pi.app.daemon import DaemonDeps, SenlytDaemon
+        from senlyt_pi.persistence.idempotency_ledger import InMemoryIdempotencyLedger
+
+        class _Probe:
+            def health_probe(self, addr: int) -> str:
+                return probe_result
+
+        class _Sink:
+            def send_heartbeat(self, hb):
+                pass
+
+            def report_status(self, r):
+                pass
+
+        return SenlytDaemon(
+            DaemonDeps(
+                device_id="dev-A",
+                command_source=type("S", (), {"commands": lambda s, i: iter(())})(),
+                status_sink=_Sink(),
+                engine=_Probe(),  # type: ignore[arg-type]
+                ledger=InMemoryIdempotencyLedger(),  # type: ignore[arg-type]
+                heartbeat_interval_s=0,
+                hw_watch_addrs=watch,
+                resolver=resolver,
+                on_pumps_seen_unmapped=on_seen,
+            )
+        )
+
+    def test_pumps_seen_unmapped_fires_policy_once(self):
+        """R8 P1-1 — 펌프 응답(ok) + pump_map 부재 = 재발견 정책 콜백 **1회**(30s 감시가
+        재기동을 연타하지 않게 래치). 이게 없으면 PUMP_ADDRESSES 각인 제거 후 펌프 전원이
+        데몬보다 늦게 켜진 기기가 재시작 전까지 영구 무토출이 된다."""
+        fired: list[int] = []
+        d = self._daemon(probe_result="ok", on_seen=lambda: fired.append(1))
+        d._refresh_hw_health()
+        d._refresh_hw_health()
+        assert fired == [1]
+
+    def test_pumps_seen_unmapped_not_fired_when_silent_or_mapped(self):
+        """전 주소 무응답(silent)이면 재발견할 것이 없고, pump_map 이 이미 있으면 정상이라 —
+        어느 쪽도 재기동 정책을 부르지 않는다(재기동 루프 방지의 반대편 그물)."""
+        from senlyt_pi.app.bootstrap import pump_map_from_addresses_env
+        from senlyt_pi.pipeline.recipe_resolver import RecipeResolver
+
+        fired: list[int] = []
+        d = self._daemon(probe_result="silent", on_seen=lambda: fired.append(1))
+        d._refresh_hw_health()
+        assert fired == []
+        mapped = RecipeResolver(pump_map_from_addresses_env("flavor:1,2"))
+        d2 = self._daemon(probe_result="ok", on_seen=lambda: fired.append(1), resolver=mapped)
+        d2._refresh_hw_health()
+        assert fired == []
+
+    def test_pumps_seen_unmapped_not_fired_on_garbled(self):
+        """⛔ garbled = boot probe False 와 동치(같은 술어·같은 파서) — 발화하면 재기동해도
+        스캔이 또 실패하는 **무한 재기동 루프**가 된다. ok 에서만 발화(R8.5 (a)의 급소)."""
+        fired: list[int] = []
+        d = self._daemon(probe_result="garbled", on_seen=lambda: fired.append(1))
+        d._refresh_hw_health()
+        assert fired == []
+
+    def test_pumps_seen_unmapped_fires_on_partial_discovery(self):
+        """R8.5 P2 — 3펌프 기대(watch=1,2,3)인데 부팅 인식이 1·2만 잡은 부분 인식: 빠진 3번이
+        ok 로 응답하면 발화한다(종전 '완전 공집합' 조건은 이 케이스를 영구 unmapped drop 으로
+        남겼다). 감시 대상도 매핑∪기대 합집합이라 3번이 관측된다."""
+        from senlyt_pi.app.bootstrap import pump_map_from_addresses_env
+        from senlyt_pi.pipeline.recipe_resolver import RecipeResolver
+
+        fired: list[int] = []
+        partial = RecipeResolver(pump_map_from_addresses_env("flavor:1,2"))
+        d = self._daemon(
+            probe_result="ok",
+            on_seen=lambda: fired.append(1),
+            resolver=partial,
+            watch=(1, 2, 3),
+        )
+        d._refresh_hw_health()
+        assert fired == [1]
+        assert d._pump_health is not None and sorted(d._pump_health) == [1, 2, 3]
+
+    def test_should_arm_pump_rediscovery_predicate(self):
+        """senlytd 주입 술어(R8.5) — fake(probe 부재)=False / 완전 매핑=False /
+        공집합·부분 인식=True. 오발화의 앱층 게이트."""
+        from senlyt_pi.app.bootstrap import pump_map_from_addresses_env
+        from senlyt_pi.app.senlytd import _should_arm_pump_rediscovery
+
+        class _WithProbe:
+            def probe(self, addr: int) -> bool:
+                return True
+
+        class _NoProbe:
+            pass
+
+        full = pump_map_from_addresses_env("fragrance:1,2,3")
+        partial = pump_map_from_addresses_env("flavor:1,2")
+        assert _should_arm_pump_rediscovery({}, _NoProbe(), (1, 2, 3)) is False
+        assert _should_arm_pump_rediscovery(full, _WithProbe(), (1, 2, 3)) is False
+        assert _should_arm_pump_rediscovery({}, _WithProbe(), (1, 2, 3)) is True
+        assert _should_arm_pump_rediscovery(partial, _WithProbe(), (1, 2, 3)) is True
 
 
 # ── F. 기주 밸브 openSec 직접 지정 (점검 "N초 열기" · 2026-07-19) ────────────────

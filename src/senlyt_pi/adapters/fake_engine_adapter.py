@@ -116,9 +116,14 @@ class BatchCall:
 class FakeEnginePort:
     """Fake EnginePort — dispense 호출 카운터 + 결과 주입.
 
+    MODEL_ID = "fake": heartbeat engine 표기(daemon.engine_wire_name)가 어댑터 자기 선언을
+    읽는다 — 종전 클래스명 사전 값("fake")과 바이트 동일(admin 화면 계약 유지).
+
     **호출 카운터가 P0 게이트의 진실**: `dispense_count`/`dispense_calls` 로 실제 물리 토출
     시도 횟수를 객관 관찰한다. Ledger DROP·재기동 no-op·empty 실패 시 카운터가 늘지 않아야 한다.
     """
+
+    MODEL_ID = "fake"
 
     def __init__(
         self,
@@ -152,6 +157,10 @@ class FakeEnginePort:
         self._stop = stop_event if stop_event is not None else threading.Event()
         # 긴급정지 래치 — 실어댑터와 동일 계약(제조 중 지연이 즉시 abort). 공유 이벤트 주입 가능.
         self._estop = estop_event if estop_event is not None else threading.Event()
+
+    def close(self) -> None:
+        """자원 정리 no-op — EnginePort 정식 계약(2026-09-03 승격) 충족용."""
+        return None
 
     def signal_stop(self) -> None:
         """진행 중 지연 슬립을 즉시 깨운다(취소/중단·SIGTERM 우아한 종료 시)."""

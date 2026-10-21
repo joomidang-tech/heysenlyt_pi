@@ -20,17 +20,20 @@ resolver 로 넘긴다. 폴백 해석 헬퍼(flavor_recipe_to_steps·flavor_reci
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 from ..core.pump_guard import StatusErrorCode, SyringeSpec
+from ..core.pump_guard import fragrance_ml_to_ul
 from ..core.wire_messages import RecipeStep
 from ..ports.valve_port import VALVE_BASES
 
 
-# 회전 밸브 헤드의 물리 구멍 범위 — SY-01B 12포트(서버 portLayout.MIN_PORT/MAX_PORT 와 동일).
+# 회전 밸브 헤드의 물리 구멍 범위 — 기본 12(SY-01B). 실제 상한은 센소리움 선언값(코드는 후보를
+#   미리 알지 않는다)이 RecipeResolver.valve_port_count 로 주입된다(2026-09-02 단일 SoT).
 MIN_PORT = 1
-MAX_PORT = 12
+MAX_PORT = 12  # 기본값 — 서버 portLayout.DEFAULT_MAX_PORT 와 동일.
 
 
 # wire `op`(camelCase·서버 계약) → pi op(snake_case). 여기 없는 op 는 거부(fail-closed).
@@ -44,9 +47,9 @@ WIRE_OP_TO_PI: dict[str, str] = {
 }
 
 
-def _is_port_valid(port: int | None) -> bool:
-    """구멍 번호가 물리적으로 실재하는가(1~12). 서버 `isPortValid` 와 동일 규칙."""
-    return isinstance(port, int) and not isinstance(port, bool) and MIN_PORT <= port <= MAX_PORT
+def _is_port_valid(port: int | None, max_port: int = MAX_PORT) -> bool:
+    """구멍 번호가 물리적으로 실재하는가(1~max_port). 서버 `isPortValid` 와 동일 규칙."""
+    return isinstance(port, int) and not isinstance(port, bool) and MIN_PORT <= port <= max_port
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +73,8 @@ class ResolvedStep:
     aspirate_speed_hz: int | None = None
     dispense_speed_hz: int | None = None
     slope: int | None = None
+    # 튠 상한 무시(2026-10-07 · 세척 에어퍼지) — wire RecipeStep.bypass_tune_cap 그대로.
+    bypass_tune_cap: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,8 +218,59 @@ class RecipeResolver:
     def __init__(self, pump_map: Mapping[int, SyringeSpec]) -> None:
         # pumpAddr → SyringeSpec. PUMP_MAP(§9-1) 검증에 사용.
         self.pump_map = dict(pump_map)
+        # 용량 출처(R4.5 P2-A) — pump_map 의 syringe_capacity_ml 이 서버 스냅샷 유래면 True.
+        #   build_resolver 가 용량을 파생하며 각인한다(기본 False = 안전측·가드 비활성).
+        self.capacity_from_settings: bool = False
+        # 유효 포트 상한(2026-09-02 센소리움 SoT) — build_resolver 가 각인. 기본 12(기존 거동).
+        #   모르는 쪽(구 스냅샷)이 상한 밖 포트 스텝을 받으면 out-of-range drop = 무동작(안전측).
+        self.valve_port_count: int = MAX_PORT
+        # (2026-09-30) 용량 출처 "snapshot"|"cache"|"default" · 유효 용량(mL) · 기종 지원 목록 밖이면 거부 사유(None = 통과).
+        #   build_resolver 가 각인한다(기본값 = 종전 거동: 출처 모름·거부 없음).
+        self.capacity_source: str = "default"
+        self.capacity_ml: float | None = None
+        self.capacity_block: str | None = None
+        # (2026-09-30) 알코올 캐리어 포트 규칙 — build_resolver 가 스냅샷에서 각인한다. None = 모름(종전 거동 · 검사 안 함).
+        #   port_liquids[펌프][포트] = 액체(소문자) 또는 None(비었거나 비활성). alcohol_strict = 향연 등 — 명시된 알코올 구멍만 허용.
+        self.port_liquids: "dict[int, dict[int, str | None]] | None" = None
+        self.alcohol_strict: bool = False
+        # (2026-09-30 · 04_erd §9-3) 설정은 **재시작 없이** 핫 적용한다 — 데몬이 유휴일 때 `apply_hot` 으로 용량(pump_map)·포트 상한·
+        #   알코올 포트 표를 한 번에 갈아 끼운다. 해석은 시작 시점의 한 벌(스냅샷)로만 한다 — 도중에 바뀌어도 섞이지 않는다.
+        self._state_lock = threading.Lock()
+
+    def apply_hot(
+        self,
+        *,
+        pump_map: Mapping[int, SyringeSpec],
+        valve_port_count: int,
+        port_liquids: "dict[int, dict[int, str | None]] | None",
+        alcohol_strict: bool,
+        capacity_ml: "float | None",
+        capacity_block: "str | None",
+    ) -> None:
+        """핫 적용(원자) — 스냅샷에서 파생한 값 한 벌로 교체한다(출처 = 라이브 스냅샷)."""
+        with self._state_lock:
+            self.pump_map = dict(pump_map)
+            self.valve_port_count = valve_port_count
+            self.port_liquids, self.alcohol_strict = port_liquids, bool(alcohol_strict)
+            self.capacity_ml = capacity_ml
+            self.capacity_block = capacity_block
+            self.capacity_source = "snapshot"
+            self.capacity_from_settings = True
 
     def resolve(self, steps: Sequence[RecipeStep]) -> ResolvedRecipe:
+        """[_resolve_once] — 설정은 시작 시점 한 벌로 판정한다(해석 중 핫 적용이 와도 섞이지 않게)."""
+        with self._state_lock:
+            view = (self.pump_map, self.valve_port_count, self.port_liquids, self.alcohol_strict)
+        return self._resolve_once(steps, *view)
+
+    def _resolve_once(
+        self,
+        steps: Sequence[RecipeStep],
+        pump_map: Mapping[int, SyringeSpec],
+        valve_port_count: int,
+        port_liquids: "dict[int, dict[int, str | None]] | None",
+        alcohol_strict: bool,
+    ) -> ResolvedRecipe:
         """steps 를 정렬·검증·파생한다. 위반 시 [RecipeValidationError] raise(→ drop).
 
         `steps` 는 이미 µL 정규화 완료(fragrance/flavor mL→µL 는 상위·§6-6)를 전제한다.
@@ -243,7 +299,7 @@ class RecipeResolver:
                 pi_op = WIRE_OP_TO_PI.get(s.op or "")
                 if pi_op is None:
                     raise RecipeValidationError("unknown_engine_op", idx=s.idx)
-                op_spec = self.pump_map.get(s.pump_addr)
+                op_spec = pump_map.get(s.pump_addr)
                 if op_spec is None:
                     # ⚠️ **미매핑 addr 은 그 스텝만 건너뛴다(배치 전체를 죽이지 않는다·리뷰 P1·2026-07-18).**
                     #   dispense 는 미매핑=재료 누락=엉뚱 제품이라 fail-closed(아래 syringe 분기 raise)지만,
@@ -253,8 +309,8 @@ class RecipeResolver:
                     #   1,2 는 정지한다. 전부 미매핑이면 아래 empty 가드가 실패로 잡는다(silent COMPLETE 금지).
                     continue
                 # 포트 유효성(1~12 밖·비정수는 안전측 무시 → 해당 동작 생략/기본값 폴백).
-                _vp = s.in_port if s.in_port is not None and 1 <= s.in_port <= 12 else None
-                _op_out = s.out_port if s.out_port is not None and 1 <= s.out_port <= 12 else None
+                _vp = s.in_port if _is_port_valid(s.in_port, valve_port_count) else None
+                _op_out = s.out_port if _is_port_valid(s.out_port, valve_port_count) else None
                 resolved.append(
                     ResolvedOpStep(
                         idx=s.idx,
@@ -340,7 +396,7 @@ class RecipeResolver:
                     )
                 pumps.add(s.pump_addr)
 
-                spec = self.pump_map.get(s.pump_addr)
+                spec = pump_map.get(s.pump_addr)
                 if spec is None:
                     raise RecipeValidationError(
                         "unmapped_pump_addr", idx=s.idx, pump_addr=s.pump_addr
@@ -349,16 +405,22 @@ class RecipeResolver:
                 if not aspirations:
                     raise RecipeValidationError("empty_batch", idx=s.idx, pump_addr=s.pump_addr)
                 # 배출 구멍은 실재 범위(1~12)여야 한다(서버가 1차·pi 2차 자물쇠).
-                if not _is_port_valid(s.out_port):
+                if not _is_port_valid(s.out_port, valve_port_count):
                     raise RecipeValidationError(
                         "out_port_out_of_range", idx=s.idx, pump_addr=s.pump_addr
                     )
                 resolved_asps: list[ResolvedAspiration] = []
                 cumulative_ul = 0.0
+                # 누적 스텝(2026-09-30 · 검증 P-3) — 흡입은 절대이동 누적(`A{합}`)이라 흡입마다 반올림한 스텝을 더하면 합이
+                #   round(누적 µL) 보다 커져 풀스트로크를 1스텝 넘을 수 있다(Tecan 0.5mL 꽉 찬 배치 약 10%). 그래서 각 흡입 스텝 =
+                #   round(누적 후) − round(누적 전) 으로 잡아 합 = round(총 µL) 이 되게 한다(오차가 쌓이지 않는다 — 5mL 처럼 1µL 가
+                #   1스텝 미만인 큰 시린지에서 총량 정밀도가 좋아진다). 양수 부피가 0스텝이 되면 1스텝을 준다(해당 향료가 아예 빠지는
+                #   것보다 낫고, 합은 아래 풀스트로크 게이트가 막는다).
+                cumulative_steps = 0
                 for a in aspirations:
                     vol = float(a.volume)
                     # 흡입 구멍 실재(1~12) + 흡입≠배출(같으면 밸브를 안 돌리고 빨아 그대로 뱉는 조립 버그).
-                    if not _is_port_valid(a.in_port):
+                    if not _is_port_valid(a.in_port, valve_port_count):
                         raise RecipeValidationError(
                             "in_port_out_of_range", idx=s.idx, pump_addr=s.pump_addr
                         )
@@ -371,11 +433,26 @@ class RecipeResolver:
                         raise RecipeValidationError(
                             "non_positive_volume", idx=s.idx, pump_addr=s.pump_addr, volume_ul=vol
                         )
-                    step_count = spec.steps_for_volume_ul(vol)
-                    if step_count < 1:
+                    if spec.steps_for_volume_ul(vol) < 1:
+                        # 단독으로도 반 스텝이 안 되는 부피 — 해상도 밖(종전과 같은 거부).
                         raise RecipeValidationError(
                             "derived_zero_steps", idx=s.idx, pump_addr=s.pump_addr, volume_ul=vol
                         )
+                    # 알코올 캐리어 흡입 구멍 확인(2026-09-30 · 이중 방어) — 다른 액체가 꽂힌 구멍은 어느 계약이든 거부,
+                    #   엄격 계약(향연)은 **알코올이 명시된 구멍**이 아니면 거부(빈 구멍에서 빨아 병이 덜 차는 것을 막는다).
+                    if port_liquids is not None and str(a.flavor).strip().lower() == "alcohol":
+                        occupant = port_liquids.get(s.pump_addr, {}).get(a.in_port)
+                        if occupant is not None and occupant != "alcohol":
+                            raise RecipeValidationError(
+                                "alcohol_port_conflict", idx=s.idx, pump_addr=s.pump_addr
+                            )
+                        if alcohol_strict and occupant != "alcohol":
+                            raise RecipeValidationError(
+                                "alcohol_port_missing", idx=s.idx, pump_addr=s.pump_addr
+                            )
+                    target_steps = spec.steps_for_volume_ul(cumulative_ul + vol)
+                    step_count = max(1, target_steps - cumulative_steps)
+                    cumulative_steps += step_count
                     cumulative_ul += vol
                     resolved_asps.append(
                         ResolvedAspiration(
@@ -391,6 +468,15 @@ class RecipeResolver:
                 #   물리 한계를 초과해 오버로드(Code 11)가 난다. 단일 syringe 는 per-step maxVolume
                 #   게이트로 막지만, 배치는 **합**을 봐야 한다(개별은 통과해도 합이 넘칠 수 있다).
                 if cumulative_ul > spec.max_volume_ul:
+                    raise RecipeValidationError(
+                        "batch_over_capacity",
+                        idx=s.idx,
+                        pump_addr=s.pump_addr,
+                        volume_ul=cumulative_ul,
+                    )
+                # 누적 **스텝** 게이트(2026-09-30) — 어댑터가 실제로 보내는 값은 µL 가 아니라 스텝 누적이다. µL 합이 용량 안이어도
+                #   스텝 합이 풀스트로크를 넘으면 펌웨어가 A 범위 밖으로 거부(Tecan err3)해 앞 stage 만 토출된 부분 토출이 된다.
+                if cumulative_steps > spec.pump_full_stroke:
                     raise RecipeValidationError(
                         "batch_over_capacity",
                         idx=s.idx,
@@ -422,7 +508,7 @@ class RecipeResolver:
             volume_ul = float(s.volume)
 
             # 미매핑 pumpAddr(§9-1 PUMP_MAP) → drop.
-            spec = self.pump_map.get(s.pump_addr)
+            spec = pump_map.get(s.pump_addr)
             if spec is None:
                 raise RecipeValidationError(
                     "unmapped_pump_addr", idx=s.idx, pump_addr=s.pump_addr
@@ -453,11 +539,11 @@ class RecipeResolver:
             #     그대로 뱉는 꼴 = 조립 버그).
             #   부피 게이트(위)는 **물리 안전**(과흡입 → Code 11 펌프 파손)이라 pi 가 끝까지 쥔다.
             if s.in_port is not None or s.out_port is not None:
-                if not _is_port_valid(s.in_port):
+                if not _is_port_valid(s.in_port, valve_port_count):
                     raise RecipeValidationError(
                         "in_port_out_of_range", idx=s.idx, pump_addr=s.pump_addr
                     )
-                if not _is_port_valid(s.out_port):
+                if not _is_port_valid(s.out_port, valve_port_count):
                     raise RecipeValidationError(
                         "out_port_out_of_range", idx=s.idx, pump_addr=s.pump_addr
                     )
@@ -480,6 +566,7 @@ class RecipeResolver:
                     aspirate_speed_hz=s.aspirate_speed_hz,
                     dispense_speed_hz=s.dispense_speed_hz,
                     slope=s.slope,
+                    bypass_tune_cap=s.bypass_tune_cap,
                 )
             )
 
@@ -663,4 +750,32 @@ def flavor_recipe_source_to_steps(
         )
         idx += 1
 
+    return steps
+
+
+def fragrance_notes_to_steps(
+    notes: Sequence[Mapping[str, object]],
+    *,
+    pump_addr_of: Callable[[str], int],
+) -> list[RecipeStep]:
+    """fragrance fragranceResult.notes → RecipeStep 폴백 해석 헬퍼(§6-6 mL→µL 정규화).
+
+    notes[i] = {name, amountMl, ...}. pumpAddr 는 pumpMap(flavor→addr) 을 통해 해석해야 하나,
+    여기서는 dispatcher 주입 interpret 가 매핑을 알고 있다고 전제하고, 단위 정규화만 제공한다.
+    (2026-09-04 감사 P2로 app/dispatcher → 여기 이관 — flavor_recipe_to_steps 와 대칭.)
+    """
+    steps: list[RecipeStep] = []
+    for i, n in enumerate(notes):
+        raw_name = n.get("name") or n.get("nameKo") or ""
+        name = raw_name if isinstance(raw_name, str) else ""
+        raw_amount = n.get("amountMl")
+        amount_ml = float(raw_amount) if isinstance(raw_amount, (int, float)) else 0.0
+        steps.append(
+            RecipeStep(
+                idx=i,
+                pump_addr=pump_addr_of(name),
+                flavor=name,
+                volume=fragrance_ml_to_ul(amount_ml),  # mL→µL(§6-6·Code 11 방지).
+            )
+        )
     return steps

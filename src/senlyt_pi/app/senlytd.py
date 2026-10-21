@@ -16,10 +16,16 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import threading
-from typing import Mapping
+import time
+from typing import TYPE_CHECKING, Callable, Mapping
 
+if TYPE_CHECKING:  # 타입 전용.
+    from ..adapters.pump_model_detect import DetectResult
+
+from ..adapters.settings_source import expected_pump_addrs
 from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
 from .bootstrap import (
     BootstrapError,
@@ -125,6 +131,58 @@ def _selftest(environ: Mapping[str, str], logger: StructuredLogger) -> int:
     return 0
 
 
+def _should_arm_pump_rediscovery(pump_map: Mapping[int, object], engine: object, watch_addrs: "tuple[int, ...]") -> bool:
+    """재발견 정책 주입 여부(R8.5 P2) — 실 probe 어댑터 + 기대 주소를 **전부** 매핑하지 못했을 때만.
+
+    fake(probe 부재)=미주입 / env 명시·스캔 완전 성공=미주입 / 공집합·부분 인식=주입.
+    Undeclared 는 probe 가 있어 주입되지만 health_probe 부재로 데몬이 발화하지 못한다
+    (그쪽 복구는 자기 재fetch 경로 소관 — 이중 SIGTERM 없음)."""
+    if not callable(getattr(engine, "probe", None)):
+        return False
+    return not set(watch_addrs) <= set(pump_map)
+
+
+def _make_pump_rediscovery_restart(logger: StructuredLogger, device_id: str) -> "Callable[[], None]":
+    """펌프 재발견 정책(R8 P1-1) — 펌프가 살아 응답하는데 부팅 스캔이 놓친 상태를 재기동으로 복구.
+
+    재기동이 boot 스캔을 다시 돌려 resolver 를 재조립한다(핫스왑 재구성 백로그 불요).
+    pump_map 이 빈 상태에서만 불리므로(제조 원천 불가) 진행 중 작업 경합이 없다."""
+
+    def _restart() -> None:
+        logger.warn(
+            "펌프 응답 감지 + 부팅 인식 부재 — 정상 종료 후 재기동으로 버스를 재스캔합니다",
+            stage=STAGE_PI_RECEIVED,
+            device_id=device_id,
+        )
+        os.kill(os.getpid(), signal.SIGTERM)  # 우아한 종료 → systemd Restart=always 재기동.
+
+    return _restart
+
+
+def _make_pump_model_changed_restart(logger: StructuredLogger, device_id: str) -> "Callable[[], None]":
+    """실물 기종 변경 정책(2026-09-14) — 유휴 감시가 확인한 "다른 기종" 을 재기동으로 반영(부팅 감지 재조립)."""
+
+    def _restart() -> None:
+        logger.warn(
+            "실물 펌프 기종 변경 확인 — 정상 종료 후 재기동으로 새 기종 어댑터를 조립합니다",
+            stage=STAGE_PI_RECEIVED,
+            device_id=device_id,
+        )
+        os.kill(os.getpid(), signal.SIGTERM)  # 우아한 종료 → systemd Restart=always 재기동.
+
+    return _restart
+
+
+def _make_settings_changed_restart(logger: StructuredLogger, device_id: str) -> "Callable[[], None]":
+    """기기 설정 변경 정책(2026-09-30 · 04_erd §9-3) — **펌프 기종·펌프 주소 집합**이 바뀐 설정만 재기동으로 반영한다
+    (어댑터 재조립 = 부팅 조립). 그 밖의 설정은 데몬이 재시작 없이 적용한다. 호출은 데몬이 유휴일 때 1회."""
+
+    def _restart() -> None:
+        os.kill(os.getpid(), signal.SIGTERM)  # 우아한 종료 → systemd Restart=always 재기동(로그는 데몬이 남긴다).
+
+    return _restart
+
+
 def _install_signal_handlers(daemon: SenlytDaemon, logger: StructuredLogger) -> None:
     """SIGTERM/SIGINT → 우아한 종료 요청(stop 플래그). 비메인스레드/미지원 플랫폼은 무시."""
     import signal
@@ -173,6 +231,71 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         logger.error("실 어댑터 조립 실패 — 부팅 중단", stage=STAGE_ERROR, error=str(e))
         return 1
 
+    # 엔진을 넘겨 pump_map **자동인식**을 가능하게 한다(PUMP_ADDRESSES 미설정 = "URL만" 설치).
+    #   env 가 있으면 그게 이기고, 없으면 어댑터의 probe 로 버스를 스캔한다.
+    #   server_settings(부팅 스냅샷)로 시린지 용량/스트로크를 서버 SoT 값으로 얹는다(O-18).
+    # 주기 HW 감시·재발견 정책의 기대 주소 — 모드 기본(flavor=[1,2]·그 외=[1,2,3]) ∪ 서버 설정 스냅샷 펌프 키
+    #   (향연 4대 · 2026-09-29 — `expected_pump_addrs`).
+    watch_addrs: "tuple[int, ...]" = tuple(
+        expected_pump_addrs(
+            getattr(components, "mode", None),
+            getattr(components, "server_settings", None),
+            # 오프라인 캐시 부팅(스냅샷 없음)에도 향연 4번 펌프를 감시 — 캐시 pumpAddrs(2026-09-29).
+            getattr(components, "hardware_profile", None),
+        )
+    )
+    resolver = build_resolver(
+        environ,
+        engine=components.engine,
+        server_settings=getattr(components, "server_settings", None),
+        # 서버배정 mode 우선(env 폴백) — 'URL만' 설치 식향 기기가 예상주소[1,2]만 프로브(부팅지연 0).
+        mode=getattr(components, "mode", None),
+        # 하드웨어 선언(스냅샷>캐시) — 캐시 부팅의 stroke·포트 상한 공급원(2026-09-02 단일 SoT).
+        hardware_profile=getattr(components, "hardware_profile", None),
+        # 부팅 감지가 찾은 응답 주소(2026-09-14) — 2차 스캔 생략(감지 기종·pump_map 동일 관측).
+        known_pump_addrs=getattr(components, "detected_pump_addrs", None),
+    )
+    # 용량 판정 결과(2026-09-30) — 기종 지원 목록 밖이면 부팅 때 한 번 WARN(모든 모션 거부 · Cloud Logging 에 뜬다).
+    if getattr(resolver, "capacity_block", None):
+        logger.warn(
+            f"부팅 자가진단 — {resolver.capacity_block}",
+            stage=STAGE_ERROR,
+            reason="syringe_unsupported",
+            capacityMl=getattr(resolver, "capacity_ml", None),
+            capacitySource=getattr(resolver, "capacity_source", None),
+        )
+    # ── 기기 설정 상시 구독(adapters/settings_watcher) — 설정 해시가 바뀌면 유휴일 때 **재시작 없이** 적용 후 새 해시 보고. ──
+    from ..adapters.settings_watcher import (
+        SettingsWatcher,
+        contract_id_from_settings,
+        settings_hash_from_settings,
+    )
+
+    _boot_snapshot = getattr(components, "server_settings", None)
+    settings_watch: "SettingsWatcher | None" = None
+    _identity = getattr(components, "identity", None)
+    if _identity is not None and getattr(components, "server_config", None) is not None:
+        settings_watch = SettingsWatcher(
+            components.server_config,
+            _identity.dispenser_token,
+            getattr(components, "mode", None) or "flavor",
+            boot_settings_hash=settings_hash_from_settings(_boot_snapshot),
+            boot_settings=_boot_snapshot,
+            logger=logger,
+        )
+        settings_watch.start()
+    # 설정 무재시작 적용 재료(2026-09-30 · 04_erd §9-3) — 기종·주소 변경만 재시작(아래 on_settings_changed).
+    from .bootstrap import SettingsHotApplyEnv
+
+    hot_env = (
+        SettingsHotApplyEnv(
+            environ,
+            mode=getattr(components, "mode", None),
+            server_base_url=components.server_config.base_url,
+        )
+        if settings_watch is not None
+        else None
+    )
     deps = DaemonDeps(
         device_id=components.device_id,
         command_source=components.command_source,
@@ -180,20 +303,17 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         engine=components.engine,
         valve=components.valve,
         ledger=ledger,
-        # 엔진을 넘겨 pump_map **자동인식**을 가능하게 한다(PUMP_ADDRESSES 미설정 = "URL만" 설치).
-        #   env 가 있으면 그게 이기고, 없으면 어댑터의 probe 로 버스를 스캔한다.
-        #   server_settings(부팅 스냅샷)로 시린지 용량/스트로크를 서버 SoT 값으로 얹는다(O-18).
-        resolver=build_resolver(
-            environ,
-            engine=components.engine,
-            server_settings=getattr(components, "server_settings", None),
-            # 서버배정 mode 우선(env 폴백) — 'URL만' 설치 식향 기기가 예상주소[1,2]만 프로브(부팅지연 0).
-            mode=getattr(components, "mode", None),
-        ),
+        resolver=resolver,
+        # 용량 축 가드 활성(R4 P0-1·R4.5 P2-A) — 출처 판정은 용량을 파생한 build_resolver 가
+        #   각인한 값을 그대로 쓴다(재계산 금지 — 두 곳 계산이 어긋나면 P0-1 이 부활한다).
+        capacity_from_settings=resolver.capacity_from_settings,
+        # 기종 지원 목록 밖 용량 거부(2026-09-30) — build_resolver 가 각인한 사유 그대로(None = 통과).
+        capacity_block=getattr(resolver, "capacity_block", None),
+        capacity_source=getattr(resolver, "capacity_source", None),
         commandset_source=components.command_source,  # 동일 SSE 어댑터가 두 축 제공.
         # 주기 HW 감시 기대 주소(실시간 판단·2026-07-19) — 부팅 인식이 비어도 이 주소들을 계속
         #   프로브해 pumpHealth 로 보고(어댑터 미장착 = silent 빨강, USB 꽂히면 ok 초록 자동 전환).
-        hw_watch_addrs=(1, 2) if getattr(components, "mode", None) == "flavor" else (1, 2, 3),
+        hw_watch_addrs=watch_addrs,
         logger=components.logger,
         poll_interval_s=_resolve_poll_interval_s(environ),
         heartbeat_interval_s=_resolve_heartbeat_interval_s(environ),
@@ -205,7 +325,110 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         estop_source=lambda: components.status_sink.poll_estop(components.device_id),
         # 어댑터에 주입한 것과 **같은 공유 래치** — 데몬·시퀀서·어댑터가 하나의 estop 이벤트를 본다.
         estop_event=estop_event,
+        # 펌프 재발견 정책(R8 P1-1) — PUMP_ADDRESSES 각인 제거로 부팅 1회 스캔이 유일해진 뒤,
+        #   펌프 전원이 데몬보다 늦게 켜지면 pump_map 이 빈 채 영구 무토출이 되던 회복 불가를
+        #   닫는다. 데몬의 주기 HW 감시가 "펌프 응답 + pump_map 부재"를 확인하면 이 콜백으로
+        #   우아한 재기동 → systemd 가 재기동 → boot 스캔이 이번엔 펌프를 찾는다(Undeclared
+        #   재fetch 와 동일 계약 — 핫스왑 대신 재기동으로 경계를 명확히). pump_map 이 있으면
+        #   (env 명시·스캔 성공) 데몬이 이 콜백을 부르지 않는다.
+        on_pumps_seen_unmapped=(
+            _make_pump_rediscovery_restart(logger, components.device_id)
+            if _should_arm_pump_rediscovery(resolver.pump_map, components.engine, watch_addrs)
+            else None
+        ),
+        # 실물 기종 변경 정책(2026-09-14) — 유휴 감시가 2회 연속 다른 기종을 보면 우아한 재기동 → 부팅 감지가
+        #   새 기종으로 재조립(핫스왑 없음 · 재발견 재기동과 같은 계약).
+        on_pump_model_changed=_make_pump_model_changed_restart(logger, components.device_id),
+        # 펌프 포트 이동 정책(2026-10-02) — 재기동하면 부팅 감지가 펌프 응답 포트를 고른다(로그는 데몬이 남긴다).
+        on_pump_port_moved=_make_settings_changed_restart(logger, components.device_id),
+        hardware_source=getattr(components, "hardware_source", None),
+        settings_watch=settings_watch,
+        settings_hot_apply=hot_env,
+        on_settings_changed=(
+            _make_settings_changed_restart(logger, components.device_id)
+            if settings_watch is not None
+            else None
+        ),
+        applied_contract_id=contract_id_from_settings(_boot_snapshot),
+        applied_settings_hash=settings_hash_from_settings(_boot_snapshot),
     )
+    # ── Undeclared 자가복구(2026-09-02 상태모델 D3) — 선언 미확정 부팅이면 주기 재fetch 스레드. ──
+    #   성공(유효 모델 수신) 시 캐시가 기록되고 데몬을 정상 종료시킨다 → systemd Restart=always 가
+    #   재기동해 새 선언으로 조립(핫스왑 없이 경계가 명확). 성공했는데 여전히 미지값이면 백오프
+    #   지속 + WARN(무한 타이트루프 금지). 도착 봉투는 UndeclaredEngineAdapter 가 정직 실패 처리.
+    _hw_src = getattr(components, "hardware_source", "")
+    from ..adapters.undeclared_engine_adapter import UndeclaredEngineAdapter as _Undeclared
+
+    # 엔진이 실제로 Undeclared 일 때만(검증 P2-4) — fake 엔진(E2E·개발기)은 출처가 undeclared 여도 재감지가 실
+    #   시리얼을 열어 재기동 루프를 만들 수 있다.
+    if _hw_src in ("undeclared", "undetected", "mixed") and isinstance(components.engine, _Undeclared):
+        from ..adapters.settings_source import (
+            fetch_settings_once,
+            hardware_profile_from_snapshot,
+            pump_model_from_settings,
+            snapshot_settings_confirmed,
+        )
+        from ..persistence.hardware_profile_cache import save_profile
+        from .bootstrap import SENLYT_STATE_DIR_ENV
+
+        def _undeclared_refetch() -> None:
+            delay = 60.0
+            state_dir = environ.get(SENLYT_STATE_DIR_ENV, "").strip() or environ.get(
+                "LOG_DIR", ""
+            ).strip()
+            while True:
+                time.sleep(delay)
+                # ① 실물 재감지(2026-09-14) — 엔진이 Undeclared 라 포트를 쥔 주체가 없어 안전. 균일 기종이 잡히면
+                #   재기동(부팅 감지가 같은 결과로 조립). 혼합/판독 불가는 계속 대기.
+                #   포트도 펌프 응답으로 고른다(2026-10-02 — 부팅 감지와 같은 규칙).
+                try:
+                    _model = redetected_model_to_adopt(
+                        environ, list(watch_addrs), components.declared_pump_model, logger
+                    )
+                    if _model is not None:
+                        logger.warn(
+                            f"실물 기종 감지(model={_model}) — 정상 종료 후 재기동으로 재조립합니다",
+                            stage=STAGE_PI_RECEIVED,
+                        )
+                        os.kill(os.getpid(), signal.SIGTERM)
+                        return
+                except Exception:  # noqa: BLE001 — 재감지 실패 = 다음 주기.
+                    pass
+                if _hw_src != "undeclared":
+                    delay = 60.0  # 재감지는 read-only 2프레임 — 고정 60초(운영자 안내 문구와 일치 · 검증 P2-5).
+                    continue
+                # ② 선언 재fetch(응답 펌프 0 + 선언 없음 — 종전 D3 경로 그대로).
+                try:
+                    snap = fetch_settings_once(
+                        components.server_config, components.identity.dispenser_token, components.mode
+                    )
+                except Exception:  # noqa: BLE001 — 재fetch 실패 = 백오프 지속.
+                    snap = None
+                model = pump_model_from_settings(snap)
+                if model is not None:
+                    # 명시 상태 경로에서만 캐시(무설정 = cwd 오염 방지·bootstrap 동일) · 확정 설정만(2026-09-30 · bootstrap 동일).
+                    if state_dir and snapshot_settings_confirmed(snap):
+                        # 조립 규칙은 헬퍼가 SoT(R6.5 M3) — bootstrap 스냅샷 경로와 바이트 동일 프로파일.
+                        save_profile(
+                            state_dir,
+                            hardware_profile_from_snapshot(model, snap),
+                            components.server_config.base_url,
+                        )
+                    logger.warn(
+                        f"하드웨어 선언 수신(model={model}) — 정상 종료 후 재기동으로 재조립합니다",
+                        stage=STAGE_PI_RECEIVED,
+                    )
+                    os.kill(os.getpid(), signal.SIGTERM)  # 우아한 종료 → systemd 재기동.
+                    return
+                if snap is not None:
+                    logger.warn(
+                        "재fetch 성공했으나 펌프 모델이 여전히 미확정 — 백오프 지속(admin 센소리움 확인)",
+                        stage=STAGE_PI_RECEIVED,
+                    )
+                delay = min(delay * 2, 300.0)
+
+        threading.Thread(target=_undeclared_refetch, name="hw-refetch", daemon=True).start()
+
     daemon = SenlytDaemon(deps)
     _install_signal_handlers(daemon, logger)
 
@@ -218,6 +441,37 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
     )
     daemon.boot()  # stop 까지 블록 — 종료 시 shutdown(우아한 종료) 수행.
     return 0
+
+
+def redetected_model_to_adopt(
+    environ: Mapping[str, str],
+    expected_addrs: "list[int]",
+    declared: "str | None",
+    logger: StructuredLogger,
+    *,
+    scan: "Callable[[], tuple[str | None, DetectResult | None]] | None" = None,
+) -> "str | None":
+    """Undeclared 재감지 1회 — 재기동할 기종(없으면 None). 부팅과 같은 채택 규칙(AUTODET-17).
+
+    부팅이 거부할 지문으로 재기동하면 같은 판정으로 다시 Undeclared → 60초 재시작 무한 반복.
+    """
+    from .bootstrap import adoptable_detected_model
+
+    if scan is None:
+        from ..adapters.pump_model_detect import detect_on_candidates, detect_pump_model
+        from ..adapters.serial_port_discovery import list_candidate_ports
+
+        def scan() -> "tuple[str | None, DetectResult | None]":
+            return detect_on_candidates(
+                list_candidate_ports(environ),
+                expected_addrs,
+                lambda p, a: detect_pump_model(p, a, logger=logger),
+            )
+
+    _port, det = scan()
+    if det is None:
+        return None
+    return adoptable_detected_model(det, declared)
 
 
 # ── 호스트 열/전압/스로틀 프로브(2026-07-25) — 실기기 과열→통신끊김 진단의 관측 씨앗 ───────────

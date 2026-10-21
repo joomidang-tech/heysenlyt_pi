@@ -77,18 +77,17 @@ def _now_iso_ms() -> str:
 #   `includeIfNull:false` 로 키 자체가 빠졌고, admin 기기 카드가 online 인데 "엔진 —"으로 떴다.
 #   실 Pi 라도 USB-RS485 어댑터 미장착이면 자동감지(bootstrap.build_engine)가 fake 로 떨어지는데,
 #   그게 **정상적인 fake 구동**인지 **보고 누락**인지 운영자가 화면에서 구분할 수 없었다.
-_ENGINE_WIRE_NAMES: dict[str, str] = {
-    "Sy01bEngineAdapter": "sy01b",
-    "FakeEnginePort": "fake",
-}
-
-
 def engine_wire_name(engine: EnginePort) -> str:
-    """엔진 어댑터 → heartbeat engine 표기. 미지 어댑터(테스트 더블 등)는 클래스명 그대로.
+    """엔진 어댑터 → heartbeat engine 표기 — 어댑터 클래스의 `MODEL_ID` 자기 선언을 읽는다.
 
-    관측 필드라 **침묵(None)보다 이름**이 낫다 — 모르는 어댑터도 무엇이 붙었는지 보이게 한다.
+    종전엔 클래스명 문자열 사전(_ENGINE_WIRE_NAMES)으로 역추론했다(2026-09-03 검증 P2 —
+    클래스 rename 시 무성 파손). 이제 어댑터가 스스로 선언한 정체(MODEL_ID: sy01b/
+    tecan_xcalibur/fake)를 그대로 쓴다 — 와이어 값은 바이트 동일(admin OrdersPage 실펌프
+    판정·test_wire_messages 계약 유지). 미지 어댑터(테스트 더블 등)는 클래스명 그대로 —
+    관측 필드라 **침묵(None)보다 이름**이 낫다.
     """
-    return _ENGINE_WIRE_NAMES.get(type(engine).__name__, type(engine).__name__)
+    mid = getattr(type(engine), "MODEL_ID", None)
+    return mid if isinstance(mid, str) and mid else type(engine).__name__
 
 
 def _order_id_of(command_id: str) -> str:
@@ -177,6 +176,43 @@ class DaemonDeps:
     #   빈 채 부팅하면(어댑터 미장착 등) 감시 대상 0 → admin 이 부팅 스냅샷 폴백에 갇혔다.
     #   mode 파생(flavor=[1,2]·fragrance=[1,2,3]) — senlytd 가 주입. None = pump_map 만(하위호환).
     hw_watch_addrs: "tuple[int, ...] | None" = None
+    # 펌프 응답 감지 + 부팅 인식 누락(기대 ⊄ pump_map — 공집합·부분 인식 공통) 시 1회 호출되는
+    #   정책 콜백(R8 P1-1·R8.5 P2) — PUMP_ADDRESSES 각인 제거 후 부팅 1회 스캔이 유일해져, 펌프
+    #   전원이 데몬보다 늦게 켜지면 매핑이 누락된 채 영구 unmapped drop 이 되던 회복 불가를 닫는다.
+    #   정책(재기동)은 app 층(senlytd)이 주입 — 데몬은 관측·발화만. 부분 인식은 제조가 가능한
+    #   상태라 발화 직전 is_busy 를 재확인해 진행 중 작업을 선점하지 않는다.
+    #   None = 비활성(테스트/구성 하위호환).
+    on_pumps_seen_unmapped: Callable[[], None] | None = None
+    # 실물 기종 변경 감지(2026-09-14) — 유휴 감시가 `&` 지문을 재관측해 현재 어댑터 MODEL_ID 와 다른 기종을
+    #   **2회 연속** 보면 1회 호출(정책 = senlytd 가 우아한 재기동 주입 → 부팅 감지가 새 기종으로 재조립).
+    #   1회 잠금(프로세스 생애) — 관측이 흔들려도 재기동 루프가 되지 않는다. None = 비활성.
+    on_pump_model_changed: Callable[[], None] | None = None
+    # 펌프 포트 이동(2026-10-02) — 전 펌프 무응답인데 다른 후보 포트에서 펌프가 응답하면 1회 호출(정책 = senlytd 가
+    #   우아한 재기동 주입 → 부팅 감지가 응답 포트로 재조립). None = 비활성.
+    on_pump_port_moved: Callable[[], None] | None = None
+    # 하드웨어 출처 관측(2026-09-14) — bootstrap.hardware_source 그대로("detected"·"snapshot"·"cache"·
+    #   "undeclared"·"undetected"·"mixed"). 하트비트 `pumpModelSource` 로 서버·admin 에 "자동 인식" 여부를 알린다.
+    hardware_source: str | None = None
+    # 용량 축 가드 활성 조건(R4 P0-1) — pump_map 의 syringe_capacity_ml 이 **서버 스냅샷 유래**일
+    #   때만 True. 폴백(스냅샷 부재 → 모드 기본 0.5)일 땐 False — 그 0.5 는 관측값이 아니라
+    #   추측값이라, 이를 근거로 서버 선언 용량을 거부하면 부팅 순단 1회로 제조·세척 전량 거부
+    #   (위생 하드락 탈출구 봉쇄 = 현장 방문 전 벽돌)가 된다. 가드는 "서버가 말한 값 vs 서버가
+    #   말한 값" 대조일 때만 의미가 있다. False = 무검사(델타 이전과 동일 거동 + 부팅 WARN).
+    capacity_from_settings: bool = False
+    # (2026-09-30) 기종 지원 목록 밖 용량이면 모든 모션 거부 사유(None = 통과) · 용량 출처(로그 필드).
+    capacity_block: "str | None" = None
+    capacity_source: "str | None" = None
+    # 기기 설정 상시 구독(adapters/settings_watcher.SettingsWatcher) — 적용 대기 프레임이 있으면 소비 루프 사이(유휴)에
+    #   **재시작 없이** 적용하고 새 해시를 보고한다(2026-09-30 · 04_erd §9-3). `settings_hot_apply` = 적용 재료
+    #   (bootstrap.SettingsHotApplyEnv). None = 비활성.
+    #   ⚠️ 예외: 펌프 기종·펌프 주소 집합이 바뀌면 어댑터를 새로 조립해야 해 `on_settings_changed`(정책 = senlytd 우아한 재시작)를
+    #   1회 부른다 — 재시작한 부팅이 새 스냅샷으로 조립하고 새 해시를 보고한다(시리얼 포트를 두 어댑터가 나눠 쓰는 창이 없다).
+    settings_watch: "Any | None" = None
+    settings_hot_apply: "Any | None" = None
+    on_settings_changed: "Callable[[], None] | None" = None
+    # 부팅 스냅샷의 AI 계약·설정 해시(서버 계산값 그대로) — 하트비트로 되돌려 보내 서버가 stale 을 판정한다.
+    applied_contract_id: "str | None" = None
+    applied_settings_hash: "str | None" = None
 
 
 class SenlytDaemon:
@@ -229,6 +265,26 @@ class SenlytDaemon:
         # 펌프 `?` 프로브로 갱신. admin 연결 칩의 실시간 근거(부팅 스냅샷 pumps 와 별개 축).
         self._pump_health: "dict[int, str] | None" = None
         self._hw_checked_at: str | None = None
+        # R8 P1-1 — 재발견 정책 콜백의 1회 발화 래치(30s 주기 감시가 재기동을 연타하지 않게).
+        self._pumps_seen_unmapped_fired = False
+        self._pump_model_changed_fired = False
+        self._pump_port_moved_fired = False
+        # 설정 무재시작 적용(2026-09-30) — 적용한 계약·프로브 주소(하트비트) · 실패 재시도 간격 · 같은 실패 로그 1회.
+        self._applied_contract_id = deps.applied_contract_id
+        self._hot_retry_at = 0.0
+        # 적용 중 표시 — 하트비트 스레드의 주기 헬스 프로브가 펌프 재초기화 창에 같은 버스로 프레임을 섞지 않게.
+        self._hot_applying = False
+        self._hot_fail_hash: "str | None" = None
+        # 같은 해시 적용 실패 횟수 — 상한(HOT_APPLY_MAX_ATTEMPTS)에 닿으면 재초기화(Z)를 더 보내지 않는다(파괴적 명령 반복 금지).
+        #   새 해시가 오거나 운영자 정비 명령이 성공하면 0 으로 되돌려 다시 시도한다.
+        self._hot_fail_count = 0
+        # 상한 뒤 자동 재개 근거 — 실패한 펌프 주소와 마지막 비파괴 상태 조회 결과(`?` · 모션 없음). 무응답/이상 → 정상으로
+        #   바뀌면(연결 회복) 재초기화를 한 번 더 허용한다. 상태 조회 자체는 상한과 무관하게 계속 돈다.
+        self._hot_fail_pump: "int | None" = None
+        self._hot_fail_pump_state: "str | None" = None
+        # 기종·주소 변경 재시작 1회 래치(프로세스 생애) — 콜백이 실패해도 재시작 루프가 되지 않게.
+        self._settings_restart_fired = False
+        self._pump_model_mismatch_streak = 0  # 유휴 감시에서 "다른 기종" 연속 관측 횟수(2회면 발화).
         self._hb_count = 0
         self._shutdown_lock = threading.Lock()
         self._shutdown_done = False
@@ -246,6 +302,17 @@ class SenlytDaemon:
             estop_event=self._estop,  # §9-4 — 감시 스레드 set 시 다음 stage 미시작(하드 중단).
             logger=self._log,  # 스텝 실패 시 raw 엔진코드·detail 을 로그로 남겨 원인 특정 가능.
         )
+        # 제조 요약 로그 문맥(2026-09-30) — 부팅 때 정해진 값(AI 계약 · 설정 해시 · 용량 · 풀스트로크 · 스텝 모드 · 용량 출처).
+        _spec = next(iter(resolver.pump_map.values()), None)
+        _model = getattr(getattr(deps.engine, "preset", None), "pump_preset_id", None)
+        self._sequencer.log_context = {
+            "contractId": deps.applied_contract_id,
+            "settingsHash": deps.applied_settings_hash,
+            "syringeCapacityMl": _spec.syringe_capacity_ml if _spec is not None else None,
+            "fullStroke": _spec.pump_full_stroke if _spec is not None else None,
+            "stepMode": "N0" if _model == "tecan_xcalibur" else _model,
+            "capacitySource": deps.capacity_source,
+        }
         # 봉투 전이 sink — status_sink 가 report_command_set_transition 을 제공하면 꽂는다.
         commandset_sink = getattr(deps.status_sink, "report_command_set_transition", None)
         self._dispatcher = Dispatcher(
@@ -256,6 +323,14 @@ class SenlytDaemon:
             commandset_source=deps.commandset_source,
             commandset_sink=commandset_sink if callable(commandset_sink) else None,
             logger=deps.logger,  # 정비 신선도 게이트 관측(2026-07-19)
+            # 용량 축 fail-closed(2026-09-02) — RR 과 같은 pump_map(부팅 스냅샷 파생). 봉투/명령의
+            #   선언 용량과 대조해 다르면 실행 전 거부(스냅샷 스테일 무성 과소토출 차단).
+            #   ⚠️ 스냅샷 유래일 때만(R4 P0-1) — 폴백 용량(추측값)으로는 대조하지 않는다.
+            pump_map=resolver.pump_map if deps.capacity_from_settings else None,
+            capacity_block=deps.capacity_block,
+            capacity_source=deps.capacity_source,
+            # (2026-09-30 · §9-3) 봉투 조립 시점 해시 ↔ 지금 적용한 해시 — 다르면 모션 0 거부(설정 변경 전 큐의 봉투).
+            applied_settings_hash=self._applied_settings_hash,
         )
         self._recovery = BootRecovery(deps.ledger)
 
@@ -302,6 +377,9 @@ class SenlytDaemon:
         consecutive_errors = 0
         try:
             while not self._stop.is_set():
+                # 설정 변경 적용(2026-09-30) — 소비 루프 스레드에서 폴 **사이**에 한다: 제조·세척·정비가 이 스레드에서 동기로
+                #   돌므로 여기는 구조적으로 유휴다(진행 중 작업은 시작 시점 설정으로 끝까지 · 적용은 그 뒤).
+                self._apply_pending_settings()
                 handled = self.poll_once()
                 if handled > 0:
                     # 처리분이 있으면 즉시 다음 폴(밀린 큐 빠른 소진) + 오류 카운터 리셋.
@@ -539,6 +617,8 @@ class SenlytDaemon:
         )
         if error_code is not None:
             self._last_error = error_code
+        if phase is DispensePhase.COMPLETED and command_id.startswith(MAINTENANCE_COMMAND_SET_PREFIX):
+            self._hot_fail_count = 0  # 운영자 정비(초기화 등) 성공 — 설정 적용 재시도 상한을 푼다.
         self._log.info(
             "상태 역보고 flush",
             stage=STAGE_STATUS_REPORT if phase is not DispensePhase.COMPLETED else STAGE_DISPENSE_DONE,
@@ -876,36 +956,380 @@ class SenlytDaemon:
         (부분 결과 폐기 — 낡은 전체 결과가 부분 신선 결과보다 일관적). 결과 의미는 어댑터
         `health_probe` 주석(ok/garbled/silent — 오늘 진단 툴과 동일 판정)."""
         probe = getattr(self.deps.engine, "health_probe", None)
-        if not callable(probe) or self._sequencer.is_busy:
+        if not callable(probe) or self._sequencer.is_busy or self._hot_applying:
             return
-        pumps = sorted(self._sequencer.resolver.pump_map)
-        if not pumps:
-            # 부팅 인식 실패(어댑터 미장착 등)여도 **기대 주소를 계속 실측**한다(실시간 판단 —
-            #   2026-07-19 확정). 그래야 admin 이 "무응답(빨강)"을 정직하게 보여주고, USB 가
-            #   나중에 꽂히면 ok(초록)로 살아나는 것도 보인다.
-            pumps = sorted(self.deps.hw_watch_addrs or ())
+        observe = getattr(self.deps.engine, "observe_fingerprint", None)
+        # 감시 대상 = 매핑 ∪ 기대 주소(R8.5 P2 — 부분 인식에서 **빠진** 주소를 관측해야
+        #   재발견 조건이 성립한다. 매핑만 보면 3펌프 중 2개 부팅 인식 시 3번은 감시조차 안 돼
+        #   영구 unmapped drop). 기대 주소 실측 유지(실시간 판단 — 2026-07-19 확정): admin 이
+        #   "무응답(빨강)"을 정직하게 보고, USB 가 나중에 꽂히면 ok(초록)로 살아난다.
+        mapped = set(self._sequencer.resolver.pump_map)
+        watch = set(self.deps.hw_watch_addrs or ())
+        pumps = sorted(mapped | watch)
         if not pumps:
             return
         health: dict[int, str] = {}
         for addr in pumps:
-            if self._sequencer.is_busy or self._stop.is_set():
+            if self._sequencer.is_busy or self._stop.is_set() or self._hot_applying:
                 return  # 제조 시작/종료 — 부분 결과 버리고 즉시 양보.
             try:
                 health[addr] = str(probe(addr))
             except Exception:  # noqa: BLE001 — 프로브 예외 = 무응답 취급(감시는 best-effort).
                 health[addr] = "silent"
+            # 기종 지문 상시 재관측(2026-09-14) — 응답(ok)한 주소만 `&` 1회. read-only Report 라 비용은 `?` 1발과
+            #   같고, 제조 시작 재확인을 `&` 앞에도 둔다(`?`~`&` 사이 창 봉합). 판정은 아래 한 곳에서.
+            if health[addr] == "ok" and callable(observe):
+                if self._sequencer.is_busy or self._stop.is_set() or self._hot_applying:
+                    return
+                try:
+                    observe(addr)
+                except Exception:  # noqa: BLE001 — 관측 실패는 감시를 막지 않는다.
+                    pass
+        # 무응답 주소의 낡은 지문 evict(검증 P1-2) — 랙 교체 중 늦게 깨어나는 주소가 옛 지문으로 남으면 영구 "혼합".
+        forget = getattr(self.deps.engine, "forget_fingerprint", None)
+        if callable(forget):
+            for addr, h in health.items():
+                if h != "ok":
+                    try:
+                        forget(addr)
+                    except Exception:  # noqa: BLE001
+                        pass
+        self._check_pump_port_moved(health)
         self._pump_health = health
         self._hw_checked_at = self._now_iso()
+        self._note_hot_fail_pump_recovery(health)
+        self._judge_pump_model_change()
         # 펌프는 응답하는데 부팅 인식(pump_map)이 비어 제조가 보류 중인 상태를 표면화(WARN 즉시
-        #   flush — 30s 주기 반복은 "조치 필요 지속" 신호로 의도). 자동 재발견은 백로그(resolver
-        #   재구성 필요) — 현 복구 경로는 senlytd 재시작.
-        if not self._sequencer.resolver.pump_map and any(v == "ok" for v in health.values()):
+        #   flush — 30s 주기 반복은 "조치 필요 지속" 신호로 의도). 자동 복구 = on_pumps_seen_unmapped
+        #   콜백(R8 P1-1 — senlytd 가 우아한 재기동을 주입: 재기동이 boot 스캔을 다시 돌려 resolver
+        #   재조립. Undeclared 재fetch 와 같은 계약). 콜백은 프로세스 생애 1회만 발화 — 재기동 후에도
+        #   스캔이 계속 실패하면(펌프가 health 엔 응답하는데 discover 엔 침묵하는 비정상) 다음
+        #   프로세스가 다시 1회 시도하므로, 사이클 간격은 부팅 시간이 자연 하한이 된다.
+        # 발화 조건(R8.5 P2 일반화) — "기대인데 부팅 인식이 못 잡은 주소(missing)" 중 **ok 응답**이
+        #   있을 때만. ok ⟺ boot probe True(같은 술어·같은 파서 — R8.5 (a) 검증)라 재기동하면 반드시
+        #   찾는 상태에서만 발화한다. ⛔ garbled 는 probe False 와 동치 — 조건에 넣으면 재기동해도
+        #   또 실패하는 무한 재기동 루프가 된다(그물: test_daemon_hardening garbled 케이스).
+        missing = watch - mapped
+        if missing and any(health.get(a) == "ok" for a in missing):
             self._log.warn(
-                "펌프 응답 감지 — 부팅 인식 실패로 제조 보류 중(재시작 시 재개·자동 재발견 백로그)",
+                "펌프 응답 감지 — 부팅 인식 누락으로 제조 제한 중(자동 재기동으로 재스캔 예정)",
                 stage=STAGE_PI_RECEIVED,
                 device_id=self.deps.device_id,
                 pumpHealth={str(a): s for a, s in health.items()},
+                missingAddrs=sorted(missing),
             )
+            if (
+                self.deps.on_pumps_seen_unmapped is not None
+                and not self._pumps_seen_unmapped_fired
+                and not self._sequencer.is_busy  # 부분 인식은 제조 가능 — 진행 중 작업 선점 금지.
+            ):
+                self._pumps_seen_unmapped_fired = True
+                try:
+                    self.deps.on_pumps_seen_unmapped()
+                except Exception:  # noqa: BLE001 — 정책 콜백 실패가 감시 루프를 죽이면 안 된다.
+                    self._log.warn("펌프 재발견 정책 콜백 실패 — 감시 지속", stage=STAGE_PI_RECEIVED)
+
+    def _judge_pump_model_change(self) -> None:
+        """유휴 감시 뒤 — 관측 지문의 기종이 현재 어댑터와 다르면(2회 연속) 정책 콜백 1회.
+
+        pi 는 여기서도 **판정을 서버에 넘기지 않는다**: 어댑터 교체는 프로세스 재기동(부팅 감지)이 하고, 이 함수는
+        "재기동할 만큼 확실한가" 만 본다. 혼합(둘 이상 기종)은 재기동해도 같은 착지(Undeclared)라 WARN 만.
+        """
+        engine = self.deps.engine
+        fps_fn = getattr(engine, "pump_fingerprints", None)
+        mid = getattr(type(engine), "MODEL_ID", None)
+        if not callable(fps_fn) or mid not in ("sy01b", "tecan_xcalibur"):
+            return
+        try:
+            from ..adapters.sy01b_engine_adapter import classify_fingerprint
+
+            models = {a: classify_fingerprint(fp) for a, fp in fps_fn().items()}
+        except Exception:  # noqa: BLE001
+            return
+        known = {m for m in models.values() if m is not None}
+        if not known:
+            self._pump_model_mismatch_streak = 0
+            return
+        if len(known) >= 2:
+            self._pump_model_mismatch_streak = 0
+            self._log.warn(
+                "펌프 기종 혼합 관측 — 한 버스에 두 기종(재기동으로 해결되지 않음 · 같은 기종으로 맞춘 뒤 재연결)",
+                stage=STAGE_PI_RECEIVED, device_id=self.deps.device_id,
+                fingerprints={str(a): m for a, m in models.items()},
+            )
+            return
+        observed = next(iter(known))
+        if observed == mid:
+            self._pump_model_mismatch_streak = 0
+            return
+        self._pump_model_mismatch_streak += 1
+        self._log.warn(
+            f"실물 기종 변경 관측({mid} 어댑터 · 실물 {observed}) — 연속 {self._pump_model_mismatch_streak}회"
+            + (" · 자동 재기동으로 재조립합니다" if self._pump_model_mismatch_streak >= 2 else " · 다음 감시에서 재확인"),
+            stage=STAGE_PI_RECEIVED, device_id=self.deps.device_id, observedModel=observed,
+        )
+        if (
+            self._pump_model_mismatch_streak >= 2
+            and self.deps.on_pump_model_changed is not None
+            and not self._pump_model_changed_fired
+            and not self._sequencer.is_busy
+        ):
+            self._pump_model_changed_fired = True
+            try:
+                self.deps.on_pump_model_changed()
+            except Exception:  # noqa: BLE001 — 정책 콜백 실패가 감시 루프를 죽이면 안 된다.
+                self._log.warn("기종 변경 정책 콜백 실패 — 감시 지속", stage=STAGE_PI_RECEIVED)
+
+    def _check_pump_port_moved(self, health: "dict[int, str]") -> None:
+        """전 펌프 무응답 = 펌프 없는 포트를 쥐었을 수 있다(2026-10-02 · Pi 내장 UART 갇힘 사고).
+
+        펌프가 응답하는 다른 포트를 찾으면 1회 재기동 정책을 부른다 → 부팅 감지가 그 포트를 골라 재조립한다.
+        가동 중 연결을 바꿔 끼우지 않는 이유: 진행 중 트랜잭션·핫 적용과 경합해 거짓 성공·엉뚱한 펌프 프레임이 날 수 있다.
+        """
+        find = getattr(self.deps.engine, "find_answering_port", None)
+        # 정찰 주소 = 부팅 감지와 **같은 기대 주소**(senlytd 가 같은 expected_pump_addrs 로 주입). 다른 집합(예: env 고정
+        #   주소)으로 찾으면 부팅 감지가 그 포트를 못 골라 재기동이 프로세스마다 반복된다(검증 2026-10-02 재현).
+        addrs = sorted(self.deps.hw_watch_addrs or ())
+        if (
+            not addrs
+            or not callable(find)
+            or self.deps.on_pump_port_moved is None
+            or self._pump_port_moved_fired
+            or not all(h == "silent" for h in health.values())
+            or self._sequencer.is_busy
+            or self._stop.is_set()
+            or self._hot_applying
+        ):
+            return
+        try:
+            port = find(addrs)
+        except Exception:  # noqa: BLE001 — 포트 정찰은 best-effort(감시를 막지 않는다).
+            return
+        if port is None or self._sequencer.is_busy:  # 정찰 사이 제조가 시작됐으면 선점하지 않는다(기존 재기동 콜백과 같은 규칙).
+            return
+        self._pump_port_moved_fired = True
+        self._log.warn(
+            "전 펌프 무응답 포트 — 펌프가 응답하는 다른 포트 발견, 정상 종료 후 재기동으로 그 포트에 재조립합니다",
+            stage=STAGE_PI_RECEIVED,
+            device_id=self.deps.device_id,
+            port=port,
+            previousPort=getattr(self.deps.engine, "port", None),
+        )
+        try:
+            self.deps.on_pump_port_moved()
+        except Exception:  # noqa: BLE001 — 정책 콜백 실패가 감시 루프를 죽이면 안 된다.
+            self._log.warn("포트 이동 정책 콜백 실패 — 감시 지속", stage=STAGE_PI_RECEIVED)
+
+    def _applied_settings_hash(self) -> "str | None":
+        watch = self.deps.settings_watch
+        fn = getattr(watch, "applied_settings_hash", None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:  # noqa: BLE001
+                pass
+        return self.deps.applied_settings_hash
+
+    # 적용 실패 뒤 재시도 간격(초) — 프로브·재초기화를 폴마다 연타하지 않게.
+    HOT_APPLY_RETRY_S = 30.0
+    HOT_APPLY_MAX_ATTEMPTS = 3
+
+    def _apply_pending_settings(self) -> None:
+        """설정 변경을 **재시작 없이** 적용하고 새 해시를 보고한다(2026-09-30 · 04_erd §9-3 단일 규칙).
+
+        소비 루프 스레드에서만 부른다(폴 사이 = 제조·세척·정비가 돌지 않는 시점). 실패하면 옛 설정을 그대로 두고 새 해시를
+        보고하지 않는다 — 서버가 제조를 계속 보류한다. `HOT_APPLY_RETRY_S` 뒤 재시도.
+        """
+        watch = self.deps.settings_watch
+        env = self.deps.settings_hot_apply
+        if watch is None or env is None:
+            return
+        pending = getattr(watch, "pending_settings", None)
+        settings = pending() if callable(pending) else None
+        if settings is None:
+            return
+        if self._sequencer.is_busy or self._sequencer.queue_depth > 0:
+            return
+        from ..adapters.settings_watcher import settings_hash_from_settings
+
+        new_hash = settings_hash_from_settings(settings)
+        if new_hash == self._hot_fail_hash:
+            if self._hot_fail_count >= self.HOT_APPLY_MAX_ATTEMPTS:
+                return  # 상한 도달 — 새 해시나 운영자 정비 성공 전까지 재초기화를 더 보내지 않는다(보류 유지).
+            if time.monotonic() < self._hot_retry_at:
+                return
+        self._hot_applying = True
+        try:
+            result = self._hot_apply(settings, env)
+        except Exception as e:  # noqa: BLE001 — 적용 실패가 소비 루프를 죽이면 안 된다(보류 유지).
+            result = {"ok": False, "reason": "exception", "error": f"{type(e).__name__}: {e}"}
+        finally:
+            self._hot_applying = False
+        if result.get("reason") == "restart_required":
+            # 기종·주소 변경 — 적용하지 않고(해시 미보고 · 서버 보류 유지) 우아한 재시작 1회. 재시작한 부팅이 새 스냅샷으로 조립한다.
+            if not self._settings_restart_fired and self.deps.on_settings_changed is not None:
+                self._settings_restart_fired = True
+                self._log.warn(
+                    "설정 변경 — 펌프 기종·주소가 바뀌어 우아하게 재시작해 새 구성으로 조립합니다(적용 전까지 서버가 제조 보류)",
+                    stage=STAGE_PI_RECEIVED,
+                    device_id=self.deps.device_id,
+                    newHash=new_hash,
+                    changes=list(getattr(watch, "last_changes", []) or []),
+                    **{k: v for k, v in result.items() if k not in ("ok", "reason")},
+                )
+                try:
+                    self.deps.on_settings_changed()
+                except Exception:  # noqa: BLE001 — 정책 콜백 실패가 소비 루프를 죽이면 안 된다(보류 유지).
+                    self._log.warn("설정 변경 재시작 콜백 실패 — 보류 유지", stage=STAGE_ERROR)
+            return
+        if result.pop("ok", False):
+            watch.mark_applied(settings)
+            self._hot_fail_hash = None
+            self._hot_fail_count = 0
+            self._hot_fail_pump = None
+            self._log.info(
+                "설정 적용(재시작 없음) — 새 해시 보고",
+                stage=STAGE_PI_RECEIVED,
+                device_id=self.deps.device_id,
+                newHash=new_hash,
+                changes=list(getattr(watch, "last_changes", []) or []),
+                **result,
+            )
+            return
+        self._hot_retry_at = time.monotonic() + self.HOT_APPLY_RETRY_S
+        if self._hot_fail_hash != new_hash:
+            self._hot_fail_hash = new_hash
+            self._hot_fail_count = 0
+        self._hot_fail_count += 1
+        fail_pump = result.get("pumpAddr")
+        self._hot_fail_pump = fail_pump if isinstance(fail_pump, int) else None
+        self._hot_fail_pump_state = (self._pump_health or {}).get(self._hot_fail_pump) if self._hot_fail_pump else None
+        if self._hot_fail_count == self.HOT_APPLY_MAX_ATTEMPTS:
+            self._log.warn(
+                f"설정 적용 재시도 상한 — 펌프 {self._hot_fail_pump or '?'} 재초기화 {self._hot_fail_count}회 실패 · 재초기화를 더 보내지 "
+                "않습니다(보류 유지 · 펌프 응답이 돌아오면 자동 재시도 · 설정 재저장·정비 초기화 성공 시에도 재시도)",
+                stage=STAGE_ERROR,
+                device_id=self.deps.device_id,
+                newHash=new_hash,
+                attempts=self._hot_fail_count,
+                **{k: v for k, v in result.items() if k != "ok"},
+            )
+        if self._hot_fail_count == 1:
+            self._log.warn(
+                "설정 적용 실패 — 옛 설정 유지 · 새 해시 미보고(서버가 제조 보류) · 잠시 뒤 재시도",
+                stage=STAGE_ERROR,
+                device_id=self.deps.device_id,
+                newHash=new_hash,
+                **result,
+            )
+
+    def _note_hot_fail_pump_recovery(self, health: "dict[int, str]") -> None:
+        """재시도 상한 뒤 자동 재개(2026-09-30) — 비파괴 상태 조회(`?`)에서 실패했던 펌프가 무응답·이상 → 정상으로 바뀌면
+        재초기화를 **한 번** 더 허용한다(연결 회복 감지). 조회는 상한과 무관하게 하트비트 주기로 계속 돈다. 이전 상태를 모르면
+        (첫 관측) 전환으로 보지 않는다 — 응답은 정상인데 초기화만 실패하는 펌프에 Z 를 한 번 더 보내지 않게."""
+        addr = self._hot_fail_pump
+        if addr is None or addr not in health:
+            return
+        cur = health[addr]
+        prev = self._hot_fail_pump_state
+        self._hot_fail_pump_state = cur
+        if self._hot_fail_count >= self.HOT_APPLY_MAX_ATTEMPTS and prev is not None and prev != "ok" and cur == "ok":
+            self._hot_fail_count = self.HOT_APPLY_MAX_ATTEMPTS - 1
+            self._hot_retry_at = 0.0
+            self._log.info(
+                f"펌프 {addr} 응답 회복 감지 — 설정 적용(재초기화)을 한 번 다시 시도합니다",
+                stage=STAGE_PI_RECEIVED,
+                device_id=self.deps.device_id,
+                pumpAddr=addr,
+                previous=prev,
+            )
+
+    def _hot_apply(self, settings: Any, env: Any) -> "dict[str, Any]":
+        """적용 본체 — 성공이면 `{"ok": True, ...로그 필드}`. 현 어댑터에 튠을 얹고, 용량이 바뀌었으면 펌프를 재초기화한다(표 3-6 힘).
+
+        펌프 기종·펌프 주소 집합이 **선언상** 바뀌었으면(또는 부팅 때 서버 설정이 없었으면) `restart_required` — 어댑터 재조립은
+        재시작한 부팅이 한다(04_erd §9-3). 비교는 선언 ↔ 선언(적용한 스냅샷 ↔ 새 프레임)이다 — 부팅 때 응답하지 않은 펌프가 있어도
+        무관한 설정 변경이 재조립을 부르지 않게.
+        """
+        from .bootstrap import derive_hot_settings
+
+        engine = self.deps.engine
+        resolver = self._sequencer.resolver
+        cur_model = getattr(type(engine), "MODEL_ID", None)
+        cur_addrs = sorted(resolver.pump_map)
+        watch = self.deps.settings_watch
+        applied_fn = getattr(watch, "applied_settings", None)
+        prev = applied_fn() if callable(applied_fn) else None
+        new_model = env.target_model(settings)
+        new_addrs = sorted(env.target_addrs(settings))
+        if prev is None:
+            return {"ok": False, "reason": "restart_required", "why": "no_boot_settings", "toModel": new_model}
+        prev_model = env.target_model(prev)
+        prev_addrs = sorted(env.target_addrs(prev))
+        if new_model != prev_model or new_addrs != prev_addrs:
+            return {
+                "ok": False,
+                "reason": "restart_required",
+                "fromModel": prev_model,
+                "toModel": new_model,
+                "fromAddrs": prev_addrs,
+                "toAddrs": new_addrs,
+            }
+        reinit: "list[int]" = []
+        hs = derive_hot_settings(settings, pump_map=resolver.pump_map, pump_model=cur_model, mode=env.mode)
+        reinit_fn = getattr(engine, "reinitialize", None)
+        # 목록 밖 용량(capacity_block)이면 모든 모션 거부 — 재초기화(Z)도 보내지 않는다.
+        if hs.capacity_changed and callable(reinit_fn) and not hs.capacity_block:
+            for a in cur_addrs:
+                code = reinit_fn(a, hs.pump_map[a])
+                if code:
+                    # 부분 실패 — 먼저 새 스펙으로 셋업된 펌프가 옛 설정 아래 남지 않게 셋업 캐시를 비운다(다음 stage 0 에 옛 스펙으로
+                    #   다시 셋업). 적용은 하지 않는다(옛 설정 유지 · 해시 미보고).
+                    invalidate = getattr(engine, "initialize", None)
+                    if callable(invalidate):
+                        try:
+                            invalidate()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return {"ok": False, "reason": "reinit_failed", "pumpAddr": a, "engineCode": code}
+                reinit.append(a)
+        if hs.engine_preset is not None and hasattr(engine, "preset"):
+            engine.preset = hs.engine_preset  # 다음 모션부터 새 v·V·c·L
+        resolver.apply_hot(
+            pump_map=hs.pump_map,
+            valve_port_count=hs.valve_port_count,
+            port_liquids=hs.port_liquids,
+            alcohol_strict=hs.alcohol_strict,
+            capacity_ml=hs.capacity_ml,
+            capacity_block=hs.capacity_block,
+        )
+        self._dispatcher.update_capacity(hs.pump_map, hs.capacity_block, "snapshot")
+        self._applied_contract_id = hs.contract_id
+        from ..adapters.settings_watcher import settings_hash_from_settings
+
+        spec = next(iter(hs.pump_map.values()), None)
+        self._sequencer.log_context = {
+            **(self._sequencer.log_context or {}),
+            "contractId": hs.contract_id,
+            "settingsHash": settings_hash_from_settings(settings),
+            "syringeCapacityMl": hs.capacity_ml,
+            "fullStroke": spec.pump_full_stroke if spec is not None else None,
+            "stepMode": "N0" if cur_model == "tecan_xcalibur" else cur_model,
+            "capacitySource": "snapshot",
+        }
+        try:
+            env.persist(settings, cur_model)
+        except Exception:  # noqa: BLE001 — 캐시 기록 실패는 적용을 되돌리지 않는다(다음 적용에 다시 기록).
+            pass
+        return {
+            "ok": True,
+            "pumpModel": cur_model,
+            "pumpAddrs": cur_addrs,
+            "syringeCapacityMl": hs.capacity_ml,
+            "reinitializedPumps": reinit,
+            "contractId": hs.contract_id,
+            "capacityBlock": hs.capacity_block,
+        }
 
     def _emit_heartbeat(self) -> None:
         """heartbeat 전송(queueDepth 파생) + ship_trace 배치 flush + OQ flush — 전부 best-effort."""
@@ -933,6 +1357,16 @@ class SenlytDaemon:
         pumps = sorted(self._sequencer.resolver.pump_map)
         avail = getattr(self.deps.valve, "available_bases", None)
         valves = avail() if callable(avail) else None
+        # 펌프 기종 지문(2026-09-11) — 어댑터가 probe/셋업에서 관측한 `&` 값을 그대로 싣는다(판정 없음).
+        #   fake/undeclared 어댑터엔 메서드가 없다 → 키 미방출(구버전 서버·목 무해).
+        fps_fn = getattr(self.deps.engine, "pump_fingerprints", None)
+        pump_fingerprints = None
+        if callable(fps_fn):
+            try:
+                fps = fps_fn()
+                pump_fingerprints = dict(fps) if fps else None
+            except Exception:  # noqa: BLE001 — 관측 실패가 하트비트를 막지 않는다.
+                pump_fingerprints = None
         return self._dispatcher.build_heartbeat(
             engine=engine_wire_name(self.deps.engine),
             last_error=self._last_error,
@@ -941,6 +1375,19 @@ class SenlytDaemon:
             # 주기 감시 실측(idle 시 ~30s 주기 갱신) — admin 연결 칩의 실시간 근거.
             pump_health=self._pump_health,
             hw_checked_at=self._hw_checked_at,
+            pump_fingerprints=pump_fingerprints,
+            pump_model_source=self.deps.hardware_source,
+            # 기기 설정 한 벌(2026-09-29) — 부팅 스냅샷의 계약·해시를 되돌려 보낸다(서버 stale 판정) · 프로브한 주소
+            #   (서버 배정 게이트가 "응답 없음"과 "프로브 범위 밖"을 가른다 — 향연 4펌프 배정 순환 해소).
+            applied_contract_id=self._applied_contract_id,
+            settings_hash=self._applied_settings_hash(),
+            # 설정 구독 중인데 적용한 해시가 없으면(부팅 때 스냅샷 없음) 명시 — 서버가 "구 pi"로 오인해 통과시키지 않게(§9-3).
+            settings_applied=(
+                False
+                if self.deps.settings_watch is not None and self._applied_settings_hash() is None
+                else None
+            ),
+            probe_addrs=sorted(set(self._sequencer.resolver.pump_map) | set(self.deps.hw_watch_addrs or ())),
         )
 
     def _flush_traces(self) -> None:

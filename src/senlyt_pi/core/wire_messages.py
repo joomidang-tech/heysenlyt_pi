@@ -99,6 +99,10 @@ class RecipeStep:
     aspirate_speed_hz: int | None = None
     dispense_speed_hz: int | None = None
     slope: int | None = None
+    # 튠 상한 무시(2026-10-07 · 세척 느린·빠른 에어퍼지 전용) — True 면 이 스텝 속도를 프리셋(튠) V 가 아니라 **기종 매뉴얼 최대**로만
+    #   자른다. 튠 V 는 정비 이동(끝까지·홈·초기화) 속도이기도 해서, 퍼지만 빠르게 돌리려고 V 를 올리면 정비 이동까지 빨라진다.
+    #   False(기본·구계약) = 종전 그대로 프리셋 V 로 클램프.
+    bypass_tune_cap: bool = False
     # batchSyringe 전용(§9-1 v3) — 한 주사기에 순서대로 누적 흡입할 액체들(1개 이상). None = 비-배치.
     #   배출 구멍은 out_port(공유)·배출 속도는 dispense_speed_hz(min)·경사는 slope 필드를 재사용한다.
     aspirations: "tuple[BatchAspiration, ...] | None" = None
@@ -220,6 +224,7 @@ class RecipeStep:
             aspirate_speed_hz=_opt_int("aspirateSpeedHz"),
             dispense_speed_hz=_opt_int("dispenseSpeedHz"),
             slope=_opt_int("slope"),
+            bypass_tune_cap=j.get("bypassTuneCap") is True,
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -301,6 +306,8 @@ class RecipeStep:
         ):
             if val is not None:
                 m[key] = val
+        if self.bypass_tune_cap:
+            m["bypassTuneCap"] = True
         return m
 
 
@@ -318,10 +325,16 @@ class Command:
     recipe: tuple[RecipeStep, ...] | None  # recipe steps | None
     trace_id: str
     created_at: str  # ISO8601 (resync 기준·재포맷 금지·부록A P-3)
+    # (선택·2026-09-02 용량 축 fail-closed) recipe 볼륨(µL)의 조립 전제 시린지 용량(mL) —
+    #   dispatcher 가 부팅 스냅샷 pump_map 용량과 대조해 다르면 거부. 부재=구서버 하위호환.
+    syringe_capacity_ml: float | None = None
 
     @staticmethod
     def from_json(j: Mapping[str, Any]) -> "Command":
+        from .command_set import _optional_float  # tolerant reader 공유(R4 P3 — 순환 없음).
+
         raw_recipe = j.get("recipe")
+        raw_cap = j.get("syringeCapacityMl")
         return Command(
             id=j["id"],
             order_id=j["orderId"],
@@ -332,6 +345,7 @@ class Command:
             else tuple(RecipeStep.from_json(s) for s in raw_recipe),
             trace_id=j["traceId"],
             created_at=j["createdAt"],
+            syringe_capacity_ml=_optional_float(raw_cap),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -342,6 +356,12 @@ class Command:
             "deviceId": self.device_id,
             # recipe 는 null 도 의미가 있으므로(§9-1 폴백 신호) 명시적으로 방출.
             "recipe": None if self.recipe is None else [s.to_json() for s in self.recipe],
+            # 용량 선언 왕복 대칭(R4.5 P3) — 있을 때만 방출(없으면 키 자체 생략 = 구계약 그대로).
+            **(
+                {"syringeCapacityMl": self.syringe_capacity_ml}
+                if self.syringe_capacity_ml is not None
+                else {}
+            ),
             "traceId": self.trace_id,
             "createdAt": self.created_at,
         }
@@ -412,6 +432,21 @@ class Heartbeat:
     #   hwCheckedAt = 마지막 프로브 시각(ISO) — "N초 전 확인" 표시용.
     pump_health: "dict[int, str] | None" = None
     hw_checked_at: str | None = None
+    # 펌프 기종 지문(2026-09-11) — pumpFingerprints = {addr: `&` 응답 데이터 블록}(예 SY-01B "8.33" ·
+    #   XCalibur "30064809 C"). ⛔ pi 는 관측·보고만, 판정(선언 기종 ↔ 실물)은 서버. 관측 전이면 키 미방출.
+    pump_fingerprints: "dict[int, str] | None" = None
+    # 기종 출처(2026-09-14) — "detected"(부팅 실물 지문 자동 인식) | "snapshot"/"cache"(선언) | "undeclared" |
+    #   "undetected" | "mixed". admin 이 "자동 인식" 배지와 미확정 사유를 이 값으로 그린다. 부재 = 구버전 pi.
+    pump_model_source: "str | None" = None
+    # (2026-09-29 기기 설정 한 벌) 부팅 스냅샷의 AI 계약 id · 서버 설정 해시(되돌려 보냄 — pi 는 계산 안 함) · 프로브한 주소.
+    #   서버가 해시를 지금 값과 대조해 "pi 가 옛 설정으로 돈다"를 관제에 보이고, 프로브 주소로 배정 게이트가 "응답 없음"과
+    #   "프로브 범위 밖"을 가른다. 부재 = 구버전 pi.
+    applied_contract_id: "str | None" = None
+    settings_hash: "str | None" = None
+    # (2026-09-30) 설정 구독 중인데 아직 적용한 설정이 없으면(부팅 때 스냅샷 없음) False — 서버가 제조를 보류한다(해시 부재와
+    #   구 pi 를 가른다). 적용한 해시가 있으면 키 미방출.
+    settings_applied: "bool | None" = None
+    probe_addrs: "list[int] | None" = None
     # (선택·2026-08-06 QA "[admin] 튜브필링 UI" 원안) 실행 중 잡 진행 스냅샷
     #   (commandSetId, stepsDone, stepN) — admin 이 "현재 몇 번째 포트인지"를 표시하는 근거.
     #   추가 통신 0(기존 하트비트 편승·유휴면 키 미방출). Sequencer.live_progress 파생.
@@ -434,6 +469,16 @@ class Heartbeat:
             {str(a): s for a, s in self.pump_health.items()} if self.pump_health else None,
         )
         put_if_present(m, "hwCheckedAt", self.hw_checked_at)
+        put_if_present(m, "pumpModelSource", self.pump_model_source)
+        put_if_present(m, "appliedContractId", self.applied_contract_id)
+        put_if_present(m, "settingsHash", self.settings_hash)
+        put_if_present(m, "settingsApplied", self.settings_applied)
+        put_if_present(m, "probeAddrs", self.probe_addrs)
+        put_if_present(
+            m,
+            "pumpFingerprints",
+            {str(a): s for a, s in self.pump_fingerprints.items()} if self.pump_fingerprints else None,
+        )
         put_if_present(
             m,
             "jobProgress",
