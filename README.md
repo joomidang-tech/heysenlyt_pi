@@ -1,32 +1,27 @@
 # heysenlyt-pi
 
-hey_senlyt **v1.4.0** 디스펜서 데몬(`senlytd`). 라즈베리파이에서 돌며, 서버에서 제조 명령을 받아 펌프·밸브를 움직이고 결과를 서버에 보고합니다.
+hey_senlyt **v2.0.0** 디스펜서 데몬(`senlytd`). 라즈베리파이에서 돌며, 서버에서 제조 명령을 받아 펌프·밸브를 움직이고 결과를 서버에 보고합니다.
 
 ---
 
 ## 1. 설치 (라즈베리파이에서 한 줄)
 
 ```bash
-# prod — 사람이 PR 로 승격한 main
-REF=main; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/$REF/install.sh" \
-  | sudo env SENLYT_INSTALL_REF=$REF bash -s -- https://senlyt.com
-# dev
-REF=dev; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/$REF/install.sh" \
-  | sudo env SENLYT_INSTALL_REF=$REF bash -s -- https://dev-env.senlyt.com
-# 프리뷰 — 버전 브랜치
-REF=v1.4.0; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/$REF/install.sh" \
-  | sudo env SENLYT_INSTALL_REF=$REF bash -s -- https://v1-4-0.env.senlyt.com
+# prod(senlyt.com) — pi 는 버전 브랜치를 그대로 설치한다(main·dev 승격 없음 · 2026-10-21)
+REF=v2.0.0; BR=hq-demo; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenlyt_pi/$REF/install.sh" \
+    | sudo env SENLYT_INSTALL_REF=$REF SENLYT_BRANCH_ID=$BR bash -s -- https://senlyt.com
 ```
 
-정하는 것은 두 가지뿐입니다.
+정하는 것은 세 가지뿐입니다. **이 한 줄은 운영자 웹 「기기 등록」이 지점까지 넣어 만들어 줍니다 — 거기서 복사하는 것이 가장 안전합니다.**
 
 | 무엇 | 어디 | 예 |
 |---|---|---|
-| 설치할 pi 코드 버전 | `REF=` | `v1.4.0` · `dev` · `main` · 40자리 커밋 SHA |
-| 붙을 서버 | 맨 끝 URL | prod `https://senlyt.com` · dev `https://dev-env.senlyt.com` · 프리뷰 `https://v1-4-0.env.senlyt.com` |
+| 설치할 pi 코드 버전 | `REF=` | 지금 버전 브랜치 `v2.0.0`(또는 40자리 커밋 SHA) · `main`·`dev` 는 쓰지 않음 |
+| 기기가 속할 지점(v2.0.0 필수) | `BR=`(`SENLYT_BRANCH_ID`) | 시연 `hq-demo` · 성수 `seongsu` — 없으면 설치가 멈추고 「운영자 웹에서 새 설치 명령」을 안내 |
+| 붙을 서버 | 맨 끝 URL | `https://senlyt.com` |
 
 > ⚠️ `REF` 는 **URL 경로와 `SENLYT_INSTALL_REF` 두 곳에 같은 값**이 들어가야 합니다(그래서 변수 하나로 씁니다). 설치 스크립트도 버전마다 바뀌어, `main` 의 스크립트로 새 버전을 깔면 제대로 뜨지 않습니다.
-> ⚠️ **서버와 REF 를 짝지어 씁니다** — prod 기기에 버전 브랜치(`v1.4.0`)를 깔면 사람 승격(PR)을 거치지 않은 코드가 매장에 나갑니다.
+> ⚠️ 같은 한 줄을 다시 실행(업데이트)하면 그 버전 브랜치의 **최신**을 받습니다 — `v2.0.0` 에 올린 pi 코드가 곧 매장 기기 코드이니, 기기 업데이트는 그 브랜치가 안정됐을 때 합니다.
 
 설치가 끝나면:
 1. 관리 화면(`<서버URL>/admin`)에 기기가 **"승인 대기"** 로 뜹니다.
@@ -36,6 +31,7 @@ REF=v1.4.0; curl -fsSL "https://raw.githubusercontent.com/joomidang-tech/heysenl
 - 설치 로그 첫 줄 `▶ hey senlyt pi 설치 — server=… (ref=…)` 로 서버·버전을 확인합니다.
 - 설치된 버전은 `/etc/senlyt/device.env` 의 `SENLYT_INSTALL_REF`·`SENLYT_INSTALL_COMMIT` 에 남습니다.
 - **업데이트 = 같은 한 줄을 다시 실행**합니다(멱등 — 받아서 재기동까지).
+- 신원(출입증)은 서버별로 `/var/lib/senlyt/identities/v2/{서버}.json` 에 둡니다(v2.0.0 세대 폴더) — v1.4.0 시절 `identities/{서버}.json` 은 지우지 않고 남겨 두며(되돌릴 때 v1.4.0 이 그대로 씀), v2.0.0 첫 설치 때는 새로 등록을 요청합니다 → 관리 화면에서 **재등록 승인**(승인 뒤 10분 안).
 
 ---
 
@@ -80,7 +76,7 @@ src/senlyt_pi/
 └── app/          # 조립·진입점(senlytd)
 ```
 
-- 계약 정본: `developer/hey_senlyt/v1.4.0/04_erd/hey_senlyt_erd.md`
+- 계약 정본: `developer/hey_senlyt/v2.0.0/04_erd/hey_senlyt_erd.md`
 - 펌프 수치 정본: `heysenlyt-web` `server/domain/pumpGuard.ts`·`settingsClamp.ts`
 
 ### 지켜야 할 것
